@@ -1,0 +1,72 @@
+# contextmatrix-runner configuration
+#
+# All fields can be overridden with environment variables using the CMR_ prefix.
+# Example: CMR_PORT=7070, CMR_API_KEY=your-secret-here
+
+# ----- Server -----
+
+# HTTP port for receiving webhooks from ContextMatrix.
+# Env: CMR_PORT
+port: 9090
+
+# ----- ContextMatrix Connection -----
+
+# Base URL of the ContextMatrix instance. Used for status callbacks.
+# Env: CMR_CONTEXTMATRIX_URL
+contextmatrix_url: "http://localhost:8080"
+
+# Shared HMAC-SHA256 secret for webhook signing (both directions).
+# Must be at least 32 characters. Must match runner.api_key in ContextMatrix.
+# Env: CMR_API_KEY
+api_key: ""
+
+# ----- Container Settings -----
+
+# Default Docker image for worker containers. Can be overridden per-project
+# via runner_image in the trigger payload.
+# Env: CMR_BASE_IMAGE
+base_image: "contextmatrix/worker:latest"
+
+# Maximum number of simultaneous containers.
+# Env: CMR_MAX_CONCURRENT
+max_concurrent: 3
+
+# Force-kill containers after this duration. Go duration format.
+# Env: CMR_CONTAINER_TIMEOUT
+container_timeout: "2h"
+
+# ----- Claude Code Authentication -----
+# At least one of claude_auth_dir or anthropic_api_key must be set.
+
+# Path to the host's ~/.claude/ directory. OAuth tokens are mounted read-only
+# into containers. Requires running `claude login` on the host first.
+# Env: CMR_CLAUDE_AUTH_DIR
+claude_auth_dir: ""
+
+# Anthropic API key. Alternative to OAuth token mount. Injected as
+# ANTHROPIC_API_KEY env var in containers.
+# Env: CMR_ANTHROPIC_API_KEY
+anthropic_api_key: ""
+
+# ----- GitHub App (Git Credentials) -----
+# The runner uses a GitHub App to generate short-lived installation tokens
+# for git clone/push operations. See README.md for setup instructions.
+
+github_app:
+  # GitHub App ID (shown on the App's settings page).
+  # Env: CMR_GITHUB_APP_ID
+  app_id: 0
+
+  # Installation ID (visible in the URL after installing the App).
+  # Env: CMR_GITHUB_INSTALLATION_ID
+  installation_id: 0
+
+  # Path to the App's PEM private key file.
+  # Env: CMR_GITHUB_PRIVATE_KEY_PATH
+  private_key_path: ""
+
+# ----- Logging -----
+
+# Log level: debug, info, warn, error.
+# Env: CMR_LOG_LEVEL
+log_level: "info"

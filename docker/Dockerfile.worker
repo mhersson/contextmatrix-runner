@@ -1,0 +1,35 @@
+FROM ubuntu:24.04
+
+# Install system dependencies.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git openssh-client ca-certificates build-essential jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22 (required by Claude Code).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go.
+ARG GO_VERSION=1.26.1
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+    | tar -C /usr/local -xzf -
+ENV PATH="/usr/local/go/bin:/home/user/go/bin:${PATH}"
+
+# Install golangci-lint.
+ARG GOLANGCI_LINT_VERSION=v2.11.3
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+    | sh -s -- -b /usr/local/bin ${GOLANGCI_LINT_VERSION}
+
+# Install Claude Code CLI.
+RUN npm install -g @anthropic-ai/claude-code
+
+# Create non-root user.
+RUN useradd -m -s /bin/bash user
+USER user
+WORKDIR /home/user
+
+# Copy entrypoint.
+COPY --chmod=755 entrypoint.sh /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
