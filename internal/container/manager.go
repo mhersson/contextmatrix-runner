@@ -1,7 +1,7 @@
 package container
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -200,6 +200,9 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 	defer m.tracker.Remove(payload.Project, payload.CardID)
 	defer m.removeContainer(context.Background(), containerID, log)
 
+	// Stream container logs in real time.
+	logDone := m.streamLogs(ctx, containerID, log)
+
 	// Apply container timeout.
 	timeout := m.cfg.ContainerTimeoutDuration()
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -209,14 +212,15 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 
 	select {
 	case result := <-waitCh:
+		<-logDone // drain remaining log output
 		if result.StatusCode != 0 {
-			m.logContainerTail(ctx, containerID, log)
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
 			log.Warn(msg, "exit_code", result.StatusCode)
 			m.reportFailure(ctx, payload, msg)
 			return
 		}
 		log.Info("container completed successfully")
+		m.reportCompleted(ctx, payload)
 
 	case err := <-errCh:
 		if waitCtx.Err() != nil {
@@ -238,6 +242,41 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 	}
 }
 
+// streamLogs follows container stdout/stderr and logs each line. The returned
+// channel is closed when the stream ends (container exit or context cancel).
+func (m *Manager) streamLogs(ctx context.Context, containerID string, log *slog.Logger) <-chan struct{} {
+	done := make(chan struct{})
+
+	reader, err := m.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+	})
+	if err != nil {
+		log.Warn("failed to attach to container logs", "error", err)
+		close(done)
+		return done
+	}
+
+	go func() {
+		defer close(done)
+		defer func() { _ = reader.Close() }()
+
+		pr, pw := io.Pipe()
+		go func() {
+			defer func() { _ = pw.Close() }()
+			_, _ = stdcopy.StdCopy(pw, pw, reader)
+		}()
+
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			log.Info("worker", "output", scanner.Text())
+		}
+	}()
+
+	return done
+}
+
 func (m *Manager) killContainer(ctx context.Context, containerID string, log *slog.Logger) {
 	grace := stopGracePeriod
 	if err := m.docker.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &grace}); err != nil {
@@ -251,31 +290,18 @@ func (m *Manager) removeContainer(ctx context.Context, containerID string, log *
 	}
 }
 
-func (m *Manager) logContainerTail(ctx context.Context, containerID string, log *slog.Logger) {
-	reader, err := m.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Tail:       "50",
-	})
-	if err != nil {
-		log.Warn("failed to read container logs", "error", err)
-		return
-	}
-	defer reader.Close()
-
-	var buf bytes.Buffer
-	if _, err := stdcopy.StdCopy(&buf, &buf, reader); err != nil {
-		log.Warn("failed to demux container log output", "error", err)
-		return
-	}
-	if buf.Len() > 0 {
-		log.Error("container logs", "output", buf.String())
-	}
-}
-
 func (m *Manager) reportFailure(ctx context.Context, payload RunConfig, message string) {
 	if err := m.callback.ReportStatus(ctx, payload.CardID, payload.Project, "failed", message); err != nil {
 		m.logger.Error("failed to report failure callback", "card_id", payload.CardID, "error", err)
+	}
+}
+
+// reportCompleted notifies ContextMatrix that the container exited normally.
+// This acts as a safety net: if Claude didn't call complete_task, the claim
+// is still released server-side when ContextMatrix receives the "completed" status.
+func (m *Manager) reportCompleted(ctx context.Context, payload RunConfig) {
+	if err := m.callback.ReportStatus(ctx, payload.CardID, payload.Project, "completed", "container exited normally"); err != nil {
+		m.logger.Error("failed to report completed callback", "card_id", payload.CardID, "error", err)
 	}
 }
 

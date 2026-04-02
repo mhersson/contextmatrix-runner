@@ -28,6 +28,9 @@ else
     jq -n --argjson mcp "$MCP_ENTRY" '{"mcpServers": $mcp}' > "$SETTINGS"
 fi
 
+# Ensure ~/.claude.json exists (lives in $HOME, not inside ~/.claude/).
+[ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+
 # ----- Git Configuration -----
 git config --global user.name "ContextMatrix Runner"
 git config --global user.email "runner@contextmatrix.local"
@@ -60,4 +63,5 @@ IMPORTANT:
 - Always use MCP tools for all ContextMatrix interactions.
 - Never push to main or master.
 - Call heartbeat every 5 minutes during idle waits.
-- On completion, call complete_task via MCP."
+- Call report_usage after every heartbeat call.
+- On completion, call release_card after transitioning to done — do NOT skip this."
