@@ -2,8 +2,10 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"io"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -12,7 +14,8 @@ import (
 
 // MockDockerClient implements DockerClient for testing.
 type MockDockerClient struct {
-	ImagePullFn       func(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error)
+	ImagePullFn              func(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error)
+	ImageInspectWithRawFn    func(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error)
 	ContainerCreateFn func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error)
 	ContainerStartFn  func(ctx context.Context, containerID string, options container.StartOptions) error
 	ContainerWaitFn   func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
@@ -27,6 +30,13 @@ func (m *MockDockerClient) ImagePull(ctx context.Context, ref string, options im
 		return m.ImagePullFn(ctx, ref, options)
 	}
 	return io.NopCloser(io.LimitReader(nil, 0)), nil
+}
+
+func (m *MockDockerClient) ImageInspectWithRaw(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error) {
+	if m.ImageInspectWithRawFn != nil {
+		return m.ImageInspectWithRawFn(ctx, imageID)
+	}
+	return dockertypes.ImageInspect{}, nil, fmt.Errorf("image not found")
 }
 
 func (m *MockDockerClient) ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error) {

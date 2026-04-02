@@ -137,6 +137,11 @@ api_key: "your-shared-secret-here-at-least-32-chars"
 # Env: CMR_BASE_IMAGE
 base_image: "contextmatrix/worker:latest"
 
+# When to pull the image: always, never, if-not-present.
+# Use "never" or "if-not-present" for locally-built images.
+# Env: CMR_IMAGE_PULL_POLICY
+image_pull_policy: "always"
+
 # Maximum simultaneous containers.
 # Env: CMR_MAX_CONCURRENT
 max_concurrent: 3

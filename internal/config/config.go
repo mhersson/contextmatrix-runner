@@ -15,12 +15,20 @@ import (
 // Matches ContextMatrix's MinRunnerAPIKeyLength.
 const MinAPIKeyLength = 32
 
+// ImagePullPolicy controls when the runner pulls container images.
+const (
+	PullAlways       = "always"
+	PullNever        = "never"
+	PullIfNotPresent = "if-not-present"
+)
+
 // Config holds all runner configuration.
 type Config struct {
 	Port             int       `yaml:"port"`
 	ContextMatrixURL string    `yaml:"contextmatrix_url"`
 	APIKey           string    `yaml:"api_key"`
 	BaseImage        string    `yaml:"base_image"`
+	ImagePullPolicy  string    `yaml:"image_pull_policy"`
 	MaxConcurrent    int       `yaml:"max_concurrent"`
 	ContainerTimeout string    `yaml:"container_timeout"`
 	ClaudeAuthDir    string    `yaml:"claude_auth_dir"`
@@ -45,6 +53,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		Port:             9090,
+		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    3,
 		ContainerTimeout: "2h",
 		LogLevel:         "info",
@@ -100,6 +109,11 @@ func (c *Config) Validate() error {
 	if c.BaseImage == "" {
 		return fmt.Errorf("base_image is required")
 	}
+	switch c.ImagePullPolicy {
+	case PullAlways, PullNever, PullIfNotPresent:
+	default:
+		return fmt.Errorf("image_pull_policy must be one of: always, never, if-not-present")
+	}
 	if c.MaxConcurrent < 1 {
 		return fmt.Errorf("max_concurrent must be at least 1")
 	}
@@ -150,6 +164,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("CMR_BASE_IMAGE"); v != "" {
 		cfg.BaseImage = v
+	}
+	if v := os.Getenv("CMR_IMAGE_PULL_POLICY"); v != "" {
+		cfg.ImagePullPolicy = v
 	}
 	if v := os.Getenv("CMR_MAX_CONCURRENT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {

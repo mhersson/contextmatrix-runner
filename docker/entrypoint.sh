@@ -8,17 +8,25 @@ if [ -d "/claude-auth" ]; then
 fi
 mkdir -p "$HOME/.claude"
 
-# Write MCP config for ContextMatrix server.
+# Write MCP config for ContextMatrix server into settings.json
+# (not claude.json, which may contain auth data from the mounted dir).
 MCP_HEADERS="{}"
 if [ -n "${CM_MCP_API_KEY:-}" ]; then
     MCP_HEADERS=$(jq -n --arg key "$CM_MCP_API_KEY" '{"Authorization": ("Bearer " + $key)}')
 fi
 
-jq -n \
+MCP_ENTRY=$(jq -n \
     --arg url "$CM_MCP_URL" \
     --argjson headers "$MCP_HEADERS" \
-    '{"mcpServers": {"contextmatrix": {"type": "http", "url": $url, "headers": $headers}}}' \
-    > "$HOME/.claude/claude.json"
+    '{"contextmatrix": {"type": "http", "url": $url, "headers": $headers}}')
+
+SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$SETTINGS" ]; then
+    jq --argjson mcp "$MCP_ENTRY" '.mcpServers = ((.mcpServers // {}) * $mcp)' "$SETTINGS" > "${SETTINGS}.tmp"
+    mv "${SETTINGS}.tmp" "$SETTINGS"
+else
+    jq -n --argjson mcp "$MCP_ENTRY" '{"mcpServers": $mcp}' > "$SETTINGS"
+fi
 
 # ----- Git Configuration -----
 git config --global user.name "ContextMatrix Runner"

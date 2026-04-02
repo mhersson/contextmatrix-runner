@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
@@ -125,20 +127,9 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		img = m.cfg.BaseImage
 	}
 
-	// Pull image.
-	pullCtx, cancel := context.WithTimeout(ctx, imagePullTimeout)
-	defer cancel()
-
-	reader, err := m.docker.ImagePull(pullCtx, img, image.PullOptions{})
-	if err != nil {
-		return "", fmt.Errorf("pull image %s: %w", img, err)
-	}
-	// Drain the pull output.
-	if _, err := io.Copy(io.Discard, reader); err != nil {
-		m.logger.Warn("failed to drain image pull output", "error", err)
-	}
-	if err := reader.Close(); err != nil {
-		m.logger.Warn("failed to close image pull reader", "error", err)
+	// Pull image according to policy.
+	if err := m.pullImage(ctx, img); err != nil {
+		return "", err
 	}
 
 	// Generate GitHub App token.
@@ -219,6 +210,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 	select {
 	case result := <-waitCh:
 		if result.StatusCode != 0 {
+			m.logContainerTail(ctx, containerID, log)
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
 			log.Warn(msg, "exit_code", result.StatusCode)
 			m.reportFailure(ctx, payload, msg)
@@ -256,6 +248,28 @@ func (m *Manager) killContainer(ctx context.Context, containerID string, log *sl
 func (m *Manager) removeContainer(ctx context.Context, containerID string, log *slog.Logger) {
 	if err := m.docker.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
 		log.Warn("failed to remove container", "error", err)
+	}
+}
+
+func (m *Manager) logContainerTail(ctx context.Context, containerID string, log *slog.Logger) {
+	reader, err := m.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       "50",
+	})
+	if err != nil {
+		log.Warn("failed to read container logs", "error", err)
+		return
+	}
+	defer reader.Close()
+
+	var buf bytes.Buffer
+	if _, err := stdcopy.StdCopy(&buf, &buf, reader); err != nil {
+		log.Warn("failed to demux container log output", "error", err)
+		return
+	}
+	if buf.Len() > 0 {
+		log.Error("container logs", "output", buf.String())
 	}
 }
 
@@ -303,6 +317,40 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 	if len(containers) > 0 {
 		m.logger.Info("orphan cleanup complete", "removed", len(containers))
 	}
+	return nil
+}
+
+func (m *Manager) pullImage(ctx context.Context, img string) error {
+	policy := m.cfg.ImagePullPolicy
+	if policy == "" {
+		policy = config.PullAlways
+	}
+
+	if policy == config.PullNever {
+		return nil
+	}
+
+	if policy == config.PullIfNotPresent {
+		if _, _, err := m.docker.ImageInspectWithRaw(ctx, img); err == nil {
+			m.logger.Debug("image already present locally, skipping pull", "image", img)
+			return nil
+		}
+	}
+
+	pullCtx, cancel := context.WithTimeout(ctx, imagePullTimeout)
+	defer cancel()
+
+	reader, err := m.docker.ImagePull(pullCtx, img, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("pull image %s: %w", img, err)
+	}
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		m.logger.Warn("failed to drain image pull output", "error", err)
+	}
+	if err := reader.Close(); err != nil {
+		m.logger.Warn("failed to close image pull reader", "error", err)
+	}
+
 	return nil
 }
 

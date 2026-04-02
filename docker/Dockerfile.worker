@@ -24,12 +24,14 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/ins
 # Install Claude Code CLI.
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create non-root user.
-RUN useradd -m -s /bin/bash user
+# Copy entrypoint.
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
+
+# Create non-root user with UID 1000 (matching typical host user).
+# Ubuntu 24.04 ships a default "ubuntu" user at UID 1000; remove it first.
+RUN userdel -r ubuntu 2>/dev/null || true && useradd -m -s /bin/bash -u 1000 user
 USER user
 WORKDIR /home/user
-
-# Copy entrypoint.
-COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
