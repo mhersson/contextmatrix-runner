@@ -48,7 +48,7 @@ func NewClient(cmURL, apiKey string, logger *slog.Logger) *Client {
 }
 
 // ReportStatus sends a runner status update to ContextMatrix.
-// Valid statuses: "running", "failed".
+// Valid statuses: "running", "failed", "completed".
 func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, message string) error {
 	body, err := json.Marshal(statusRequest{
 		CardID:       cardID,

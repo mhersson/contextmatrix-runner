@@ -140,7 +140,7 @@ base_image: "contextmatrix/worker:latest"
 # When to pull the image: always, never, if-not-present.
 # Use "never" or "if-not-present" for locally-built images.
 # Env: CMR_IMAGE_PULL_POLICY
-image_pull_policy: "always"
+image_pull_policy: "never"
 
 # Maximum simultaneous containers.
 # Env: CMR_MAX_CONCURRENT
@@ -175,7 +175,9 @@ log_level: "info"
 On the ContextMatrix side, configure the runner connection in `config.yaml`:
 
 ```yaml
-# MCP endpoint authentication (optional but recommended).
+# MCP endpoint authentication — bearer token for the /mcp endpoint.
+# When set, the runner passes this to containers so Claude Code can
+# authenticate with ContextMatrix via MCP tools.
 mcp_api_key: "your-mcp-bearer-token"
 
 # Runner integration.
@@ -200,6 +202,7 @@ remote_execution:
 2. ContextMatrix sends a signed `/trigger` webhook to the runner
 3. Runner generates a short-lived GitHub App token
 4. Runner pulls the Docker image and starts a container with:
+   - Ubuntu 24.04 base with Go 1.26, Node.js 22, GitHub CLI, and golangci-lint
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
    - GitHub App token for git operations
@@ -227,6 +230,9 @@ All webhooks are signed with HMAC-SHA256 using a shared secret.
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
 HMAC computed over `timestamp.body`. Max 5-minute clock skew.
+
+Status callback values: `running` (container started), `failed` (error or
+non-zero exit), `completed` (clean exit).
 
 ## API Endpoints
 
@@ -278,10 +284,11 @@ HMAC computed over `timestamp.body`. Max 5-minute clock skew.
 
 ### Containers can't reach ContextMatrix MCP endpoint
 
-- Verify `runner.public_url` in ContextMatrix config is reachable from inside
-  Docker containers
-- For Docker Desktop: use `host.docker.internal` instead of `localhost`
-- For Docker on Linux: use the host's LAN IP or configure Docker networking
+- The runner automatically adds a `host.docker.internal` mapping to all
+  containers, so this hostname works on both Docker Desktop and Linux
+- Verify `runner.public_url` in ContextMatrix config uses
+  `host.docker.internal` or the host's LAN IP — not `localhost`
+- If it still fails, check Docker networking and firewall rules
 
 ### Orphan containers after runner crash
 

@@ -53,7 +53,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		Port:             9090,
-		ImagePullPolicy:  PullAlways,
+		ImagePullPolicy:  PullNever,
 		MaxConcurrent:    3,
 		ContainerTimeout: "2h",
 		LogLevel:         "info",
