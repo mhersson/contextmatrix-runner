@@ -18,6 +18,7 @@ internal/config/                  → YAML config + env overrides + validation
 internal/hmac/                    → HMAC-SHA256 signing/verification (shared)
 internal/webhook/                 → HTTP handlers (/trigger, /kill, /stop-all, /health)
 internal/container/               → Docker SDK abstraction, container lifecycle
+internal/logparser/               → Parses Claude Code stream-json output, logs relevant events
 internal/tracker/                 → Thread-safe card_id → container mapping
 internal/callback/                → HMAC-signed status callbacks to CM
 internal/github/                  → GitHub App JWT → installation token exchange
