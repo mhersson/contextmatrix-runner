@@ -14,10 +14,12 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/github"
+	"github.com/mhersson/contextmatrix-runner/internal/logparser"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -260,9 +262,12 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, log *slog.
 	go func() {
 		defer close(done)
 		defer func() { _ = reader.Close() }()
-		// Drain the stream so Docker does not block the container,
-		// but discard the content — it is available via `docker logs`.
-		_, _ = io.Copy(io.Discard, reader)
+		pr, pw := io.Pipe()
+		go func() {
+			defer func() { _ = pw.Close() }()
+			_, _ = stdcopy.StdCopy(pw, pw, reader)
+		}()
+		logparser.ProcessStream(pr, log)
 	}()
 
 	return done

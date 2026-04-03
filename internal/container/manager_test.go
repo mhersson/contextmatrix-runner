@@ -333,6 +333,53 @@ func TestCleanupOrphans(t *testing.T) {
 	assert.Contains(t, removedIDs, "orphan-2")
 }
 
+func TestStreamLogs_WithLogData(t *testing.T) {
+	// Sample stream-json lines that logparser would process.
+	// We pass them as raw bytes (not Docker multiplexed format).
+	// stdcopy.StdCopy will fail to demux them (no valid header), so it will
+	// return without writing anything to the pipe — logparser will then see
+	// an empty stream. The test verifies the pipeline does not panic or hang.
+	sampleJSON := `{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n"
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerLogsFn: func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(sampleJSON)), nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	// Should complete without hanging or panicking.
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	assert.Equal(t, 0, tr.Count())
+}
+
 func TestSanitizeContainerName(t *testing.T) {
 	tests := []struct {
 		project  string
