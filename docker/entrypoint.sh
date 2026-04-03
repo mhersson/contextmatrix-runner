@@ -47,12 +47,12 @@ git clone "${CM_REPO_URL}" /home/user/workspace
 cd /home/user/workspace
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
-exec claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
+exec claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
     "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
 
 Steps:
-1. Call get_skill(skill_name='run-autonomous', card_id='${CM_CARD_ID}', caller_model='claude-opus-4-6')
+1. Call get_skill(skill_name='run-autonomous', card_id='${CM_CARD_ID}', caller_model='sonnet')
 2. Follow the returned skill instructions exactly.
 
 IMPORTANT:
