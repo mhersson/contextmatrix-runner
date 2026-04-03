@@ -8,8 +8,8 @@ if [ -d "/claude-auth" ]; then
 fi
 mkdir -p "$HOME/.claude"
 
-# Write MCP config for ContextMatrix server into settings.json
-# (not claude.json, which may contain auth data from the mounted dir).
+# Write MCP config for ContextMatrix server into ~/.claude.json
+# (Claude Code reads MCP servers from this file, not settings.json).
 MCP_HEADERS="{}"
 if [ -n "${CM_MCP_API_KEY:-}" ]; then
     MCP_HEADERS=$(jq -n --arg key "$CM_MCP_API_KEY" '{"Authorization": ("Bearer " + $key)}')
@@ -20,16 +20,10 @@ MCP_ENTRY=$(jq -n \
     --argjson headers "$MCP_HEADERS" \
     '{"contextmatrix": {"type": "http", "url": $url, "headers": $headers}}')
 
-SETTINGS="$HOME/.claude/settings.json"
-if [ -f "$SETTINGS" ]; then
-    jq --argjson mcp "$MCP_ENTRY" '.mcpServers = ((.mcpServers // {}) * $mcp)' "$SETTINGS" > "${SETTINGS}.tmp"
-    mv "${SETTINGS}.tmp" "$SETTINGS"
-else
-    jq -n --argjson mcp "$MCP_ENTRY" '{"mcpServers": $mcp}' > "$SETTINGS"
-fi
-
-# Ensure ~/.claude.json exists (lives in $HOME, not inside ~/.claude/).
-[ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+CLAUDE_JSON="$HOME/.claude.json"
+[ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
+jq --argjson mcp "$MCP_ENTRY" '.mcpServers = ((.mcpServers // {}) * $mcp)' "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp"
+mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 
 # ----- Git Configuration -----
 git config --global user.name "ContextMatrix Runner"
@@ -39,6 +33,8 @@ git config --global user.email "runner@contextmatrix.local"
 if [ -n "${CM_GIT_TOKEN:-}" ]; then
     printf 'machine github.com\nlogin x-access-token\npassword %s\n' "$CM_GIT_TOKEN" > "$HOME/.netrc"
     chmod 600 "$HOME/.netrc"
+    # Expose token for GitHub CLI (gh pr create, etc.).
+    export GH_TOKEN="$CM_GIT_TOKEN"
     # Redirect SSH-style URLs to HTTPS so .netrc credentials are used.
     git config --global url."https://github.com/".insteadOf "git@github.com:"
     git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
@@ -51,7 +47,7 @@ git clone "${CM_REPO_URL}" /home/user/workspace
 cd /home/user/workspace
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
-exec claude -p --dangerously-skip-permissions \
+exec claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
     "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
 

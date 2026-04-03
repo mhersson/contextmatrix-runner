@@ -1,7 +1,6 @@
 package container
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -15,7 +14,6 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
@@ -177,7 +175,8 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			},
 		},
 		&container.HostConfig{
-			Mounts: mounts,
+			Mounts:     mounts,
+			ExtraHosts: []string{"host.docker.internal:host-gateway"},
 		},
 		nil, nil, name,
 	)
@@ -261,17 +260,9 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, log *slog.
 	go func() {
 		defer close(done)
 		defer func() { _ = reader.Close() }()
-
-		pr, pw := io.Pipe()
-		go func() {
-			defer func() { _ = pw.Close() }()
-			_, _ = stdcopy.StdCopy(pw, pw, reader)
-		}()
-
-		scanner := bufio.NewScanner(pr)
-		for scanner.Scan() {
-			log.Info("worker", "output", scanner.Text())
-		}
+		// Drain the stream so Docker does not block the container,
+		// but discard the content — it is available via `docker logs`.
+		_, _ = io.Copy(io.Discard, reader)
 	}()
 
 	return done
