@@ -206,7 +206,24 @@ func TestValidate_GitHubAppMissingFields(t *testing.T) {
 }
 
 func TestContainerTimeoutDuration(t *testing.T) {
-	cfg := &Config{ContainerTimeout: "2h"}
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := &Config{
+		ContextMatrixURL: "http://localhost",
+		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:        "img",
+		ImagePullPolicy:  PullAlways,
+		MaxConcurrent:    1,
+		ContainerTimeout: "2h",
+		AnthropicAPIKey:  "sk-ant-test",
+		GitHubApp: GitHubApp{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+	require.NoError(t, cfg.Validate())
 	assert.Equal(t, 2*60*60*1e9, float64(cfg.ContainerTimeoutDuration()))
 }
 

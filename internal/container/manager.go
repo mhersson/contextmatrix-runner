@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
@@ -127,6 +129,22 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		img = m.cfg.BaseImage
 	}
 
+	// Validate image against allowlist.
+	if len(m.cfg.AllowedImages) > 0 {
+		allowed := false
+		for _, ai := range m.cfg.AllowedImages {
+			if img == ai {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return "", fmt.Errorf("image %q not in allowed_images list", img)
+		}
+	} else if img != m.cfg.BaseImage {
+		return "", fmt.Errorf("image %q not allowed (only base_image %q permitted when allowed_images is empty)", img, m.cfg.BaseImage)
+	}
+
 	// Pull image according to policy.
 	if err := m.pullImage(ctx, img); err != nil {
 		return "", err
@@ -177,8 +195,14 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			},
 		},
 		&container.HostConfig{
-			Mounts:     mounts,
-			ExtraHosts: []string{"host.docker.internal:host-gateway"},
+			Mounts:      mounts,
+			ExtraHosts:  []string{"host.docker.internal:host-gateway"},
+			CapDrop:     strslice.StrSlice{"ALL"},
+			SecurityOpt: []string{"no-new-privileges"},
+			Resources: container.Resources{
+				Memory:    m.cfg.ContainerMemoryLimit,
+				PidsLimit: &m.cfg.ContainerPidsLimit,
+			},
 		},
 		nil, nil, name,
 	)
@@ -217,11 +241,13 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 		if result.StatusCode != 0 {
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
 			log.Warn(msg, "exit_code", result.StatusCode)
-			m.reportFailure(ctx, payload, msg)
+			reportCtx := context.Background()
+			m.reportFailure(reportCtx, payload, msg)
 			return
 		}
 		log.Info("container completed successfully")
-		m.reportCompleted(ctx, payload)
+		reportCtx := context.Background()
+		m.reportCompleted(reportCtx, payload)
 
 	case err := <-errCh:
 		if waitCtx.Err() != nil {
@@ -229,12 +255,14 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 			msg := fmt.Sprintf("container timed out after %s", timeout)
 			log.Warn(msg)
 			m.killContainer(context.Background(), containerID, log)
-			m.reportFailure(ctx, payload, msg)
+			reportCtx := context.Background()
+			m.reportFailure(reportCtx, payload, msg)
 			return
 		}
 		msg := fmt.Sprintf("wait error: %v", err)
 		log.Error(msg)
-		m.reportFailure(ctx, payload, msg)
+		reportCtx := context.Background()
+		m.reportFailure(reportCtx, payload, msg)
 
 	case <-ctx.Done():
 		// Parent context canceled (e.g., kill or shutdown).
@@ -262,12 +290,25 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, log *slog.
 	go func() {
 		defer close(done)
 		defer func() { _ = reader.Close() }()
-		pr, pw := io.Pipe()
+
+		stdoutPr, stdoutPw := io.Pipe()
+		stderrPr, stderrPw := io.Pipe()
+
 		go func() {
-			defer func() { _ = pw.Close() }()
-			_, _ = stdcopy.StdCopy(pw, pw, reader)
+			defer func() { _ = stdoutPw.Close(); _ = stderrPw.Close() }()
+			_, _ = stdcopy.StdCopy(stdoutPw, stderrPw, reader)
 		}()
-		logparser.ProcessStream(pr, log)
+
+		// Log stderr lines as warnings.
+		go func() {
+			scanner := bufio.NewScanner(stderrPr)
+			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+			for scanner.Scan() {
+				log.Warn("container stderr", "line", scanner.Text())
+			}
+		}()
+
+		logparser.ProcessStream(stdoutPr, log)
 	}()
 
 	return done

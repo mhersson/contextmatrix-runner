@@ -24,17 +24,22 @@ const (
 
 // Config holds all runner configuration.
 type Config struct {
-	Port             int       `yaml:"port"`
-	ContextMatrixURL string    `yaml:"contextmatrix_url"`
-	APIKey           string    `yaml:"api_key"`
-	BaseImage        string    `yaml:"base_image"`
-	ImagePullPolicy  string    `yaml:"image_pull_policy"`
-	MaxConcurrent    int       `yaml:"max_concurrent"`
-	ContainerTimeout string    `yaml:"container_timeout"`
-	ClaudeAuthDir    string    `yaml:"claude_auth_dir"`
-	AnthropicAPIKey  string    `yaml:"anthropic_api_key"`
-	GitHubApp        GitHubApp `yaml:"github_app"`
-	LogLevel         string    `yaml:"log_level"`
+	Port                 int       `yaml:"port"`
+	ContextMatrixURL     string    `yaml:"contextmatrix_url"`
+	APIKey               string    `yaml:"api_key"`
+	BaseImage            string    `yaml:"base_image"`
+	AllowedImages        []string  `yaml:"allowed_images"`
+	ImagePullPolicy      string    `yaml:"image_pull_policy"`
+	MaxConcurrent        int       `yaml:"max_concurrent"`
+	ContainerTimeout     string    `yaml:"container_timeout"`
+	ContainerMemoryLimit int64     `yaml:"container_memory_limit"`
+	ContainerPidsLimit   int64     `yaml:"container_pids_limit"`
+	ClaudeAuthDir        string    `yaml:"claude_auth_dir"`
+	AnthropicAPIKey      string    `yaml:"anthropic_api_key"`
+	GitHubApp            GitHubApp `yaml:"github_app"`
+	LogLevel             string    `yaml:"log_level"`
+
+	containerTimeoutDuration time.Duration
 }
 
 // GitHubApp holds GitHub App credentials for generating installation tokens.
@@ -52,11 +57,13 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Port:             9090,
-		ImagePullPolicy:  PullNever,
-		MaxConcurrent:    3,
-		ContainerTimeout: "2h",
-		LogLevel:         "info",
+		Port:                 9090,
+		ImagePullPolicy:      PullNever,
+		MaxConcurrent:        3,
+		ContainerTimeout:     "2h",
+		ContainerMemoryLimit: 8 * 1024 * 1024 * 1024, // 8 GiB
+		ContainerPidsLimit:   512,
+		LogLevel:             "info",
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -71,14 +78,18 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// ContainerTimeoutDuration parses ContainerTimeout as a time.Duration.
-// Panics if the value is invalid; call Validate() first.
+// ContainerTimeoutDuration returns the parsed container timeout duration.
+// The value is parsed and cached during Validate().
 func (c *Config) ContainerTimeoutDuration() time.Duration {
-	d, err := time.ParseDuration(c.ContainerTimeout)
-	if err != nil {
-		panic(fmt.Sprintf("invalid container_timeout %q: %v", c.ContainerTimeout, err))
+	return c.containerTimeoutDuration
+}
+
+// ParseContainerTimeout parses and caches the container timeout duration.
+// Intended for tests that create partial configs without calling Validate().
+func (c *Config) ParseContainerTimeout() {
+	if d, err := time.ParseDuration(c.ContainerTimeout); err == nil {
+		c.containerTimeoutDuration = d
 	}
-	return d
 }
 
 // LogLevelSlog returns the slog.Level for the configured log level.
@@ -117,9 +128,11 @@ func (c *Config) Validate() error {
 	if c.MaxConcurrent < 1 {
 		return fmt.Errorf("max_concurrent must be at least 1")
 	}
-	if _, err := time.ParseDuration(c.ContainerTimeout); err != nil {
+	d, err := time.ParseDuration(c.ContainerTimeout)
+	if err != nil {
 		return fmt.Errorf("container_timeout is invalid: %w", err)
 	}
+	c.containerTimeoutDuration = d
 	if c.ClaudeAuthDir == "" && c.AnthropicAPIKey == "" {
 		return fmt.Errorf("at least one of claude_auth_dir or anthropic_api_key is required")
 	}
@@ -175,6 +188,16 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("CMR_CONTAINER_TIMEOUT"); v != "" {
 		cfg.ContainerTimeout = v
+	}
+	if v := os.Getenv("CMR_CONTAINER_MEMORY_LIMIT"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.ContainerMemoryLimit = n
+		}
+	}
+	if v := os.Getenv("CMR_CONTAINER_PIDS_LIMIT"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.ContainerPidsLimit = n
+		}
 	}
 	if v := os.Getenv("CMR_CLAUDE_AUTH_DIR"); v != "" {
 		cfg.ClaudeAuthDir = v

@@ -50,11 +50,14 @@ func testLogger() *slog.Logger {
 }
 
 func testConfig() *config.Config {
-	return &config.Config{
+	cfg := &config.Config{
 		BaseImage:        "test-image:latest",
 		ContainerTimeout: "1h",
 		AnthropicAPIKey:  "sk-test",
 	}
+	// Parse the container timeout duration without full validation.
+	cfg.ParseContainerTimeout()
+	return cfg
 }
 
 // testTokenProvider creates a mock GitHub token server and TokenProvider.
@@ -266,7 +269,9 @@ func TestRun_CustomImage(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, testConfig(), testLogger())
+	cfg := testConfig()
+	cfg.AllowedImages = []string{"test-image:latest", "custom/image:v2"}
+	mgr := NewManager(mock, tr, cb, tp, cfg, testLogger())
 
 	payload := testPayload()
 	payload.RunnerImage = "custom/image:v2"
