@@ -118,6 +118,7 @@ github_app:
 ## Configuration
 
 All fields can be overridden with environment variables using the `CMR_` prefix.
+See `config.yaml.example` for the fully-commented template.
 
 ```yaml
 # HTTP port for receiving webhooks from ContextMatrix.
@@ -137,6 +138,11 @@ api_key: "your-shared-secret-here-at-least-32-chars"
 # Env: CMR_BASE_IMAGE
 base_image: "contextmatrix/worker:latest"
 
+# Allowlist of permitted Docker images. When set, only listed images may be
+# used (including runner_image overrides from trigger payloads). When empty,
+# only base_image is permitted.
+allowed_images: []
+
 # When to pull the image: always, never, if-not-present.
 # Use "never" or "if-not-present" for locally-built images.
 # Env: CMR_IMAGE_PULL_POLICY
@@ -149,6 +155,14 @@ max_concurrent: 3
 # Force-kill containers after this duration.
 # Env: CMR_CONTAINER_TIMEOUT
 container_timeout: "2h"
+
+# Memory limit per container in bytes. Default: 8 GiB.
+# Env: CMR_CONTAINER_MEMORY_LIMIT
+container_memory_limit: 8589934592
+
+# Maximum number of PIDs per container. Default: 512.
+# Env: CMR_CONTAINER_PIDS_LIMIT
+container_pids_limit: 512
 
 # Path to host's ~/.claude/ directory (OAuth tokens).
 # Required unless anthropic_api_key is set.
@@ -201,12 +215,13 @@ remote_execution:
 1. User clicks **Run Now** on an autonomous card in the ContextMatrix web UI
 2. ContextMatrix sends a signed `/trigger` webhook to the runner
 3. Runner generates a short-lived GitHub App token
-4. Runner pulls the Docker image and starts a container with:
+4. Runner pulls the Docker image and starts a hardened container with:
    - Ubuntu 24.04 base with Go 1.26, Node.js 22, GitHub CLI, and golangci-lint
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
    - GitHub App token for git operations
    - Anthropic auth (OAuth tokens or API key)
+   - All capabilities dropped, no-new-privileges, memory and PID limits
 5. Claude Code runs the `run-autonomous` workflow:
    - Claims the card via MCP
    - Clones the repo, plans, executes, reviews, documents
@@ -245,14 +260,38 @@ non-zero exit), `completed` (clean exit).
 
 ## Security Model
 
+Running AI agents in containers is a security boundary. The runner enforces
+defense-in-depth so that a compromised or misbehaving agent cannot escalate
+beyond its container.
+
+### Container hardening
+
+Every container is launched with the following restrictions:
+
+- **All Linux capabilities dropped** (`CapDrop: ALL`). The container process
+  runs with zero special privileges — it cannot modify network interfaces, mount
+  filesystems, load kernel modules, or perform any other privileged operation,
+  even as UID 0.
+- **No new privileges** (`no-new-privileges` security option). Prevents
+  privilege escalation via setuid/setgid binaries inside the container.
+- **Memory limit** (default 8 GiB, configurable via `container_memory_limit`).
+  Prevents a runaway process from exhausting host memory.
+- **PID limit** (default 512, configurable via `container_pids_limit`). Prevents
+  fork bombs from consuming all host PIDs.
+- **Image allowlist** (`allowed_images`). When set, only explicitly listed images
+  may be used. When empty, only the configured `base_image` is permitted. This
+  prevents trigger payloads from requesting execution of arbitrary images.
+- **Disposable containers**. Each task gets a fresh environment, destroyed after
+  completion. No state persists between runs.
+
+### Authentication and secrets
+
 - **HMAC-SHA256 webhook signing** in both directions (shared secret, never
   transmitted)
 - **GitHub App tokens**: short-lived (1 hour), repo-scoped, only ephemeral
   tokens enter containers
-- **Human-only controls**: only humans can trigger Run/Stop from the CM web UI
-- **Disposable containers**: fresh environment per task, destroyed after
-  completion
 - **Read-only mounts**: OAuth tokens mounted read-only into containers
+- **Human-only controls**: only humans can trigger Run/Stop from the CM web UI
 - **No inbound connections**: runner only makes outbound calls to GitHub API and
   ContextMatrix
 
