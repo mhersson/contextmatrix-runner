@@ -11,12 +11,22 @@ export HOME=/home/user
 if [ -n "${HOST_UID:-}" ]; then
     CURRENT_UID=$(id -u user)
     if [ "$CURRENT_UID" != "$HOST_UID" ]; then
+        # Remove any existing non-system user that holds the target UID
+        BLOCKING_USER=$(getent passwd "$HOST_UID" | cut -d: -f1 || true)
+        if [ -n "$BLOCKING_USER" ] && [ "$HOST_UID" -ge 1000 ]; then
+            userdel "$BLOCKING_USER"
+        fi
         usermod -u "$HOST_UID" user
     fi
 fi
 if [ -n "${HOST_GID:-}" ]; then
     CURRENT_GID=$(id -g user)
     if [ "$CURRENT_GID" != "$HOST_GID" ]; then
+        # Remove any existing non-system group that holds the target GID
+        BLOCKING_GROUP=$(getent group "$HOST_GID" | cut -d: -f1 || true)
+        if [ -n "$BLOCKING_GROUP" ] && [ "$BLOCKING_GROUP" != "user" ] && [ "$HOST_GID" -ge 1000 ]; then
+            groupdel "$BLOCKING_GROUP"
+        fi
         groupmod -g "$HOST_GID" user
     fi
 fi
