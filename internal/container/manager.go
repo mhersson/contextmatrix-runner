@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/url"
 	"os/user"
 	"regexp"
 	"strings"
@@ -202,7 +204,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		},
 		&container.HostConfig{
 			Mounts:      mounts,
-			ExtraHosts:  []string{"host.docker.internal:host-gateway"},
+			ExtraHosts:  m.buildExtraHosts(payload.MCPURL),
 			CapDrop:     strslice.StrSlice{"ALL"},
 			SecurityOpt: []string{"no-new-privileges"},
 			Resources: container.Resources{
@@ -438,4 +440,33 @@ func truncateID(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// buildExtraHosts returns extra /etc/hosts entries for the container.
+// Always includes host.docker.internal. If the MCP URL contains a hostname
+// that resolves on the host (e.g. via /etc/hosts), it's added so containers
+// can reach it too.
+func (m *Manager) buildExtraHosts(mcpURL string) []string {
+	hosts := []string{"host.docker.internal:host-gateway"}
+
+	u, err := url.Parse(mcpURL)
+	if err != nil || u.Hostname() == "" {
+		return hosts
+	}
+
+	hostname := u.Hostname()
+	// Skip if it's an IP or localhost
+	if net.ParseIP(hostname) != nil || hostname == "localhost" {
+		return hosts
+	}
+
+	addrs, err := net.LookupHost(hostname)
+	if err != nil || len(addrs) == 0 {
+		m.logger.Warn("could not resolve MCP hostname for container", "hostname", hostname, "error", err)
+		return hosts
+	}
+
+	hosts = append(hosts, hostname+":"+addrs[0])
+	m.logger.Info("added MCP host to container", "hostname", hostname, "ip", addrs[0])
+	return hosts
 }
