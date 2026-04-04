@@ -190,9 +190,17 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	name := sanitizeContainerName(payload.Project, payload.CardID)
 
+	// Run container as the host user directly via Docker's User field.
+	// No runtime privilege transitions needed.
+	containerUser := "1000:1000"
+	if u != nil {
+		containerUser = u.Uid + ":" + u.Gid
+	}
+
 	resp, err := m.docker.ContainerCreate(ctx,
 		&container.Config{
 			Image: img,
+			User:  containerUser,
 			Env:   env,
 			Labels: map[string]string{
 				LabelRunner:  "true",
@@ -204,7 +212,6 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			Mounts:      mounts,
 			ExtraHosts:  []string{"host.docker.internal:host-gateway"},
 			CapDrop:     strslice.StrSlice{"ALL"},
-			CapAdd:      strslice.StrSlice{"SETUID", "SETGID"},
 			SecurityOpt: []string{"no-new-privileges"},
 			Resources: container.Resources{
 				Memory:    m.cfg.ContainerMemoryLimit,

@@ -3,7 +3,7 @@ FROM alpine:3.23
 # Install system dependencies + Claude Code requirements (libgcc, libstdc++, ripgrep).
 RUN apk add --no-cache \
     bash curl git openssh-client ca-certificates build-base jq \
-    libgcc libstdc++ ripgrep su-exec \
+    libgcc libstdc++ ripgrep \
     nodejs npm \
     github-cli
 
@@ -24,9 +24,11 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANG
 # Install Claude Code CLI.
 RUN npm install -g @anthropic-ai/claude-code
 
-# Copy entrypoint (runs as root, creates user with HOST_UID, then drops to user).
+# Create home directory writable by any UID (Docker --user overrides UID at runtime).
+RUN mkdir -p /home/user && chmod 777 /home/user
+WORKDIR /home/user
+
 COPY entrypoint.sh /entrypoint.sh
-COPY setup-and-run.sh /setup-and-run.sh
-RUN chmod 755 /entrypoint.sh /setup-and-run.sh
+RUN chmod 755 /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
