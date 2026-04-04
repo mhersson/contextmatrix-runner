@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os/user"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -384,56 +383,6 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 	mgr.Wait()
 
 	assert.Equal(t, 0, tr.Count())
-}
-
-func TestRun_HostUIDGIDEnv(t *testing.T) {
-	// user.Current() succeeds in a normal test environment, so HOST_UID and
-	// HOST_GID must be present in the env passed to ContainerCreate.
-	currentUser, err := user.Current()
-	require.NoError(t, err, "os/user.Current() must succeed for this test to be meaningful")
-
-	var createdEnv []string
-
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			createdEnv = cfg.Env
-			return container.CreateResponse{ID: "test-uid-gid-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-			return ch, make(chan error)
-		},
-	}
-
-	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer cbSrv.Close()
-
-	tr := tracker.New()
-	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
-	tp := testTokenProvider(t)
-
-	mgr := NewManager(mock, tr, cb, tp, testConfig(), testLogger())
-
-	payload := testPayload()
-	require.NoError(t, tr.Add(&tracker.ContainerInfo{
-		CardID:  payload.CardID,
-		Project: payload.Project,
-	}))
-
-	mgr.Run(context.Background(), payload)
-	mgr.Wait()
-
-	assert.Contains(t, createdEnv, "HOST_UID="+currentUser.Uid,
-		"HOST_UID should be set to the current process uid")
-	assert.Contains(t, createdEnv, "HOST_GID="+currentUser.Gid,
-		"HOST_GID should be set to the current process gid")
 }
 
 func TestSanitizeContainerName(t *testing.T) {

@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
-	"os/user"
 	"regexp"
 	"strings"
 	"sync"
@@ -172,11 +171,6 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	}
 	if m.cfg.AnthropicAPIKey != "" {
 		env = append(env, "ANTHROPIC_API_KEY="+m.cfg.AnthropicAPIKey)
-	}
-	if u, err := user.Current(); err != nil {
-		m.logger.Warn("failed to get current user; HOST_UID/HOST_GID will not be set", "error", err)
-	} else {
-		env = append(env, "HOST_UID="+u.Uid, "HOST_GID="+u.Gid)
 	}
 
 	// Build mounts.

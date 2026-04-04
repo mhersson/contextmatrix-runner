@@ -248,14 +248,11 @@ remote_execution:
 2. ContextMatrix sends a signed `/trigger` webhook to the runner
 3. Runner generates a short-lived GitHub App token
 4. Runner pulls the Docker image and starts a hardened container with:
-   - Ubuntu 24.04 base with Go 1.26, Node.js 22, GitHub CLI, and golangci-lint
+   - Alpine 3.23 base with Go 1.26, Node.js 22, GitHub CLI, and golangci-lint
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
    - GitHub App token for git operations
    - Anthropic auth (OAuth tokens or API key)
-   - `HOST_UID` and `HOST_GID` set to the runner process's uid/gid (for file
-     ownership alignment — see
-     [Worker Image & UID Handling](#worker-image--uid-handling))
    - All capabilities dropped, no-new-privileges, memory and PID limits
 5. Claude Code runs the `run-autonomous` workflow:
    - Claims the card via MCP
@@ -267,55 +264,23 @@ remote_execution:
 **On kill**: Container is destroyed immediately. All uncommitted work is
 discarded.
 
-## Worker Image & UID Handling
+## Worker Image
 
-The worker image (`docker/Dockerfile.worker`) runs `entrypoint.sh` as root and
-drops privileges via [`gosu`](https://github.com/tianon/gosu) immediately before
-invoking Claude Code.
-
-### Dynamic UID/GID realignment
-
-On most Linux hosts the user running the runner has uid 1000. On others (e.g.,
-systems with pre-existing accounts, CI environments, or shared servers) the uid
-may differ. If the container's `user` account has a different uid, files created
-inside the container — cloned workspaces, git config, auth tokens — are owned by
-the wrong uid and the host user cannot read or modify them after the container
-exits.
-
-To solve this, the runner automatically passes `HOST_UID` and `HOST_GID` to
-every worker container:
-
-```
-HOST_UID=<uid of the runner process>
-HOST_GID=<gid of the runner process>
-```
-
-These values are obtained via `os/user.Current()` in Go. If the lookup fails
-(unusual; logged as a warning), the env vars are omitted and the container falls
-back to whatever uid `useradd` assigned.
+The worker image (`docker/Dockerfile.worker`) is Alpine-based and runs
+everything as a non-root `user` account (UID 1000). No privilege escalation or
+dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
 
 ### What happens inside the container
 
-`entrypoint.sh` runs as root and performs these steps before the privilege drop:
+`entrypoint.sh` runs as `user` and performs these steps:
 
-1. **UID/GID realignment** — if `HOST_UID`/`HOST_GID` are set, calls
-   `usermod -u $HOST_UID user` and `groupmod -g $HOST_GID user` so the
-   container's `user` account matches the host user exactly.
-2. **Auth setup** — copies OAuth tokens from the read-only `/claude-auth` mount,
-   writes `.claude.json` (MCP config), `.netrc` (GitHub token), and `.gitconfig`
-   — all as root, so no permission issues with the read-only mount.
-3. **Ownership fix** — runs `chown -R user:user /home/user` to hand all
-   root-created files to `user` before the privilege drop.
-4. **Privilege drop** — `exec gosu user claude ...` replaces the root process
-   with Claude Code running as `user`.
-
-The result is that Claude Code always runs as a non-root user whose uid matches
-the host runner, and all files written during the task are owned by that uid.
-
-### No uid 1000 requirement
-
-You do not need to ensure your host user has uid 1000. The runner detects and
-propagates the correct uid automatically.
+1. **Auth setup** — copies OAuth tokens from the read-only `/claude-auth` mount
+   into `~/.claude/`, writes `.claude.json` (MCP config), `.netrc` (GitHub
+   token), and `.gitconfig`.
+2. **Clone** — clones the project repository into `/home/user/workspace`.
+3. **Execute** — `exec claude` runs Claude Code in headless mode, which connects
+   to ContextMatrix via MCP tools to claim the card, execute the work, and
+   report completion.
 
 ## Webhook Protocol
 
@@ -416,15 +381,10 @@ Every container is launched with the following restrictions:
 
 ### Files in workspace owned by wrong user after container exits
 
-This can happen if the runner fails to obtain the current user's uid (rare; look
-for a `"failed to get current user"` warning in runner logs). When `HOST_UID`
-and `HOST_GID` are absent, the container's `user` account retains whatever uid
-`useradd` assigned (system-dependent).
-
-To resolve: ensure the runner process has a resolvable uid (normal on any
-standard Linux system), or explicitly set `HOST_UID` and `HOST_GID` as
-environment variables when launching the runner — the container entrypoint
-respects them regardless of how they arrive.
+The worker container runs as UID 1000. If the host user running the runner has a
+different UID, files created inside bind-mounted volumes will be owned by UID
+1000 on the host. This only matters for bind mounts — the default disposable
+container filesystem is discarded on exit.
 
 ### Orphan containers after runner crash
 
