@@ -55,6 +55,38 @@ cp config.yaml.example config.yaml
 ./contextmatrix-runner -config config.yaml
 ```
 
+## Service Management
+
+`svc.sh` manages contextmatrix-runner as a systemd user service. No root access
+is required — it uses `systemctl --user`.
+
+**Prerequisite:** Build the binary first (`make build`).
+
+```bash
+./svc.sh install    # Generate service file, reload daemon, enable on login
+./svc.sh start      # Start the service
+./svc.sh stop       # Stop the service
+./svc.sh status     # Show service status
+./svc.sh uninstall  # Stop, disable, and remove the service file
+```
+
+`install` writes the unit file to
+`~/.config/systemd/user/contextmatrix-runner.service`. It sets `ExecStart` and
+`WorkingDirectory` to the directory containing `svc.sh`, so the script resolves
+paths correctly regardless of where it is invoked from. The config file defaults
+to `config.yaml` in the same directory.
+
+The unit file is configured for graceful shutdown on stop: `KillMode=mixed` and
+`TimeoutStopSec=60` give running containers time to complete before being
+force-killed. The service restarts automatically on failure (`Restart=always`,
+`RestartSec=10`) and declares `After=docker.service`.
+
+To validate the script with shellcheck:
+
+```bash
+make lint-sh
+```
+
 ## GitHub App Setup
 
 The runner uses a GitHub App to generate short-lived installation tokens for git
@@ -222,7 +254,8 @@ remote_execution:
    - GitHub App token for git operations
    - Anthropic auth (OAuth tokens or API key)
    - `HOST_UID` and `HOST_GID` set to the runner process's uid/gid (for file
-     ownership alignment — see [Worker Image & UID Handling](#worker-image--uid-handling))
+     ownership alignment — see
+     [Worker Image & UID Handling](#worker-image--uid-handling))
    - All capabilities dropped, no-new-privileges, memory and PID limits
 5. Claude Code runs the `run-autonomous` workflow:
    - Claims the card via MCP
@@ -269,8 +302,8 @@ back to whatever uid `useradd` assigned.
    `usermod -u $HOST_UID user` and `groupmod -g $HOST_GID user` so the
    container's `user` account matches the host user exactly.
 2. **Auth setup** — copies OAuth tokens from the read-only `/claude-auth` mount,
-   writes `.claude.json` (MCP config), `.netrc` (GitHub token), and
-   `.gitconfig` — all as root, so no permission issues with the read-only mount.
+   writes `.claude.json` (MCP config), `.netrc` (GitHub token), and `.gitconfig`
+   — all as root, so no permission issues with the read-only mount.
 3. **Ownership fix** — runs `chown -R user:user /home/user` to hand all
    root-created files to `user` before the privilege drop.
 4. **Privilege drop** — `exec gosu user claude ...` replaces the root process
@@ -330,9 +363,9 @@ Every container is launched with the following restrictions:
   Prevents a runaway process from exhausting host memory.
 - **PID limit** (default 512, configurable via `container_pids_limit`). Prevents
   fork bombs from consuming all host PIDs.
-- **Image allowlist** (`allowed_images`). When set, only explicitly listed images
-  may be used. When empty, only the configured `base_image` is permitted. This
-  prevents trigger payloads from requesting execution of arbitrary images.
+- **Image allowlist** (`allowed_images`). When set, only explicitly listed
+  images may be used. When empty, only the configured `base_image` is permitted.
+  This prevents trigger payloads from requesting execution of arbitrary images.
 - **Disposable containers**. Each task gets a fresh environment, destroyed after
   completion. No state persists between runs.
 
@@ -377,8 +410,8 @@ Every container is launched with the following restrictions:
 
 - The runner automatically adds a `host.docker.internal` mapping to all
   containers, so this hostname works on both Docker Desktop and Linux
-- Verify `runner.public_url` in ContextMatrix config uses
-  `host.docker.internal` or the host's LAN IP — not `localhost`
+- Verify `runner.public_url` in ContextMatrix config uses `host.docker.internal`
+  or the host's LAN IP — not `localhost`
 - If it still fails, check Docker networking and firewall rules
 
 ### Files in workspace owned by wrong user after container exits
