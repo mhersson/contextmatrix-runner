@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint clean docker-worker
+.PHONY: build test test-race lint lint-sh clean docker-worker
 
 build:
 	go build -o contextmatrix-runner ./cmd/contextmatrix-runner
@@ -11,6 +11,9 @@ test-race:
 
 lint:
 	golangci-lint run
+
+lint-sh:
+	shellcheck svc.sh
 
 docker-worker:
 	docker build -f docker/Dockerfile.worker -t contextmatrix/worker:latest docker/
