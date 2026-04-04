@@ -63,6 +63,7 @@ git clone "${CM_REPO_URL}" /home/user/workspace
 cd /home/user/workspace
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
+chown -R user:user /home/user
 exec gosu user claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
     "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
