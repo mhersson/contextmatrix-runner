@@ -19,7 +19,9 @@ import (
 )
 
 func testManager(tr *tracker.Tracker) *container.Manager {
-	return container.NewManager(nil, tr, nil, nil, &config.Config{ContainerTimeout: "1h"}, nil)
+	cfg := &config.Config{ContainerTimeout: "1h"}
+	cfg.ParseContainerTimeout()
+	return container.NewManager(nil, tr, nil, nil, cfg, nil)
 }
 
 

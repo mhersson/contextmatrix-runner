@@ -60,11 +60,10 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 		return fmt.Errorf("marshal callback: %w", err)
 	}
 
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, body, ts)
-
 	var lastErr error
 	for attempt := range maxRetries {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, body, ts)
 		lastErr = c.doRequest(ctx, body, signature, ts)
 		if lastErr == nil {
 			return nil

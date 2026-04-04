@@ -27,6 +27,12 @@ api_key: ""
 # Env: CMR_BASE_IMAGE
 base_image: "contextmatrix/worker:latest"
 
+# Allowlist of permitted Docker images. When set, only these images may be used
+# (including via runner_image in the trigger payload). When empty, only base_image
+# is permitted — any runner_image override that differs from base_image is rejected.
+# No env var override (list type).
+allowed_images: []
+
 # When to pull the container image: always, never, if-not-present.
 # Use "never" or "if-not-present" for locally-built images.
 # Env: CMR_IMAGE_PULL_POLICY
@@ -39,6 +45,14 @@ max_concurrent: 3
 # Force-kill containers after this duration. Go duration format.
 # Env: CMR_CONTAINER_TIMEOUT
 container_timeout: "2h"
+
+# Memory limit per container in bytes. Default: 8 GiB (8589934592).
+# Env: CMR_CONTAINER_MEMORY_LIMIT
+container_memory_limit: 8589934592
+
+# Maximum number of PIDs per container. Default: 512.
+# Env: CMR_CONTAINER_PIDS_LIMIT
+container_pids_limit: 512
 
 # ----- Claude Code Authentication -----
 # At least one of claude_auth_dir or anthropic_api_key must be set.

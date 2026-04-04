@@ -64,22 +64,21 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.tracker.Count() >= h.maxConcurrent {
-		writeError(w, http.StatusTooManyRequests, "container limit reached")
-		return
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-	err := h.tracker.Add(&tracker.ContainerInfo{
+	err := h.tracker.AddIfUnderLimit(&tracker.ContainerInfo{
 		CardID:    payload.CardID,
 		Project:   payload.Project,
 		Image:     payload.RunnerImage,
 		StartedAt: time.Now(),
 		Cancel:    cancel,
-	})
+	}, h.maxConcurrent)
 	if err != nil {
 		cancel()
-		writeError(w, http.StatusConflict, "task already running: "+payload.CardID)
+		if strings.Contains(err.Error(), "container limit reached") {
+			writeError(w, http.StatusTooManyRequests, err.Error())
+		} else {
+			writeError(w, http.StatusConflict, "task already running: "+payload.CardID)
+		}
 		return
 	}
 
