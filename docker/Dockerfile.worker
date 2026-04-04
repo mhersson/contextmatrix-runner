@@ -24,11 +24,13 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANG
 # Install Claude Code CLI.
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create home directory writable by any UID (Docker --user overrides UID at runtime).
-RUN mkdir -p /home/user && chmod 777 /home/user
-WORKDIR /home/user
-
+# Copy entrypoint.
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh
+
+# Create non-root user at UID 1000 (Alpine has no default user at this UID).
+RUN adduser -D -u 1000 -s /bin/bash user
+USER user
+WORKDIR /home/user
 
 ENTRYPOINT ["/entrypoint.sh"]

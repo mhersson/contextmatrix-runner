@@ -171,13 +171,10 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	if m.cfg.AnthropicAPIKey != "" {
 		env = append(env, "ANTHROPIC_API_KEY="+m.cfg.AnthropicAPIKey)
 	}
-	// Determine host user for UID/GID mapping.
-	containerUser := "1000:1000"
 	if u, err := user.Current(); err != nil {
-		m.logger.Warn("failed to get current user; defaulting to UID 1000", "error", err)
+		m.logger.Warn("failed to get current user; HOST_UID/HOST_GID will not be set", "error", err)
 	} else {
 		env = append(env, "HOST_UID="+u.Uid, "HOST_GID="+u.Gid)
-		containerUser = u.Uid + ":" + u.Gid
 	}
 
 	// Build mounts.
@@ -196,7 +193,6 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	resp, err := m.docker.ContainerCreate(ctx,
 		&container.Config{
 			Image: img,
-			User:  containerUser,
 			Env:   env,
 			Labels: map[string]string{
 				LabelRunner:  "true",

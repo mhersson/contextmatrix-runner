@@ -1,16 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-export HOME=/home/user
-
 # ----- Claude Code Authentication -----
+# If OAuth tokens were mounted from the host, copy them to the writable home.
 if [ -d "/claude-auth" ]; then
-    mkdir -p "$HOME/.claude"
     cp -r /claude-auth/. "$HOME/.claude/" 2>/dev/null || true
 fi
 mkdir -p "$HOME/.claude"
 
 # Write MCP config for ContextMatrix server into ~/.claude.json
+# (Claude Code reads MCP servers from this file, not settings.json).
 MCP_HEADERS="{}"
 if [ -n "${CM_MCP_API_KEY:-}" ]; then
     MCP_HEADERS=$(jq -n --arg key "$CM_MCP_API_KEY" '{"Authorization": ("Bearer " + $key)}')
@@ -30,10 +29,13 @@ mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 git config --global user.name "ContextMatrix Runner"
 git config --global user.email "runner@contextmatrix.local"
 
+# Configure git to use GitHub App token via .netrc (keeps token out of git config).
 if [ -n "${CM_GIT_TOKEN:-}" ]; then
     printf 'machine github.com\nlogin x-access-token\npassword %s\n' "$CM_GIT_TOKEN" > "$HOME/.netrc"
     chmod 600 "$HOME/.netrc"
+    # Expose token for GitHub CLI (gh pr create, etc.).
     export GH_TOKEN="$CM_GIT_TOKEN"
+    # Redirect SSH-style URLs to HTTPS so .netrc credentials are used.
     git config --global url."https://github.com/".insteadOf "git@github.com:"
     git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
     git config --global url."https://github.com/".insteadOf "ssh://github.com/"
