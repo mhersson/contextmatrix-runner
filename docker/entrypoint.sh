@@ -13,7 +13,7 @@ export HOME=/home/user
 # ----- Claude Code Authentication -----
 # If OAuth tokens were mounted from the host, copy them to the writable home.
 if [ -d "/claude-auth" ]; then
-    cp -r /claude-auth/. "$HOME/.claude/" 2>/dev/null || true
+    cp -r --no-preserve=ownership /claude-auth/. "$HOME/.claude/" 2>/dev/null || true
 fi
 mkdir -p "$HOME/.claude"
 chown -R user:user "$HOME/.claude"
