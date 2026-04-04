@@ -9,10 +9,16 @@ export HOME=/home/user
 # files written inside the container are owned by the same uid/gid as the host
 # user. Falls back gracefully when the vars are not set.
 if [ -n "${HOST_UID:-}" ]; then
-    usermod -u "$HOST_UID" user
+    CURRENT_UID=$(id -u user)
+    if [ "$CURRENT_UID" != "$HOST_UID" ]; then
+        usermod -u "$HOST_UID" user
+    fi
 fi
 if [ -n "${HOST_GID:-}" ]; then
-    groupmod -g "$HOST_GID" user
+    CURRENT_GID=$(id -g user)
+    if [ "$CURRENT_GID" != "$HOST_GID" ]; then
+        groupmod -g "$HOST_GID" user
+    fi
 fi
 
 # ----- Claude Code Authentication -----
