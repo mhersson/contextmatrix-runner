@@ -26,6 +26,7 @@ RUN npm install -g @anthropic-ai/claude-code
 
 # Copy entrypoint (runs as root, creates user with HOST_UID, then drops to user).
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod 755 /entrypoint.sh
+COPY setup-and-run.sh /setup-and-run.sh
+RUN chmod 755 /entrypoint.sh /setup-and-run.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
