@@ -204,6 +204,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			Mounts:      mounts,
 			ExtraHosts:  []string{"host.docker.internal:host-gateway"},
 			CapDrop:     strslice.StrSlice{"ALL"},
+			CapAdd:      strslice.StrSlice{"CHOWN", "SETUID", "SETGID"},
 			SecurityOpt: []string{"no-new-privileges"},
 			Resources: container.Resources{
 				Memory:    m.cfg.ContainerMemoryLimit,

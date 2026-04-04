@@ -1,39 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-# Running as root. Set HOME explicitly (USER instruction removed from Dockerfile).
-export HOME=/home/user
+# ----- Create user with host-matching UID/GID -----
+TARGET_UID="${HOST_UID:-1000}"
+TARGET_GID="${HOST_GID:-1000}"
 
-# ----- Dynamic UID/GID Realignment -----
-# If the host passes HOST_UID / HOST_GID, realign the "user" account so that
-# files written inside the container are owned by the same uid/gid as the host
-# user. Falls back gracefully when the vars are not set.
-if [ -n "${HOST_UID:-}" ]; then
-    CURRENT_UID=$(id -u user)
-    if [ "$CURRENT_UID" != "$HOST_UID" ]; then
-        # Remove any non-system user blocking the target UID from passwd
-        BLOCKING_USER=$(getent passwd "$HOST_UID" | cut -d: -f1 || true)
-        if [ -n "$BLOCKING_USER" ] && [ "$HOST_UID" -ge 1000 ]; then
-            sed -i "/^${BLOCKING_USER}:/d" /etc/passwd /etc/shadow 2>/dev/null || true
-        fi
-        sed -i "s/^user:x:${CURRENT_UID}:/user:x:${HOST_UID}:/" /etc/passwd
-    fi
-fi
-if [ -n "${HOST_GID:-}" ]; then
-    CURRENT_GID=$(id -g user)
-    if [ "$CURRENT_GID" != "$HOST_GID" ]; then
-        # Remove any non-system group blocking the target GID
-        BLOCKING_GROUP=$(getent group "$HOST_GID" | cut -d: -f1 || true)
-        if [ -n "$BLOCKING_GROUP" ] && [ "$BLOCKING_GROUP" != "user" ] && [ "$HOST_GID" -ge 1000 ]; then
-            sed -i "/^${BLOCKING_GROUP}:/d" /etc/group /etc/gshadow 2>/dev/null || true
-        fi
-        sed -i "s/^user:x:${CURRENT_GID}:/user:x:${HOST_GID}:/" /etc/group
-    fi
-fi
+addgroup -g "$TARGET_GID" user 2>/dev/null || true
+adduser -D -u "$TARGET_UID" -G user -s /bin/bash -h /home/user user 2>/dev/null || true
+
+export HOME=/home/user
 
 # ----- Claude Code Authentication -----
 # If OAuth tokens were mounted from the host, copy them to the writable home.
-# Running as root here so the source files are always readable.
 if [ -d "/claude-auth" ]; then
     cp -r /claude-auth/. "$HOME/.claude/" 2>/dev/null || true
 fi
@@ -76,11 +54,13 @@ fi
 # ----- Clone and Execute -----
 echo "Cloning ${CM_REPO_URL}..."
 git clone "${CM_REPO_URL}" /home/user/workspace
+
+chown -R user:user /home/user
+
 cd /home/user/workspace
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
-chown -R user:user /home/user
-exec gosu user claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
+exec su-exec user claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
     "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
 
