@@ -1,12 +1,28 @@
 #!/bin/bash
 set -euo pipefail
 
+# Running as root. Set HOME explicitly (USER instruction removed from Dockerfile).
+export HOME=/home/user
+
+# ----- Dynamic UID/GID Realignment -----
+# If the host passes HOST_UID / HOST_GID, realign the "user" account so that
+# files written inside the container are owned by the same uid/gid as the host
+# user. Falls back gracefully when the vars are not set.
+if [ -n "${HOST_UID:-}" ]; then
+    usermod -u "$HOST_UID" user
+fi
+if [ -n "${HOST_GID:-}" ]; then
+    groupmod -g "$HOST_GID" user
+fi
+
 # ----- Claude Code Authentication -----
 # If OAuth tokens were mounted from the host, copy them to the writable home.
+# Running as root here so the source files are always readable.
 if [ -d "/claude-auth" ]; then
     cp -r /claude-auth/. "$HOME/.claude/" 2>/dev/null || true
 fi
 mkdir -p "$HOME/.claude"
+chown -R user:user "$HOME/.claude"
 
 # Write MCP config for ContextMatrix server into ~/.claude.json
 # (Claude Code reads MCP servers from this file, not settings.json).
@@ -47,7 +63,8 @@ git clone "${CM_REPO_URL}" /home/user/workspace
 cd /home/user/workspace
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
-exec claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
+chown -R user:user /home/user
+exec gosu user claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
     "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
 

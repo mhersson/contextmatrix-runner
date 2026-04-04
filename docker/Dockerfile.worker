@@ -2,7 +2,7 @@ FROM ubuntu:24.04
 
 # Install system dependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl git openssh-client ca-certificates build-essential jq \
+    curl git openssh-client ca-certificates build-essential jq gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 22 (required by Claude Code).
@@ -36,10 +36,8 @@ RUN npm install -g @anthropic-ai/claude-code
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh
 
-# Create non-root user with UID 1000 (matching typical host user).
-# Ubuntu 24.04 ships a default "ubuntu" user at UID 1000; remove it first.
-RUN userdel -r ubuntu 2>/dev/null || true && useradd -m -s /bin/bash -u 1000 user
-USER user
+# Create non-root user (UID assigned by system; entrypoint will realign via gosu).
+RUN useradd -m -s /bin/bash user
 WORKDIR /home/user
 
 ENTRYPOINT ["/entrypoint.sh"]
