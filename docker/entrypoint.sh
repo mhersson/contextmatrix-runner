@@ -11,23 +11,23 @@ export HOME=/home/user
 if [ -n "${HOST_UID:-}" ]; then
     CURRENT_UID=$(id -u user)
     if [ "$CURRENT_UID" != "$HOST_UID" ]; then
-        # Remove any existing non-system user that holds the target UID
+        # Remove any non-system user blocking the target UID from passwd
         BLOCKING_USER=$(getent passwd "$HOST_UID" | cut -d: -f1 || true)
         if [ -n "$BLOCKING_USER" ] && [ "$HOST_UID" -ge 1000 ]; then
-            userdel "$BLOCKING_USER"
+            sed -i "/^${BLOCKING_USER}:/d" /etc/passwd /etc/shadow 2>/dev/null || true
         fi
-        usermod -u "$HOST_UID" user
+        sed -i "s/^user:x:${CURRENT_UID}:/user:x:${HOST_UID}:/" /etc/passwd
     fi
 fi
 if [ -n "${HOST_GID:-}" ]; then
     CURRENT_GID=$(id -g user)
     if [ "$CURRENT_GID" != "$HOST_GID" ]; then
-        # Remove any existing non-system group that holds the target GID
+        # Remove any non-system group blocking the target GID
         BLOCKING_GROUP=$(getent group "$HOST_GID" | cut -d: -f1 || true)
         if [ -n "$BLOCKING_GROUP" ] && [ "$BLOCKING_GROUP" != "user" ] && [ "$HOST_GID" -ge 1000 ]; then
-            groupdel "$BLOCKING_GROUP"
+            sed -i "/^${BLOCKING_GROUP}:/d" /etc/group /etc/gshadow 2>/dev/null || true
         fi
-        groupmod -g "$HOST_GID" user
+        sed -i "s/^user:x:${CURRENT_GID}:/user:x:${HOST_GID}:/" /etc/group
     fi
 fi
 
