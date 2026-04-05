@@ -149,7 +149,7 @@ func TestRun_Success(t *testing.T) {
 	assert.Contains(t, createdEnv, "CM_CARD_ID=PROJ-042")
 	assert.Contains(t, createdEnv, "CM_PROJECT=my-project")
 	assert.Contains(t, createdEnv, "CM_MCP_URL=http://cm:8080/mcp")
-	assert.Contains(t, createdEnv, "CM_REPO_URL=git@github.com:org/repo.git")
+	assert.Contains(t, createdEnv, "CM_REPO_URL=https://github.com/org/repo.git")
 	assert.Contains(t, createdEnv, "ANTHROPIC_API_KEY=sk-test")
 
 	// Verify labels.
@@ -397,5 +397,59 @@ func TestSanitizeContainerName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.expected, sanitizeContainerName(tt.project, tt.cardID))
+	}
+}
+
+func TestNormalizeRepoURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "SCP-style with user",
+			input:    "git@github.com:org/repo.git",
+			expected: "https://github.com/org/repo.git",
+		},
+		{
+			name:     "SCP-style without user",
+			input:    "github.com:org/repo.git",
+			expected: "https://github.com/org/repo.git",
+		},
+		{
+			name:     "ssh scheme with user",
+			input:    "ssh://git@github.com/org/repo.git",
+			expected: "https://github.com/org/repo.git",
+		},
+		{
+			name:     "ssh scheme without user",
+			input:    "ssh://github.com/org/repo.git",
+			expected: "https://github.com/org/repo.git",
+		},
+		{
+			name:     "https passthrough",
+			input:    "https://github.com/org/repo.git",
+			expected: "https://github.com/org/repo.git",
+		},
+		{
+			name:     "http passthrough",
+			input:    "http://github.com/org/repo.git",
+			expected: "http://github.com/org/repo.git",
+		},
+		{
+			name:     "SCP-style with non-GitHub host",
+			input:    "git@gitlab.com:mygroup/myrepo.git",
+			expected: "https://gitlab.com/mygroup/myrepo.git",
+		},
+		{
+			name:     "ssh scheme with non-GitHub host",
+			input:    "ssh://git@bitbucket.org/team/project.git",
+			expected: "https://bitbucket.org/team/project.git",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, normalizeRepoURL(tt.input))
+		})
 	}
 }

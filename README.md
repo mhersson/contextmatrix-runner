@@ -366,6 +366,9 @@ Every container is launched with the following restrictions:
 
 - Verify the repo URL in the ContextMatrix project config matches an installed
   repo
+- Both HTTPS (`https://github.com/org/repo`) and SCP-style SSH
+  (`git@github.com:org/repo`) URLs are supported — SCP-style URLs are
+  automatically normalized to HTTPS before the container clones
 - Check that the GitHub App has "Contents: Read & Write" permission
 - If the token expired (>1 hour task), retry — the new container gets a fresh
   token

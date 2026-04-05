@@ -163,7 +163,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		"CM_CARD_ID=" + payload.CardID,
 		"CM_PROJECT=" + payload.Project,
 		"CM_MCP_URL=" + payload.MCPURL,
-		"CM_REPO_URL=" + payload.RepoURL,
+		"CM_REPO_URL=" + normalizeRepoURL(payload.RepoURL),
 		"CM_GIT_TOKEN=" + gitToken,
 	}
 	if payload.MCPAPIKey != "" {
@@ -420,6 +420,43 @@ func (m *Manager) pullImage(ctx context.Context, img string) error {
 }
 
 var containerNameRe = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
+
+// scpRe matches SCP-style git remote URLs of the form [user@]host:path
+// where path does not begin with a slash (which would indicate an absolute
+// ssh:// URI instead).  Examples: git@github.com:org/repo.git
+var scpRe = regexp.MustCompile(`^([^@:/\s]+@)?([^:/\s]+):([^/].*)$`)
+
+// normalizeRepoURL converts SCP-style and ssh:// git remote URLs to their
+// HTTPS equivalents so the container can authenticate with a token rather
+// than an SSH key.
+//
+//   git@github.com:org/repo.git        → https://github.com/org/repo.git
+//   ssh://git@github.com/org/repo.git  → https://github.com/org/repo.git
+//   ssh://github.com/org/repo.git      → https://github.com/org/repo.git
+//   https://github.com/org/repo.git    → (unchanged)
+func normalizeRepoURL(rawURL string) string {
+	// SCP-style: [user@]host:path (path must not start with /).
+	if m := scpRe.FindStringSubmatch(rawURL); m != nil {
+		host := m[2]
+		path := m[3]
+		return "https://" + host + "/" + path
+	}
+
+	// Parse generic URL schemes.
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+
+	if u.Scheme == "ssh" {
+		// Strip the user info (e.g. "git@") and rewrite to https.
+		u.Scheme = "https"
+		u.User = nil
+		return u.String()
+	}
+
+	return rawURL
+}
 
 func sanitizeContainerName(project, cardID string) string {
 	name := fmt.Sprintf("cmr-%s-%s", project, cardID)
