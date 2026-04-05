@@ -281,9 +281,11 @@ dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
 
 `entrypoint.sh` runs as `user` and performs these steps:
 
-1. **Auth setup** — copies OAuth tokens from the read-only `/claude-auth` mount
-   into `~/.claude/`, writes `.claude.json` (MCP config), `.netrc` (GitHub
-   token), and `.gitconfig`.
+1. **Auth setup** — if OAuth tokens were mounted from `/claude-auth`, copies
+   them into `~/.claude/`. Alternatively, if `anthropic_api_key` is configured,
+   it is injected as the `ANTHROPIC_API_KEY` env var at container creation time
+   (no entrypoint logic needed). Writes `.claude.json` (MCP config), `.netrc`
+   (GitHub token), and `.gitconfig`.
 2. **Clone** — clones the project repository into `/home/user/workspace`.
 3. **Execute** — `exec claude` runs Claude Code in headless mode, which connects
    to ContextMatrix via MCP tools to claim the card, execute the work, and
