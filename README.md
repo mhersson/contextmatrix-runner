@@ -4,6 +4,13 @@ A self-hosted runner that receives webhooks from
 [ContextMatrix](https://github.com/mhersson/contextmatrix) and spawns disposable
 Docker containers to execute autonomous AI tasks using Claude Code.
 
+<video src="https://github.com/user-attachments/assets/5202b397-c12e-4952-81ba-dbf88c1e830d" autoplay muted playsinline></video>
+
+_*A user clicks **Run Now** on a card in the ContextMatrix web UI, triggering
+the runner to spin up a container. Inside it, Claude Code executes the task,
+creates a PR, and completes the card - then the runner cleans up the container.
+(Video is sped up and edited.)*_
+
 ## Architecture
 
 ```text
