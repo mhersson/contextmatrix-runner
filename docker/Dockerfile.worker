@@ -11,7 +11,7 @@ RUN apk add --no-cache \
 ARG GO_VERSION=1.26.1
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
     | tar -C /usr/local -xzf -
-ENV PATH="/usr/local/go/bin:/home/user/go/bin:${PATH}"
+ENV PATH="/usr/local/go/bin:/home/user/go/bin:/home/user/.local/bin:${PATH}"
 
 # Install gopls (Go language server for Claude Code LSP integration).
 RUN GOBIN=/usr/local/go/bin go install golang.org/x/tools/gopls@latest
@@ -21,9 +21,6 @@ ARG GOLANGCI_LINT_VERSION=v2.11.3
 RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh \
     | sh -s -- -b /usr/local/bin ${GOLANGCI_LINT_VERSION}
 
-# Install Claude Code CLI.
-RUN npm install -g @anthropic-ai/claude-code
-
 # Copy entrypoint.
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh
@@ -32,5 +29,8 @@ RUN chmod 755 /entrypoint.sh
 RUN adduser -D -u 1000 -s /bin/bash user
 USER user
 WORKDIR /home/user
+
+# Install Claude Code CLI.
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 ENTRYPOINT ["/entrypoint.sh"]
