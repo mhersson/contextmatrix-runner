@@ -7,12 +7,33 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"regexp"
 	"strings"
 )
 
 // maxScannerBuf is the maximum token size for the scanner. Thinking blocks
 // can be very long, so we allocate a generous buffer.
 const maxScannerBuf = 1 << 20 // 1 MiB
+
+// secretPatterns matches common credential formats that should never appear in
+// logs. Compiled once at package init time.
+var secretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`ghp_[A-Za-z0-9_]{36,}`),          // GitHub personal access token
+	regexp.MustCompile(`gho_[A-Za-z0-9_]{36,}`),          // GitHub OAuth token
+	regexp.MustCompile(`ghu_[A-Za-z0-9_]{36,}`),          // GitHub user-to-server token
+	regexp.MustCompile(`ghs_[A-Za-z0-9_]{36,}`),          // GitHub server-to-server token
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`),   // GitHub fine-grained PAT
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`),      // Anthropic API key
+	regexp.MustCompile(`Bearer\s+[A-Za-z0-9._\-/+]{20,}`), // Bearer tokens in output
+}
+
+// Redact replaces recognized secret patterns with [REDACTED].
+func Redact(s string) string {
+	for _, re := range secretPatterns {
+		s = re.ReplaceAllString(s, "[REDACTED]")
+	}
+	return s
+}
 
 // event is the top-level structure of every stream-json line.
 type event struct {
@@ -67,9 +88,9 @@ func ProcessStream(r io.Reader, logger *slog.Logger) {
 		for _, block := range ev.Message.Content {
 			switch block.Type {
 			case "text":
-				logger.Info("claude", "claude_text", block.Text)
+				logger.Info("claude", "claude_text", Redact(block.Text))
 			case "thinking":
-				logger.Info("claude", "claude_thinking", block.Thinking)
+				logger.Info("claude", "claude_thinking", Redact(block.Thinking))
 			case "tool_use":
 				if strings.HasPrefix(block.Name, "mcp__") {
 					continue

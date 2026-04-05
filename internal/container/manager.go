@@ -243,13 +243,11 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 		if result.StatusCode != 0 {
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
 			log.Warn(msg, "exit_code", result.StatusCode)
-			reportCtx := context.Background()
-			m.reportFailure(reportCtx, payload, msg)
+			m.reportFailure(context.Background(), payload, msg)
 			return
 		}
 		log.Info("container completed successfully")
-		reportCtx := context.Background()
-		m.reportCompleted(reportCtx, payload)
+		m.reportCompleted(context.Background(), payload)
 
 	case err := <-errCh:
 		if waitCtx.Err() != nil {
@@ -257,19 +255,21 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 			msg := fmt.Sprintf("container timed out after %s", timeout)
 			log.Warn(msg)
 			m.killContainer(context.Background(), containerID, log)
-			reportCtx := context.Background()
-			m.reportFailure(reportCtx, payload, msg)
+			<-logDone
+			m.reportFailure(context.Background(), payload, msg)
 			return
 		}
 		msg := fmt.Sprintf("wait error: %v", err)
 		log.Error(msg)
-		reportCtx := context.Background()
-		m.reportFailure(reportCtx, payload, msg)
+		m.killContainer(context.Background(), containerID, log)
+		<-logDone
+		m.reportFailure(context.Background(), payload, msg)
 
 	case <-ctx.Done():
 		// Parent context canceled (e.g., kill or shutdown).
 		log.Info("container canceled")
 		m.killContainer(context.Background(), containerID, log)
+		<-logDone
 	}
 }
 

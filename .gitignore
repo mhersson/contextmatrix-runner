@@ -1,2 +1,25 @@
+# Binary
 contextmatrix-runner
+
+# Configuration with secrets
 config.yaml
+.env
+.env.*
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+
+# Logs
+*.log

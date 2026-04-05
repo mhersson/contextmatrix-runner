@@ -181,3 +181,68 @@ func TestProcessStream_EmptyReader(t *testing.T) {
 	ProcessStream(strings.NewReader(""), logger)
 	assert.Empty(t, *records)
 }
+
+func TestRedact(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "GitHub PAT",
+			input: "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn",
+			want:  "token: [REDACTED]",
+		},
+		{
+			name:  "GitHub server token",
+			input: "using ghs_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn for auth",
+			want:  "using [REDACTED] for auth",
+		},
+		{
+			name:  "GitHub fine-grained PAT",
+			input: "github_pat_ABCDEFGHIJKLMNOPQRSTUV1234",
+			want:  "[REDACTED]",
+		},
+		{
+			name:  "Anthropic key",
+			input: "key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+			want:  "key is [REDACTED]",
+		},
+		{
+			name:  "Bearer token",
+			input: "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abcdef",
+			want:  "Authorization: [REDACTED]",
+		},
+		{
+			name:  "no secrets",
+			input: "normal log output with no secrets",
+			want:  "normal log output with no secrets",
+		},
+		{
+			name:  "empty string",
+			input: "",
+			want:  "",
+		},
+		{
+			name:  "short token-like strings not matched",
+			input: "ghp_short is fine",
+			want:  "ghp_short is fine",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, Redact(tc.input))
+		})
+	}
+}
+
+func TestProcessStream_RedactsSecrets(t *testing.T) {
+	input := `{"type":"assistant","message":{"content":[{"type":"text","text":"token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"}]}}`
+
+	logger, records := newTestLogger()
+	ProcessStream(strings.NewReader(input), logger)
+
+	assert.Len(t, *records, 1)
+	assert.Equal(t, "token is [REDACTED]", attr((*records)[0], "claude_text"))
+}
