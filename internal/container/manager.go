@@ -170,6 +170,10 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		env = append(env, "CM_MCP_API_KEY="+payload.MCPAPIKey)
 	}
 
+	if m.cfg.ClaudeSettings != "" {
+		env = append(env, "CM_CLAUDE_SETTINGS="+m.cfg.ClaudeSettings)
+	}
+
 	// Apply highest-priority auth method only.
 	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
 	var mounts []mount.Mount

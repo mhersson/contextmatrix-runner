@@ -75,6 +75,14 @@ claude_oauth_token: ""
 # Env: CMR_ANTHROPIC_API_KEY
 anthropic_api_key: ""
 
+# ----- Claude Code Settings -----
+
+# Raw JSON written to /home/user/.claude/settings.json inside the container.
+# Use this to configure Claude Code behaviour (plugins, preferences, etc.).
+# Must be valid JSON if set. Empty string disables the feature.
+# Env: CMR_CLAUDE_SETTINGS
+# claude_settings: '{"includeCoAuthoredBy":false,"enabledPlugins":{"gopls-lsp@claude-plugins-official":true,"typescript-lsp@claude-plugins-official":true}}'
+
 # ----- GitHub App (Git Credentials) -----
 # The runner uses a GitHub App to generate short-lived installation tokens
 # for git clone/push operations. See README.md for setup instructions.

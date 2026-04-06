@@ -339,6 +339,95 @@ func TestContainerTimeoutDuration(t *testing.T) {
 	assert.Equal(t, 2*60*60*1e9, float64(cfg.ContainerTimeoutDuration()))
 }
 
+func TestValidate_ClaudeSettings(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	baseConfig := func() *Config {
+		return &Config{
+			ContextMatrixURL: "http://localhost",
+			APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			BaseImage:        "img",
+			ImagePullPolicy:  PullAlways,
+			MaxConcurrent:    1,
+			ContainerTimeout: "1h",
+			AnthropicAPIKey:  "sk-ant-test",
+			GitHubApp: GitHubApp{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		settings string
+		wantErr  bool
+	}{
+		{
+			name:     "empty string is valid",
+			settings: "",
+			wantErr:  false,
+		},
+		{
+			name:     "valid JSON object passes",
+			settings: `{"includeCoAuthoredBy":false,"enabledPlugins":{"gopls-lsp@claude-plugins-official":true}}`,
+			wantErr:  false,
+		},
+		{
+			name:     "invalid JSON fails",
+			settings: `{not valid json`,
+			wantErr:  true,
+		},
+		{
+			name:     "plain string is invalid JSON",
+			settings: "hello",
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.ClaudeSettings = tt.settings
+			err := cfg.Validate()
+			if tt.wantErr {
+				assert.ErrorContains(t, err, "claude_settings is not valid JSON")
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestLoad_ClaudeSettingsEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	validJSON := `{"includeCoAuthoredBy":false}`
+	t.Setenv("CMR_CLAUDE_SETTINGS", validJSON)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, validJSON, cfg.ClaudeSettings)
+}
+
+func TestLoad_ClaudeSettingsEnvOverride_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	t.Setenv("CMR_CLAUDE_SETTINGS", "{invalid json")
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "claude_settings is not valid JSON")
+}
+
 func TestLogLevelSlog(t *testing.T) {
 	tests := []struct {
 		level    string

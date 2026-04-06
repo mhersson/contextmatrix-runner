@@ -8,6 +8,12 @@ if [ -d "/claude-auth" ]; then
 fi
 mkdir -p "$HOME/.claude"
 
+# Write claude settings.json if provided via env var.
+# This runs after the optional claude-auth copy so it always wins.
+if [ -n "${CM_CLAUDE_SETTINGS:-}" ]; then
+    printf '%s' "$CM_CLAUDE_SETTINGS" > "$HOME/.claude/settings.json"
+fi
+
 # Write MCP config for ContextMatrix server into ~/.claude.json
 # (Claude Code reads MCP servers from this file, not settings.json).
 MCP_HEADERS="{}"

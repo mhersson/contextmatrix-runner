@@ -508,6 +508,75 @@ func TestAuthPriority_OAuthTokenOnly(t *testing.T) {
 	}
 }
 
+// TestClaudeSettings_EnvVarPresentWhenSet verifies that CM_CLAUDE_SETTINGS is
+// injected into the container env when cfg.ClaudeSettings is non-empty.
+func TestClaudeSettings_EnvVarPresentWhenSet(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClaudeSettings = `{"enabledTools":["Bash","Edit"]}`
+
+	env, _ := buildAuthTestManager(t, cfg)
+
+	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"enabledTools":["Bash","Edit"]}`)
+}
+
+// TestClaudeSettings_EnvVarAbsentWhenEmpty verifies that CM_CLAUDE_SETTINGS is
+// not injected when cfg.ClaudeSettings is empty.
+func TestClaudeSettings_EnvVarAbsentWhenEmpty(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClaudeSettings = ""
+
+	env, _ := buildAuthTestManager(t, cfg)
+
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "CM_CLAUDE_SETTINGS="), "CM_CLAUDE_SETTINGS must not be set when ClaudeSettings is empty")
+	}
+}
+
+// TestClaudeSettings_WithClaudeAuthDir verifies that CM_CLAUDE_SETTINGS is
+// injected alongside the claude-auth directory mount.
+func TestClaudeSettings_WithClaudeAuthDir(t *testing.T) {
+	dir := t.TempDir()
+
+	cfg := testConfig()
+	cfg.ClaudeAuthDir = dir
+	cfg.ClaudeSettings = `{"model":"claude-sonnet-4-6"}`
+
+	env, mounts := buildAuthTestManager(t, cfg)
+
+	assert.Contains(t, mounts, "/claude-auth", "claude-auth mount should be present")
+	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"model":"claude-sonnet-4-6"}`)
+}
+
+// TestClaudeSettings_WithOAuthToken verifies that CM_CLAUDE_SETTINGS is
+// injected alongside the OAuth token env var.
+func TestClaudeSettings_WithOAuthToken(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClaudeAuthDir = ""
+	cfg.ClaudeOAuthToken = "oauth-tok"
+	cfg.AnthropicAPIKey = ""
+	cfg.ClaudeSettings = `{"theme":"dark"}`
+
+	env, _ := buildAuthTestManager(t, cfg)
+
+	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-tok")
+	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"theme":"dark"}`)
+}
+
+// TestClaudeSettings_WithAPIKey verifies that CM_CLAUDE_SETTINGS is
+// injected alongside the Anthropic API key env var.
+func TestClaudeSettings_WithAPIKey(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClaudeAuthDir = ""
+	cfg.ClaudeOAuthToken = ""
+	cfg.AnthropicAPIKey = "sk-test-key"
+	cfg.ClaudeSettings = `{"permissions":{"allow":["Bash"]}}`
+
+	env, _ := buildAuthTestManager(t, cfg)
+
+	assert.Contains(t, env, "ANTHROPIC_API_KEY=sk-test-key")
+	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"permissions":{"allow":["Bash"]}}`)
+}
+
 func TestSanitizeContainerName(t *testing.T) {
 	tests := []struct {
 		project  string

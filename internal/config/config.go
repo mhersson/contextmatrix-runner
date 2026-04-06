@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -37,6 +38,7 @@ type Config struct {
 	ClaudeAuthDir        string    `yaml:"claude_auth_dir"`
 	ClaudeOAuthToken     string    `yaml:"claude_oauth_token"`
 	AnthropicAPIKey      string    `yaml:"anthropic_api_key"`
+	ClaudeSettings       string    `yaml:"claude_settings"`
 	GitHubApp            GitHubApp `yaml:"github_app"`
 	LogLevel             string    `yaml:"log_level"`
 
@@ -142,6 +144,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("claude_auth_dir does not exist: %w", err)
 		}
 	}
+	if c.ClaudeSettings != "" && !json.Valid([]byte(c.ClaudeSettings)) {
+		return fmt.Errorf("claude_settings is not valid JSON")
+	}
 	if err := c.GitHubApp.validate(); err != nil {
 		return fmt.Errorf("github_app: %w", err)
 	}
@@ -208,6 +213,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("CMR_ANTHROPIC_API_KEY"); v != "" {
 		cfg.AnthropicAPIKey = v
+	}
+	if v := os.Getenv("CMR_CLAUDE_SETTINGS"); v != "" {
+		cfg.ClaudeSettings = v
 	}
 	if v := os.Getenv("CMR_GITHUB_APP_ID"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {

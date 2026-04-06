@@ -215,6 +215,12 @@ claude_oauth_token: ""
 # Env: CMR_ANTHROPIC_API_KEY
 anthropic_api_key: ""
 
+# Raw JSON written to /home/user/.claude/settings.json inside each container.
+# Use this to configure Claude Code behaviour. Must be valid JSON if set.
+# If invalid, the runner exits on startup.
+# Env: CMR_CLAUDE_SETTINGS
+# claude_settings: '{"includeCoAuthoredBy":false}'
+
 # GitHub App credentials (see setup above).
 github_app:
   app_id: 0 # CMR_GITHUB_APP_ID
@@ -292,6 +298,9 @@ dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
      var at container creation time (no entrypoint logic needed)
    - `anthropic_api_key`: injected as `ANTHROPIC_API_KEY` env var at container
      creation time (no entrypoint logic needed)
+
+   If `claude_settings` is configured, writes it to `~/.claude/settings.json`
+   after the optional auth-dir copy, so it always takes precedence.
 
    Also writes `.claude.json` (MCP config), `.netrc` (GitHub token), and
    `.gitconfig`.
