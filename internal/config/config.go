@@ -35,6 +35,7 @@ type Config struct {
 	ContainerMemoryLimit int64     `yaml:"container_memory_limit"`
 	ContainerPidsLimit   int64     `yaml:"container_pids_limit"`
 	ClaudeAuthDir        string    `yaml:"claude_auth_dir"`
+	ClaudeOAuthToken     string    `yaml:"claude_oauth_token"`
 	AnthropicAPIKey      string    `yaml:"anthropic_api_key"`
 	GitHubApp            GitHubApp `yaml:"github_app"`
 	LogLevel             string    `yaml:"log_level"`
@@ -133,8 +134,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("container_timeout is invalid: %w", err)
 	}
 	c.containerTimeoutDuration = d
-	if c.ClaudeAuthDir == "" && c.AnthropicAPIKey == "" {
-		return fmt.Errorf("at least one of claude_auth_dir or anthropic_api_key is required")
+	if c.ClaudeAuthDir == "" && c.ClaudeOAuthToken == "" && c.AnthropicAPIKey == "" {
+		return fmt.Errorf("at least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key is required")
 	}
 	if c.ClaudeAuthDir != "" {
 		if _, err := os.Stat(c.ClaudeAuthDir); err != nil {
@@ -201,6 +202,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("CMR_CLAUDE_AUTH_DIR"); v != "" {
 		cfg.ClaudeAuthDir = v
+	}
+	if v := os.Getenv("CMR_CLAUDE_OAUTH_TOKEN"); v != "" {
+		cfg.ClaudeOAuthToken = v
 	}
 	if v := os.Getenv("CMR_ANTHROPIC_API_KEY"); v != "" {
 		cfg.AnthropicAPIKey = v
