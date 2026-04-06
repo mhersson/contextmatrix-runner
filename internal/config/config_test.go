@@ -137,7 +137,7 @@ func TestValidate_NoCCAuth(t *testing.T) {
 		},
 	}
 	err := cfg.Validate()
-	assert.ErrorContains(t, err, "at least one of claude_auth_dir or anthropic_api_key")
+	assert.ErrorContains(t, err, "at least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key is required")
 }
 
 func TestValidate_AnthropicAPIKeyAlone(t *testing.T) {
@@ -160,6 +160,118 @@ func TestValidate_AnthropicAPIKeyAlone(t *testing.T) {
 	}
 	err := cfg.Validate()
 	assert.NoError(t, err)
+}
+
+func TestValidate_ClaudeOAuthTokenAlone(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := &Config{
+		ContextMatrixURL: "http://localhost",
+		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:        "img",
+		ImagePullPolicy:  PullAlways,
+		MaxConcurrent:    1,
+		ContainerTimeout: "1h",
+		ClaudeOAuthToken: "oauth-token-value",
+		GitHubApp: GitHubApp{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+	err := cfg.Validate()
+	assert.NoError(t, err)
+}
+
+func TestValidate_AuthMethodsSatisfyRequirement(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	baseConfig := func() *Config {
+		return &Config{
+			ContextMatrixURL: "http://localhost",
+			APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			BaseImage:        "img",
+			ImagePullPolicy:  PullAlways,
+			MaxConcurrent:    1,
+			ContainerTimeout: "1h",
+			GitHubApp: GitHubApp{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		setup   func(cfg *Config)
+		wantErr bool
+	}{
+		{
+			name: "claude_auth_dir alone satisfies requirement",
+			setup: func(cfg *Config) {
+				cfg.ClaudeAuthDir = dir
+			},
+			wantErr: false,
+		},
+		{
+			name: "claude_oauth_token alone satisfies requirement",
+			setup: func(cfg *Config) {
+				cfg.ClaudeOAuthToken = "oauth-token-value"
+			},
+			wantErr: false,
+		},
+		{
+			name: "anthropic_api_key alone satisfies requirement",
+			setup: func(cfg *Config) {
+				cfg.AnthropicAPIKey = "sk-ant-test"
+			},
+			wantErr: false,
+		},
+		{
+			name:    "none set fails validation",
+			setup:   func(cfg *Config) {},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			tt.setup(cfg)
+			err := cfg.Validate()
+			if tt.wantErr {
+				assert.ErrorContains(t, err, "at least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key is required")
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestLoad_ClaudeOAuthTokenEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	// Config without any auth set — env override will provide the token.
+	content := `
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker:latest"
+github_app:
+  app_id: 12345
+  installation_id: 67890
+  private_key_path: "` + pemPath + `"
+`
+	path := writeConfig(t, dir, content)
+
+	t.Setenv("CMR_CLAUDE_OAUTH_TOKEN", "my-oauth-token-value")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "my-oauth-token-value", cfg.ClaudeOAuthToken)
 }
 
 func TestValidate_InvalidContainerTimeout(t *testing.T) {

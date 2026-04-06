@@ -385,6 +385,129 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 	assert.Equal(t, 0, tr.Count())
 }
 
+// buildAuthTestManager creates a manager with a mock that captures env and mounts,
+// runs a container, and returns the captured values. The cfg argument controls auth.
+func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mounts []string) {
+	t.Helper()
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, c *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			env = c.Env
+			for _, m := range hc.Mounts {
+				mounts = append(mounts, m.Target)
+			}
+			return container.CreateResponse{ID: "auth-test-ctr"}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(cbSrv.Close)
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, cfg, testLogger())
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	return env, mounts
+}
+
+// TestAuthPriority_ClaudeAuthDir verifies that when ClaudeAuthDir is set alongside
+// oauth token and API key, only the directory mount is used — no auth env vars injected.
+func TestAuthPriority_ClaudeAuthDir(t *testing.T) {
+	// Create a temporary directory to use as ClaudeAuthDir so validation passes.
+	dir := t.TempDir()
+
+	cfg := testConfig()
+	cfg.ClaudeAuthDir = dir
+	cfg.ClaudeOAuthToken = "oauth-tok"
+	cfg.AnthropicAPIKey = "sk-api"
+
+	env, mounts := buildAuthTestManager(t, cfg)
+
+	// Mount should be present.
+	assert.Contains(t, mounts, "/claude-auth", "claude-auth mount should be present")
+
+	// No auth env vars should be injected.
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when ClaudeAuthDir is highest priority")
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be set when ClaudeAuthDir is highest priority")
+	}
+}
+
+// TestAuthPriority_OAuthToken verifies that when ClaudeAuthDir is unset but
+// ClaudeOAuthToken and AnthropicAPIKey are both set, only the OAuth token env var is injected.
+func TestAuthPriority_OAuthToken(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClaudeAuthDir = ""
+	cfg.ClaudeOAuthToken = "oauth-tok"
+	cfg.AnthropicAPIKey = "sk-api"
+
+	env, mounts := buildAuthTestManager(t, cfg)
+
+	// No mount should be present.
+	assert.Empty(t, mounts, "no mounts should be present when using oauth token")
+
+	// Only CLAUDE_CODE_OAUTH_TOKEN should be injected.
+	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-tok")
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when OAuth token takes priority")
+	}
+}
+
+// TestAuthPriority_APIKeyOnly verifies that when only AnthropicAPIKey is set,
+// only ANTHROPIC_API_KEY is injected and no mounts are added.
+func TestAuthPriority_APIKeyOnly(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClaudeAuthDir = ""
+	cfg.ClaudeOAuthToken = ""
+	cfg.AnthropicAPIKey = "sk-only"
+
+	env, mounts := buildAuthTestManager(t, cfg)
+
+	assert.Empty(t, mounts, "no mounts should be present when using API key only")
+	assert.Contains(t, env, "ANTHROPIC_API_KEY=sk-only")
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be set when only API key is configured")
+	}
+}
+
+// TestAuthPriority_OAuthTokenOnly verifies that when only ClaudeOAuthToken is set,
+// only CLAUDE_CODE_OAUTH_TOKEN is injected and no mounts are added.
+func TestAuthPriority_OAuthTokenOnly(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClaudeAuthDir = ""
+	cfg.ClaudeOAuthToken = "oauth-only"
+	cfg.AnthropicAPIKey = ""
+
+	env, mounts := buildAuthTestManager(t, cfg)
+
+	assert.Empty(t, mounts, "no mounts should be present when using OAuth token only")
+	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-only")
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when only OAuth token is configured")
+	}
+}
+
 func TestSanitizeContainerName(t *testing.T) {
 	tests := []struct {
 		project  string

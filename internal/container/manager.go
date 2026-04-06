@@ -169,19 +169,22 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	if payload.MCPAPIKey != "" {
 		env = append(env, "CM_MCP_API_KEY="+payload.MCPAPIKey)
 	}
-	if m.cfg.AnthropicAPIKey != "" {
-		env = append(env, "ANTHROPIC_API_KEY="+m.cfg.AnthropicAPIKey)
-	}
 
-	// Build mounts.
+	// Apply highest-priority auth method only.
+	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
 	var mounts []mount.Mount
 	if m.cfg.ClaudeAuthDir != "" {
+		// Mount the auth directory; no auth env vars injected.
 		mounts = append(mounts, mount.Mount{
 			Type:     mount.TypeBind,
 			Source:   m.cfg.ClaudeAuthDir,
 			Target:   "/claude-auth",
 			ReadOnly: true,
 		})
+	} else if m.cfg.ClaudeOAuthToken != "" {
+		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+m.cfg.ClaudeOAuthToken)
+	} else if m.cfg.AnthropicAPIKey != "" {
+		env = append(env, "ANTHROPIC_API_KEY="+m.cfg.AnthropicAPIKey)
 	}
 
 	name := sanitizeContainerName(payload.Project, payload.CardID)
