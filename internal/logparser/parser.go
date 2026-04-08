@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+
+	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 )
 
 // maxScannerBuf is the maximum token size for the scanner. Thinking blocks
@@ -64,7 +66,10 @@ type contentBlock struct {
 //
 // All other event types are silently skipped. Malformed JSON lines produce a
 // warning and do not interrupt processing.
-func ProcessStream(r io.Reader, logger *slog.Logger) {
+//
+// emit is called for each parsed block after the slog call. If emit is nil,
+// it is skipped (backward-compatible with callers that do not need broadcasting).
+func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogEntry)) {
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, maxScannerBuf)
 	scanner.Buffer(buf, maxScannerBuf)
@@ -88,14 +93,25 @@ func ProcessStream(r io.Reader, logger *slog.Logger) {
 		for _, block := range ev.Message.Content {
 			switch block.Type {
 			case "text":
-				logger.Info("claude", "claude_text", Redact(block.Text))
+				content := Redact(block.Text)
+				logger.Info("claude", "claude_text", content)
+				if emit != nil {
+					emit(logbroadcast.LogEntry{Type: "text", Content: content})
+				}
 			case "thinking":
-				logger.Info("claude", "claude_thinking", Redact(block.Thinking))
+				content := Redact(block.Thinking)
+				logger.Info("claude", "claude_thinking", content)
+				if emit != nil {
+					emit(logbroadcast.LogEntry{Type: "thinking", Content: content})
+				}
 			case "tool_use":
 				if strings.HasPrefix(block.Name, "mcp__") {
 					continue
 				}
 				logger.Info("claude", "claude_tool", block.Name)
+				if emit != nil {
+					emit(logbroadcast.LogEntry{Type: "tool_call", Content: block.Name})
+				}
 			}
 		}
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	"github.com/mhersson/contextmatrix-runner/internal/github"
+	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 	"github.com/mhersson/contextmatrix-runner/internal/webhook"
 )
@@ -57,7 +58,8 @@ func main() {
 	// Core components.
 	trk := tracker.New()
 	cb := callback.NewClient(cfg.ContextMatrixURL, cfg.APIKey, logger)
-	mgr := container.NewManager(docker, trk, cb, tokenProvider, cfg, logger)
+	broadcaster := logbroadcast.NewBroadcaster()
+	mgr := container.NewManager(docker, trk, cb, tokenProvider, broadcaster, cfg, logger)
 
 	// Clean up any orphan containers from a previous crash.
 	if err := mgr.CleanupOrphans(context.Background()); err != nil {
@@ -65,7 +67,7 @@ func main() {
 	}
 
 	// Webhook handler.
-	wh := webhook.NewHandler(mgr, trk, cfg.APIKey, cfg.MaxConcurrent, logger)
+	wh := webhook.NewHandler(mgr, trk, broadcaster, cfg.APIKey, cfg.MaxConcurrent, logger)
 	mux := http.NewServeMux()
 	wh.Register(mux)
 

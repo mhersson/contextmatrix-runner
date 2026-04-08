@@ -23,6 +23,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/github"
+	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/logparser"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
@@ -52,13 +53,14 @@ const (
 
 // Manager handles the lifecycle of Docker containers for task execution.
 type Manager struct {
-	docker   DockerClient
-	tracker  *tracker.Tracker
-	callback *callback.Client
-	token    *github.TokenProvider
-	cfg      *config.Config
-	logger   *slog.Logger
-	wg       sync.WaitGroup
+	docker      DockerClient
+	tracker     *tracker.Tracker
+	callback    *callback.Client
+	token       *github.TokenProvider
+	broadcaster *logbroadcast.Broadcaster
+	cfg         *config.Config
+	logger      *slog.Logger
+	wg          sync.WaitGroup
 }
 
 // NewManager creates a container manager.
@@ -67,16 +69,18 @@ func NewManager(
 	tracker *tracker.Tracker,
 	cb *callback.Client,
 	token *github.TokenProvider,
+	broadcaster *logbroadcast.Broadcaster,
 	cfg *config.Config,
 	logger *slog.Logger,
 ) *Manager {
 	return &Manager{
-		docker:   docker,
-		tracker:  tracker,
-		callback: cb,
-		token:    token,
-		cfg:      cfg,
-		logger:   logger,
+		docker:      docker,
+		tracker:     tracker,
+		callback:    cb,
+		token:       token,
+		broadcaster: broadcaster,
+		cfg:         cfg,
+		logger:      logger,
 	}
 }
 
@@ -115,6 +119,17 @@ func (m *Manager) run(ctx context.Context, payload RunConfig) {
 	}
 
 	m.tracker.UpdateContainerID(payload.Project, payload.CardID, containerID)
+
+	// Emit system event: container started.
+	if m.broadcaster != nil {
+		m.broadcaster.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			CardID:    payload.CardID,
+			Project:   payload.Project,
+			Type:      "system",
+			Content:   "container started",
+		})
+	}
 
 	// Report running status to CM.
 	if err := m.callback.ReportStatus(ctx, payload.CardID, payload.Project, "running", "container started"); err != nil {
@@ -235,7 +250,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 	defer m.removeContainer(context.Background(), containerID, log)
 
 	// Stream container logs in real time.
-	logDone := m.streamLogs(ctx, containerID, log)
+	logDone := m.streamLogs(ctx, containerID, payload, log)
 
 	// Apply container timeout.
 	timeout := m.cfg.ContainerTimeoutDuration()
@@ -250,10 +265,12 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 		if result.StatusCode != 0 {
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
 			log.Warn(msg, "exit_code", result.StatusCode)
+			m.emitSystem(payload, "container failed: "+msg)
 			m.reportFailure(context.Background(), payload, msg)
 			return
 		}
 		log.Info("container completed successfully")
+		m.emitSystem(payload, "container completed")
 		m.reportCompleted(context.Background(), payload)
 
 	case err := <-errCh:
@@ -263,6 +280,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 			log.Warn(msg)
 			m.killContainer(context.Background(), containerID, log)
 			<-logDone
+			m.emitSystem(payload, "container failed: "+msg)
 			m.reportFailure(context.Background(), payload, msg)
 			return
 		}
@@ -270,6 +288,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 		log.Error(msg)
 		m.killContainer(context.Background(), containerID, log)
 		<-logDone
+		m.emitSystem(payload, "container failed: "+msg)
 		m.reportFailure(context.Background(), payload, msg)
 
 	case <-ctx.Done():
@@ -277,12 +296,13 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 		log.Info("container canceled")
 		m.killContainer(context.Background(), containerID, log)
 		<-logDone
+		m.emitSystem(payload, "container canceled")
 	}
 }
 
 // streamLogs follows container stdout/stderr and logs each line. The returned
 // channel is closed when the stream ends (container exit or context cancel).
-func (m *Manager) streamLogs(ctx context.Context, containerID string, log *slog.Logger) <-chan struct{} {
+func (m *Manager) streamLogs(ctx context.Context, containerID string, payload RunConfig, log *slog.Logger) <-chan struct{} {
 	done := make(chan struct{})
 
 	reader, err := m.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
@@ -308,16 +328,37 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, log *slog.
 			_, _ = stdcopy.StdCopy(stdoutPw, stderrPw, reader)
 		}()
 
-		// Log stderr lines as warnings.
+		// Log stderr lines as warnings and emit to broadcaster.
 		go func() {
 			scanner := bufio.NewScanner(stderrPr)
 			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 			for scanner.Scan() {
-				log.Warn("container stderr", "line", scanner.Text())
+				line := scanner.Text()
+				log.Warn("container stderr", "line", line)
+				if m.broadcaster != nil {
+					m.broadcaster.Publish(logbroadcast.LogEntry{
+						Timestamp: time.Now(),
+						CardID:    payload.CardID,
+						Project:   payload.Project,
+						Type:      "stderr",
+						Content:   logparser.Redact(line),
+					})
+				}
 			}
 		}()
 
-		logparser.ProcessStream(stdoutPr, log)
+		// Build emit callback with card_id/project pre-filled from RunConfig.
+		var emit func(logbroadcast.LogEntry)
+		if m.broadcaster != nil {
+			emit = func(e logbroadcast.LogEntry) {
+				e.Timestamp = time.Now()
+				e.CardID = payload.CardID
+				e.Project = payload.Project
+				m.broadcaster.Publish(e)
+			}
+		}
+
+		logparser.ProcessStream(stdoutPr, log, emit)
 	}()
 
 	return done
@@ -349,6 +390,20 @@ func (m *Manager) reportCompleted(ctx context.Context, payload RunConfig) {
 	if err := m.callback.ReportStatus(ctx, payload.CardID, payload.Project, "completed", "container exited normally"); err != nil {
 		m.logger.Error("failed to report completed callback", "card_id", payload.CardID, "error", err)
 	}
+}
+
+// emitSystem publishes a system-type LogEntry to the broadcaster if one is set.
+func (m *Manager) emitSystem(payload RunConfig, content string) {
+	if m.broadcaster == nil {
+		return
+	}
+	m.broadcaster.Publish(logbroadcast.LogEntry{
+		Timestamp: time.Now(),
+		CardID:    payload.CardID,
+		Project:   payload.Project,
+		Type:      "system",
+		Content:   content,
+	})
 }
 
 // Kill stops and removes a specific container by project and card ID.

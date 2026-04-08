@@ -130,7 +130,7 @@ func TestRun_Success(t *testing.T) {
 	cb := callback.NewClient(origCbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -189,7 +189,7 @@ func TestRun_NonZeroExit(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -229,7 +229,7 @@ func TestRun_ImagePullFailure(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -271,7 +271,7 @@ func TestRun_CustomImage(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.AllowedImages = []string{"test-image:latest", "custom/image:v2"}
-	mgr := NewManager(mock, tr, cb, tp, cfg, testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
 
 	payload := testPayload()
 	payload.RunnerImage = "custom/image:v2"
@@ -289,7 +289,7 @@ func TestRun_CustomImage(t *testing.T) {
 func TestKill(t *testing.T) {
 	mock := &MockDockerClient{}
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
 
 	canceled := false
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -307,7 +307,7 @@ func TestKill(t *testing.T) {
 func TestKill_NotFound(t *testing.T) {
 	mock := &MockDockerClient{}
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
 
 	err := mgr.Kill("proj", "PROJ-999")
 	assert.ErrorContains(t, err, "no container tracked")
@@ -329,7 +329,7 @@ func TestCleanupOrphans(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.NoError(t, err)
@@ -370,7 +370,7 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -418,7 +418,7 @@ func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mount
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, cfg, testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  payload.CardID,

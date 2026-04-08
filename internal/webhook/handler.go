@@ -12,6 +12,7 @@ import (
 
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
+	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -21,6 +22,7 @@ type bodyKey struct{}
 type Handler struct {
 	manager       *container.Manager
 	tracker       *tracker.Tracker
+	broadcaster   *logbroadcast.Broadcaster
 	apiKey        string
 	maxConcurrent int
 	logger        *slog.Logger
@@ -30,6 +32,7 @@ type Handler struct {
 func NewHandler(
 	manager *container.Manager,
 	tracker *tracker.Tracker,
+	broadcaster *logbroadcast.Broadcaster,
 	apiKey string,
 	maxConcurrent int,
 	logger *slog.Logger,
@@ -37,6 +40,7 @@ func NewHandler(
 	return &Handler{
 		manager:       manager,
 		tracker:       tracker,
+		broadcaster:   broadcaster,
 		apiKey:        apiKey,
 		maxConcurrent: maxConcurrent,
 		logger:        logger,
@@ -48,6 +52,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /trigger", h.hmacAuth(h.handleTrigger))
 	mux.HandleFunc("POST /kill", h.hmacAuth(h.handleKill))
 	mux.HandleFunc("POST /stop-all", h.hmacAuth(h.handleStopAll))
+	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
 	mux.HandleFunc("GET /health", h.handleHealth)
 }
 
@@ -152,6 +157,95 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"ok":                  true,
 		"running_containers": h.tracker.Count(),
 	})
+}
+
+// handleLogs streams log entries via Server-Sent Events (SSE).
+// An optional ?project= query parameter filters entries by project name.
+func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	project := r.URL.Query().Get("project")
+
+	// Clear the write deadline — the server has a 30s WriteTimeout that would
+	// otherwise terminate the long-lived SSE connection.
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		if h.logger != nil {
+			h.logger.Debug("SSE could not clear write deadline", "error", err)
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Flush headers and send initial keepalive to trigger client onopen.
+	flusher.Flush()
+	if _, err := fmt.Fprintf(w, ": connected\n\n"); err != nil {
+		if h.logger != nil {
+			h.logger.Debug("SSE initial write failed", "error", err)
+		}
+		return
+	}
+	flusher.Flush()
+
+	ch, unsubscribe := h.broadcaster.Subscribe(project)
+	defer unsubscribe()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	if h.logger != nil {
+		h.logger.Info("SSE log client connected",
+			"project_filter", project,
+			"remote_addr", r.RemoteAddr,
+		)
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			if h.logger != nil {
+				h.logger.Info("SSE log client disconnected",
+					"project_filter", project,
+					"remote_addr", r.RemoteAddr,
+				)
+			}
+			return
+
+		case <-ticker.C:
+			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+				if h.logger != nil {
+					h.logger.Debug("SSE keepalive write failed", "error", err)
+				}
+				return
+			}
+			flusher.Flush()
+
+		case entry, ok := <-ch:
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(entry)
+			if err != nil {
+				if h.logger != nil {
+					h.logger.Debug("SSE marshal failed", "error", err)
+				}
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				if h.logger != nil {
+					h.logger.Debug("SSE event write failed", "error", err)
+				}
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 // hmacAuth is middleware that verifies HMAC signatures on incoming requests.
