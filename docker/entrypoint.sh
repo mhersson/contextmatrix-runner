@@ -48,9 +48,19 @@ if [ -n "${CM_GIT_TOKEN:-}" ]; then
 fi
 
 # ----- Clone and Execute -----
-echo "Cloning ${CM_REPO_URL}..."
-git clone "${CM_REPO_URL}" /home/user/workspace
+if [ -n "${CM_BASE_BRANCH:-}" ]; then
+    echo "Cloning ${CM_REPO_URL} (branch: ${CM_BASE_BRANCH})..."
+    git clone -b "${CM_BASE_BRANCH}" "${CM_REPO_URL}" /home/user/workspace
+else
+    echo "Cloning ${CM_REPO_URL}..."
+    git clone "${CM_REPO_URL}" /home/user/workspace
+fi
 cd /home/user/workspace
+
+BASE_BRANCH_CONTEXT=""
+if [ -n "${CM_BASE_BRANCH:-}" ]; then
+    BASE_BRANCH_CONTEXT="The base branch for this task is ${CM_BASE_BRANCH}. Create PRs targeting this branch using 'gh pr create --base ${CM_BASE_BRANCH}'."
+fi
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
 exec claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
@@ -66,4 +76,5 @@ IMPORTANT:
 - Never push to main or master.
 - Call heartbeat every 5 minutes during idle waits.
 - Call report_usage after every heartbeat call.
-- On completion, call release_card after transitioning to done — do NOT skip this."
+- On completion, call release_card after transitioning to done — do NOT skip this.
+${BASE_BRANCH_CONTEXT}"

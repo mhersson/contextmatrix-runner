@@ -36,6 +36,7 @@ type RunConfig struct {
 	RepoURL     string
 	MCPURL      string
 	MCPAPIKey   string
+	BaseBranch  string
 	RunnerImage string
 }
 
@@ -183,6 +184,9 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	}
 	if payload.MCPAPIKey != "" {
 		env = append(env, "CM_MCP_API_KEY="+payload.MCPAPIKey)
+	}
+	if payload.BaseBranch != "" {
+		env = append(env, "CM_BASE_BRANCH="+payload.BaseBranch)
 	}
 
 	if m.cfg.ClaudeSettings != "" {
