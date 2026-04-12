@@ -47,6 +47,14 @@ if [ -n "${CM_GIT_TOKEN:-}" ]; then
     git config --global url."https://github.com/".insteadOf "ssh://github.com/"
 fi
 
+# Validate branch name to prevent git option injection.
+if [ -n "${CM_BASE_BRANCH:-}" ]; then
+    if printf '%s' "$CM_BASE_BRANCH" | grep -qE '^-|[[:space:]]'; then
+        echo "ERROR: Invalid branch name: ${CM_BASE_BRANCH}" >&2
+        exit 1
+    fi
+fi
+
 # ----- Clone and Execute -----
 if [ -n "${CM_BASE_BRANCH:-}" ]; then
     echo "Cloning ${CM_REPO_URL} (branch: ${CM_BASE_BRANCH})..."
