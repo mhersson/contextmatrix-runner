@@ -157,14 +157,49 @@ func TestHandleTrigger_Duplicate(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
-		CardID:  "PROJ-042",
-		Project: "my-project",
-		RepoURL: "git@github.com:org/repo.git",
-		MCPURL:  "http://cm:8080/mcp",
+		CardID:     "PROJ-042",
+		Project:    "my-project",
+		RepoURL:    "git@github.com:org/repo.git",
+		MCPURL:     "http://cm:8080/mcp",
+		BaseBranch: "main",
 	})
 	h.hmacAuth(h.handleTrigger)(w, req)
 
 	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+// TestHandleTrigger_BaseBranchAccepted verifies that a payload containing
+// base_branch is parsed without error (no 400 Bad Request response).
+// The request conflicts with the pre-seeded duplicate so manager.Run is never
+// called, but the handler must successfully decode base_branch first.
+func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
+	tr := tracker.New()
+	// Seed a duplicate so the handler returns 409 before calling manager.Run,
+	// allowing manager to be nil while still exercising JSON decoding.
+	_ = tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-200",
+		Project: "my-project",
+	})
+
+	h := NewHandler(nil, tr, nil, testAPIKey, 3, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
+		CardID:     "PROJ-200",
+		Project:    "my-project",
+		RepoURL:    "git@github.com:org/repo.git",
+		MCPURL:     "http://cm:8080/mcp",
+		BaseBranch: "develop",
+	})
+	h.hmacAuth(h.handleTrigger)(w, req)
+
+	// 409 Conflict means the payload was parsed correctly (base_branch did not
+	// cause a 400) and the duplicate check fired as expected.
+	assert.Equal(t, http.StatusConflict, w.Code)
+	var resp Response
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+	assert.NotContains(t, resp.Error, "invalid JSON")
 }
 
 func TestHandleKill_NotFound(t *testing.T) {

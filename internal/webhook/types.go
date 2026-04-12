@@ -7,6 +7,7 @@ type TriggerPayload struct {
 	RepoURL     string `json:"repo_url"`
 	MCPURL      string `json:"mcp_url"`
 	MCPAPIKey   string `json:"mcp_api_key,omitempty"`
+	BaseBranch  string `json:"base_branch,omitempty"`
 	RunnerImage string `json:"runner_image,omitempty"`
 }
 

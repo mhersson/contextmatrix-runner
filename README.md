@@ -305,7 +305,11 @@ dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
    Also writes `.claude.json` (MCP config), `.netrc` (GitHub token), and
    `.gitconfig`.
 
-2. **Clone** — clones the project repository into `/home/user/workspace`.
+2. **Clone** — clones the project repository into `/home/user/workspace`. When
+   `base_branch` is set in the trigger payload, the clone uses `-b <branch>` so
+   work starts from the correct base. The Claude Code prompt is also extended
+   with an instruction to target that branch when creating PRs (`gh pr create
+   --base <branch>`).
 3. **Execute** — `exec claude` runs Claude Code in headless mode, which connects
    to ContextMatrix via MCP tools to claim the card, execute the work, and
    report completion.
@@ -326,6 +330,18 @@ HMAC computed over `timestamp.body`. Max 5-minute clock skew.
 
 Status callback values: `running` (container started), `failed` (error or
 non-zero exit), `completed` (clean exit).
+
+### Trigger payload fields
+
+| Field          | Type   | Required | Description                                                                              |
+| -------------- | ------ | -------- | ---------------------------------------------------------------------------------------- |
+| `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                     |
+| `project`      | string | yes      | Project name                                                                             |
+| `repo_url`     | string | yes      | Repository URL. HTTPS and SCP-style SSH (`git@github.com:org/repo`) are both supported. |
+| `mcp_url`      | string | yes      | ContextMatrix MCP endpoint URL                                                           |
+| `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                      |
+| `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted. |
+| `runner_image` | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.          |
 
 ## API Endpoints
 

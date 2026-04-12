@@ -93,6 +93,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		RepoURL:     payload.RepoURL,
 		MCPURL:      payload.MCPURL,
 		MCPAPIKey:   payload.MCPAPIKey,
+		BaseBranch:  payload.BaseBranch,
 		RunnerImage: payload.RunnerImage,
 	})
 

@@ -577,6 +577,90 @@ func TestClaudeSettings_WithAPIKey(t *testing.T) {
 	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"permissions":{"allow":["Bash"]}}`)
 }
 
+// TestBaseBranch_EnvVarPresentWhenSet verifies that CM_BASE_BRANCH is injected
+// into the container env when RunConfig.BaseBranch is non-empty.
+func TestBaseBranch_EnvVarPresentWhenSet(t *testing.T) {
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			assert.Contains(t, cfg.Env, "CM_BASE_BRANCH=main")
+			return container.CreateResponse{ID: "bb-test-ctr"}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	payload.BaseBranch = "main"
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+}
+
+// TestBaseBranch_EnvVarAbsentWhenEmpty verifies that CM_BASE_BRANCH is not
+// injected into the container env when RunConfig.BaseBranch is empty.
+func TestBaseBranch_EnvVarAbsentWhenEmpty(t *testing.T) {
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			for _, e := range cfg.Env {
+				assert.False(t, strings.HasPrefix(e, "CM_BASE_BRANCH="), "CM_BASE_BRANCH must not be set when BaseBranch is empty")
+			}
+			return container.CreateResponse{ID: "bb-test-ctr"}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	// BaseBranch is intentionally left empty (zero value).
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+}
+
 func TestSanitizeContainerName(t *testing.T) {
 	tests := []struct {
 		project  string
