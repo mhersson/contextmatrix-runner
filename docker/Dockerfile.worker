@@ -9,7 +9,8 @@ RUN apk add --no-cache \
 
 # Install Go.
 ARG GO_VERSION=1.26.1
-RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" \
     | tar -C /usr/local -xzf -
 ENV PATH="/usr/local/go/bin:/home/user/go/bin:/home/user/.local/bin:${PATH}"
 
