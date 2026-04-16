@@ -552,8 +552,8 @@ func (m *Manager) buildExtraHosts(mcpURL string) []string {
 	}
 
 	hostname := u.Hostname()
-	// Skip if it's an IP or localhost
-	if net.ParseIP(hostname) != nil || hostname == "localhost" {
+	// Skip if it's an IP, localhost, or host.docker.internal (already added via host-gateway above)
+	if net.ParseIP(hostname) != nil || hostname == "localhost" || hostname == "host.docker.internal" {
 		return hosts
 	}
 
