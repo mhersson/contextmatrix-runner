@@ -49,6 +49,7 @@ func main() {
 		cfg.GitHubApp.AppID,
 		cfg.GitHubApp.InstallationID,
 		cfg.GitHubApp.PrivateKeyPath,
+		github.WithAPIBaseURL(cfg.GitHubApp.APIBaseURL),
 	)
 	if err != nil {
 		logger.Error("failed to create GitHub token provider", "error", err)

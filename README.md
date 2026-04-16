@@ -95,7 +95,8 @@ private key stays on the runner host, and only ephemeral tokens (valid for 1
 hour) enter containers.
 
 **No inbound connections required.** The runner only makes outbound HTTPS calls
-to `api.github.com`. It works on a local LAN with no public domain.
+to the GitHub API (`api.github.com` or your enterprise endpoint). It works on a
+local LAN with no public domain.
 
 ### Step 1: Create the GitHub App
 
@@ -145,7 +146,16 @@ github_app:
   app_id: 123456
   installation_id: 78901234
   private_key_path: "/home/you/.config/contextmatrix-runner/app.pem"
+  # For GitHub Enterprise Cloud with Data Residency (GHEC-DR) or GHES:
+  # api_base_url: "https://api.acme.ghe.com"  # Env: CMR_GITHUB_API_BASE_URL
 ```
+
+For GitHub Enterprise, `api_base_url` must point to the enterprise API endpoint
+(e.g. `https://api.acme.ghe.com`). Leave it empty for standard `github.com`.
+The git host inside containers is derived automatically from the repo URL, so no
+extra git configuration is required. Set the matching `github.host` (or
+`github.api_base_url`) in ContextMatrix so both sides target the same enterprise
+instance.
 
 ## Configuration
 
@@ -226,6 +236,7 @@ github_app:
   app_id: 0 # CMR_GITHUB_APP_ID
   installation_id: 0 # CMR_GITHUB_INSTALLATION_ID
   private_key_path: "" # CMR_GITHUB_PRIVATE_KEY_PATH
+  # api_base_url: "https://api.acme.ghe.com"  # CMR_GITHUB_API_BASE_URL (GHEC-DR/GHES only)
 
 # Log level: debug, info, warn, error.
 # Env: CMR_LOG_LEVEL

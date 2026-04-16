@@ -37,14 +37,18 @@ git config --global user.email "runner@contextmatrix.local"
 
 # Configure git to use GitHub App token via .netrc (keeps token out of git config).
 if [ -n "${CM_GIT_TOKEN:-}" ]; then
-    printf 'machine github.com\nlogin x-access-token\npassword %s\n' "$CM_GIT_TOKEN" > "$HOME/.netrc"
+    GIT_HOST=$(printf '%s' "${CM_REPO_URL:-}" | sed -n 's#^https://\([^/]*\)/.*#\1#p')
+    [ -z "$GIT_HOST" ] && GIT_HOST="github.com"
+    printf 'machine %s\nlogin x-access-token\npassword %s\n' "$GIT_HOST" "$CM_GIT_TOKEN" > "$HOME/.netrc"
     chmod 600 "$HOME/.netrc"
     # Expose token for GitHub CLI (gh pr create, etc.).
     export GH_TOKEN="$CM_GIT_TOKEN"
+    # Required by gh CLI when targeting a non-github.com host.
+    export GH_HOST="$GIT_HOST"
     # Redirect SSH-style URLs to HTTPS so .netrc credentials are used.
-    git config --global url."https://github.com/".insteadOf "git@github.com:"
-    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-    git config --global url."https://github.com/".insteadOf "ssh://github.com/"
+    git config --global "url.https://${GIT_HOST}/".insteadOf "git@${GIT_HOST}:"
+    git config --global --add "url.https://${GIT_HOST}/".insteadOf "ssh://git@${GIT_HOST}/"
+    git config --global --add "url.https://${GIT_HOST}/".insteadOf "ssh://${GIT_HOST}/"
 fi
 
 # Validate branch name to prevent git option injection.

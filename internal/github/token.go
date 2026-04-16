@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -22,6 +23,20 @@ const (
 	tokenRequestTimeout = 10 * time.Second
 )
 
+// Option is a functional option for configuring a TokenProvider.
+type Option func(*TokenProvider)
+
+// WithAPIBaseURL returns an Option that overrides the GitHub API base URL.
+// Trailing slashes are trimmed. Empty string is a no-op.
+func WithAPIBaseURL(u string) Option {
+	return func(p *TokenProvider) {
+		if u == "" {
+			return
+		}
+		p.apiBaseURL = strings.TrimRight(u, "/")
+	}
+}
+
 // TokenProvider generates installation access tokens for a GitHub App.
 type TokenProvider struct {
 	appID          int64
@@ -32,7 +47,9 @@ type TokenProvider struct {
 }
 
 // NewTokenProvider creates a TokenProvider by reading the PEM private key from disk.
-func NewTokenProvider(appID, installationID int64, privateKeyPath string) (*TokenProvider, error) {
+// Optional functional options (e.g. WithAPIBaseURL) are applied after the provider
+// is constructed with its defaults.
+func NewTokenProvider(appID, installationID int64, privateKeyPath string, opts ...Option) (*TokenProvider, error) {
 	keyData, err := os.ReadFile(privateKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("read private key: %w", err)
@@ -41,13 +58,17 @@ func NewTokenProvider(appID, installationID int64, privateKeyPath string) (*Toke
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
 	}
-	return &TokenProvider{
+	tp := &TokenProvider{
 		appID:          appID,
 		installationID: installationID,
 		privateKey:     key,
 		apiBaseURL:     "https://api.github.com",
 		httpClient:     &http.Client{Timeout: tokenRequestTimeout},
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(tp)
+	}
+	return tp, nil
 }
 
 // NewTokenProviderWithKey creates a TokenProvider from an already-parsed RSA key

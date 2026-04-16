@@ -50,6 +50,7 @@ type GitHubApp struct {
 	AppID          int64  `yaml:"app_id"`
 	InstallationID int64  `yaml:"installation_id"`
 	PrivateKeyPath string `yaml:"private_key_path"`
+	APIBaseURL     string `yaml:"api_base_url"`
 }
 
 // Load reads a YAML config file and applies environment variable overrides.
@@ -229,6 +230,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("CMR_GITHUB_PRIVATE_KEY_PATH"); v != "" {
 		cfg.GitHubApp.PrivateKeyPath = v
+	}
+	if v := os.Getenv("CMR_GITHUB_API_BASE_URL"); v != "" {
+		cfg.GitHubApp.APIBaseURL = v
 	}
 	if v := os.Getenv("CMR_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v

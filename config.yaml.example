@@ -100,6 +100,11 @@ github_app:
   # Env: CMR_GITHUB_PRIVATE_KEY_PATH
   private_key_path: ""
 
+  # GitHub API base URL. Leave empty for github.com (https://api.github.com).
+  # Set for GitHub Enterprise Cloud with Data Residency (GHEC-DR) or GHES.
+  # Env: CMR_GITHUB_API_BASE_URL
+  # api_base_url: "https://api.acme.ghe.com"  # GHEC-DR or GHES API endpoint (optional)
+
 # ----- Logging -----
 
 # Log level: debug, info, warn, error.

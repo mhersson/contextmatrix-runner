@@ -428,6 +428,62 @@ func TestLoad_ClaudeSettingsEnvOverride_InvalidJSON(t *testing.T) {
 	assert.ErrorContains(t, err, "claude_settings is not valid JSON")
 }
 
+func TestLoad_GitHubApp_APIBaseURL_YAML(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	content := `
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker:latest"
+claude_auth_dir: "` + dir + `"
+github_app:
+  app_id: 12345
+  installation_id: 67890
+  private_key_path: "` + pemPath + `"
+  api_base_url: "https://api.acme.ghe.com"
+`
+	path := writeConfig(t, dir, content)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "https://api.acme.ghe.com", cfg.GitHubApp.APIBaseURL)
+}
+
+func TestLoad_GitHubApp_APIBaseURL_EnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	content := `
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker:latest"
+claude_auth_dir: "` + dir + `"
+github_app:
+  app_id: 12345
+  installation_id: 67890
+  private_key_path: "` + pemPath + `"
+  api_base_url: "https://api.yaml.example"
+`
+	path := writeConfig(t, dir, content)
+
+	t.Setenv("CMR_GITHUB_API_BASE_URL", "https://api.env.example")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "https://api.env.example", cfg.GitHubApp.APIBaseURL)
+}
+
+func TestLoad_GitHubApp_APIBaseURL_Default(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	// No api_base_url in YAML, no env var set.
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "", cfg.GitHubApp.APIBaseURL)
+}
+
 func TestLogLevelSlog(t *testing.T) {
 	tests := []struct {
 		level    string

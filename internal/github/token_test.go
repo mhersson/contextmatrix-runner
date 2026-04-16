@@ -148,6 +148,65 @@ func TestGenerateToken_ContextCanceled(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestNewTokenProvider_DefaultBaseURL(t *testing.T) {
+	_, pemPath := generateTestKey(t)
+
+	tp, err := NewTokenProvider(12345, 67890, pemPath)
+	require.NoError(t, err)
+	assert.Equal(t, "https://api.github.com", tp.apiBaseURL)
+}
+
+func TestNewTokenProvider_WithAPIBaseURL(t *testing.T) {
+	key, pemPath := generateTestKey(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.True(t, strings.HasSuffix(r.URL.Path, "/app/installations/67890/access_tokens"))
+
+		// Verify JWT issuer
+		auth := r.Header.Get("Authorization")
+		require.True(t, strings.HasPrefix(auth, "Bearer "))
+		jwtStr := strings.TrimPrefix(auth, "Bearer ")
+		token, err := jwt.Parse(jwtStr, func(t *jwt.Token) (any, error) {
+			return &key.PublicKey, nil
+		})
+		require.NoError(t, err)
+		assert.True(t, token.Valid)
+
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"token":      "ghs_option_token",
+			"expires_at": "2030-01-01T00:00:00Z",
+		})
+	}))
+	defer srv.Close()
+
+	tp, err := NewTokenProvider(12345, 67890, pemPath, WithAPIBaseURL(srv.URL))
+	require.NoError(t, err)
+	assert.Equal(t, srv.URL, tp.apiBaseURL)
+
+	tok, err := tp.GenerateToken(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "ghs_option_token", tok)
+}
+
+func TestWithAPIBaseURL_Empty(t *testing.T) {
+	_, pemPath := generateTestKey(t)
+
+	tp, err := NewTokenProvider(1, 1, pemPath, WithAPIBaseURL(""))
+	require.NoError(t, err)
+	// Empty option must be a no-op; default must be preserved.
+	assert.Equal(t, "https://api.github.com", tp.apiBaseURL)
+}
+
+func TestWithAPIBaseURL_TrimsTrailingSlash(t *testing.T) {
+	_, pemPath := generateTestKey(t)
+
+	tp, err := NewTokenProvider(1, 1, pemPath, WithAPIBaseURL("https://api.acme.ghe.com/"))
+	require.NoError(t, err)
+	assert.Equal(t, "https://api.acme.ghe.com", tp.apiBaseURL)
+}
+
 func TestCreateJWT_Claims(t *testing.T) {
 	_, pemPath := generateTestKey(t)
 
