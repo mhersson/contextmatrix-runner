@@ -14,15 +14,16 @@ import (
 
 // MockDockerClient implements DockerClient for testing.
 type MockDockerClient struct {
-	ImagePullFn              func(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error)
-	ImageInspectWithRawFn    func(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error)
-	ContainerCreateFn func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error)
-	ContainerStartFn  func(ctx context.Context, containerID string, options container.StartOptions) error
-	ContainerWaitFn   func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
-	ContainerStopFn   func(ctx context.Context, containerID string, options container.StopOptions) error
-	ContainerRemoveFn func(ctx context.Context, containerID string, options container.RemoveOptions) error
-	ContainerLogsFn   func(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
-	ContainerListFn   func(ctx context.Context, options container.ListOptions) ([]DockerContainer, error)
+	ImagePullFn           func(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error)
+	ImageInspectWithRawFn func(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error)
+	ContainerCreateFn     func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error)
+	ContainerStartFn      func(ctx context.Context, containerID string, options container.StartOptions) error
+	ContainerWaitFn       func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
+	ContainerStopFn       func(ctx context.Context, containerID string, options container.StopOptions) error
+	ContainerRemoveFn     func(ctx context.Context, containerID string, options container.RemoveOptions) error
+	ContainerLogsFn       func(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
+	ContainerListFn       func(ctx context.Context, options container.ListOptions) ([]DockerContainer, error)
+	ContainerAttachFn     func(ctx context.Context, containerID string, options container.AttachOptions) (*HijackedResponse, error)
 }
 
 func (m *MockDockerClient) ImagePull(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error) {
@@ -88,6 +89,15 @@ func (m *MockDockerClient) ContainerList(ctx context.Context, options container.
 		return m.ContainerListFn(ctx, options)
 	}
 	return nil, nil
+}
+
+func (m *MockDockerClient) ContainerAttach(ctx context.Context, containerID string, options container.AttachOptions) (*HijackedResponse, error) {
+	if m.ContainerAttachFn != nil {
+		return m.ContainerAttachFn(ctx, containerID, options)
+	}
+	// Default: return a no-op hijacked response backed by a discarding pipe.
+	_, pw := io.Pipe()
+	return &HijackedResponse{Conn: pw}, nil
 }
 
 func (m *MockDockerClient) Close() error { return nil }

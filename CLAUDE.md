@@ -78,6 +78,46 @@ The runner must produce and verify HMAC signatures identical to ContextMatrix's
 sides sign as `HMAC-SHA256(key, timestamp + "." + body)`, hex-encoded. Headers:
 `X-Signature-256: sha256=<hex>`, `X-Webhook-Timestamp: <unix-ts>`.
 
+### Endpoints
+
+| Method | Path        | Auth | Description                                                                                  |
+|--------|-------------|------|----------------------------------------------------------------------------------------------|
+| POST   | `/trigger`  | HMAC | Start a container. Payload includes `card_id`, `project`, `repo_url`, `mcp_url`, and optional `interactive: bool`. |
+| POST   | `/kill`     | HMAC | Stop a specific container. Payload: `{card_id, project}`.                                   |
+| POST   | `/stop-all` | HMAC | Stop all containers (optionally filtered by project).                                        |
+| POST   | `/message`  | HMAC | Send a user message to an interactive session. Payload: `{card_id, project, content, message_id}`. `content` must be ≤8192 bytes (413 on overflow). Returns 404 if no container, 409 if not interactive, 202 `{ok:true, message_id}` on success. |
+| POST   | `/promote`  | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Returns 404/409 on error, 202 `{ok:true}` on success. |
+| GET    | `/logs`     | none | SSE stream of `LogEntry` events for all active containers.                                   |
+| GET    | `/health`   | none | Health probe; returns 200.                                                                   |
+
+### HITL (interactive) mode
+
+When `interactive: true` is set in the `/trigger` payload:
+
+- The runner sets `CM_INTERACTIVE=1` in the container environment and attaches to the container's stdin.
+- `entrypoint.sh` branches on `CM_INTERACTIVE`: instead of the one-shot `run-autonomous` invocation, it runs `claude` with `--input-format stream-json --output-format stream-json` and a prompt instructing Claude to wait for the user's first message.
+- The tracker stashes the stdin writer; `tracker.WriteStdin` serialises concurrent writes with a per-entry mutex.
+- Operators interact with the running session via:
+  - `POST /message` — writes a stream-json user message to the container stdin and echoes it as a `user`-typed `LogEntry`.
+  - `POST /promote` — writes a canned autonomous-mode instruction to stdin and emits a `system` LogEntry `"promoted to autonomous mode"`.
+- `tracker.Remove` closes the stdin writer when the container exits.
+
+## LogEntry types
+
+`logbroadcast.LogEntry.Type` is a free-form string. Known values:
+
+| Type       | Source                                      | Redacted? |
+|------------|---------------------------------------------|-----------|
+| `text`     | Claude assistant text block (stdout)        | yes       |
+| `thinking` | Claude thinking block (stdout)              | yes       |
+| `tool_call`| Claude tool_use block (non-MCP, stdout)     | no        |
+| `stderr`   | Container stderr line                       | yes       |
+| `system`   | Runner lifecycle event (start/stop/error)   | no        |
+| `user`     | HITL chat message via /message webhook      | no        |
+
+`logparser.Redact` is applied only to `text`, `thinking`, and `stderr` entries
+(i.e. container output paths). It is never called on `user` or `system` entries.
+
 ## Verification
 
 ```bash

@@ -75,8 +75,25 @@ if [ -n "${CM_BASE_BRANCH:-}" ]; then
 fi
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
-exec claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
-    "You are running inside a disposable container spawned by contextmatrix-runner.
+if [ "${CM_INTERACTIVE:-}" = "1" ]; then
+    exec claude -p --model claude-sonnet-4-6 \
+        --input-format stream-json \
+        --output-format stream-json \
+        --verbose --dangerously-skip-permissions \
+        "You are running inside a disposable container spawned by contextmatrix-runner for card ${CM_CARD_ID}.
+A human user will send you messages to guide the workflow. Wait for the user's first message before starting any substantive work.
+
+IMPORTANT:
+- Always use the contextmatrix MCP server for all board interactions.
+- Claim the card before making any changes.
+- Call heartbeat every 5 minutes during idle waits.
+- Call report_usage after every heartbeat call.
+- On completion, call release_card after transitioning to done — do NOT skip this.
+- Never push to main or master.
+${BASE_BRANCH_CONTEXT}"
+else
+    exec claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
+        "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
 
 Steps:
@@ -90,3 +107,4 @@ IMPORTANT:
 - Call report_usage after every heartbeat call.
 - On completion, call release_card after transitioning to done — do NOT skip this.
 ${BASE_BRANCH_CONTEXT}"
+fi

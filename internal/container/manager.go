@@ -38,6 +38,7 @@ type RunConfig struct {
 	MCPAPIKey   string
 	BaseBranch  string
 	RunnerImage string
+	Interactive bool
 }
 
 const (
@@ -188,6 +189,9 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	if payload.BaseBranch != "" {
 		env = append(env, "CM_BASE_BRANCH="+payload.BaseBranch)
 	}
+	if payload.Interactive {
+		env = append(env, "CM_INTERACTIVE=1")
+	}
 
 	if m.cfg.ClaudeSettings != "" {
 		env = append(env, "CM_CLAUDE_SETTINGS="+m.cfg.ClaudeSettings)
@@ -212,16 +216,24 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	name := sanitizeContainerName(payload.Project, payload.CardID)
 
-	resp, err := m.docker.ContainerCreate(ctx,
-		&container.Config{
-			Image: img,
-			Env:   env,
-			Labels: map[string]string{
-				LabelRunner:  "true",
-				LabelCardID:  payload.CardID,
-				LabelProject: payload.Project,
-			},
+	containerCfg := &container.Config{
+		Image: img,
+		Env:   env,
+		Labels: map[string]string{
+			LabelRunner:  "true",
+			LabelCardID:  payload.CardID,
+			LabelProject: payload.Project,
 		},
+	}
+	if payload.Interactive {
+		containerCfg.OpenStdin = true
+		containerCfg.AttachStdin = true
+		containerCfg.Tty = false
+		containerCfg.StdinOnce = false
+	}
+
+	resp, err := m.docker.ContainerCreate(ctx,
+		containerCfg,
 		&container.HostConfig{
 			Mounts:      mounts,
 			ExtraHosts:  m.buildExtraHosts(payload.MCPURL),
@@ -244,6 +256,20 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			m.logger.Warn("failed to remove container after start failure", "container_id", resp.ID, "error", rmErr)
 		}
 		return "", fmt.Errorf("start container: %w", err)
+	}
+
+	if payload.Interactive {
+		attached, err := m.docker.ContainerAttach(ctx, resp.ID, container.AttachOptions{
+			Stream: true,
+			Stdin:  true,
+			Stdout: false,
+			Stderr: false,
+		})
+		if err != nil {
+			m.logger.Warn("failed to attach stdin to container", "container_id", resp.ID, "error", err)
+		} else {
+			m.tracker.SetStdin(payload.Project, payload.CardID, attached.Conn, attached.Close)
+		}
 	}
 
 	return resp.ID, nil

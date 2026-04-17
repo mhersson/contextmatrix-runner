@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,9 +19,17 @@ import (
 
 type bodyKey struct{}
 
+// ContainerRunner is the subset of container.Manager used by the webhook handler.
+// Using an interface here enables handler tests to inject fakes without needing
+// the Docker daemon or the full Manager dependency graph.
+type ContainerRunner interface {
+	Run(ctx context.Context, payload container.RunConfig)
+	Kill(project, cardID string) error
+}
+
 // Handler processes incoming webhooks from ContextMatrix.
 type Handler struct {
-	manager       *container.Manager
+	manager       ContainerRunner
 	tracker       *tracker.Tracker
 	broadcaster   *logbroadcast.Broadcaster
 	apiKey        string
@@ -30,7 +39,7 @@ type Handler struct {
 
 // NewHandler creates a webhook handler.
 func NewHandler(
-	manager *container.Manager,
+	manager ContainerRunner,
 	tracker *tracker.Tracker,
 	broadcaster *logbroadcast.Broadcaster,
 	apiKey string,
@@ -52,6 +61,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /trigger", h.hmacAuth(h.handleTrigger))
 	mux.HandleFunc("POST /kill", h.hmacAuth(h.handleKill))
 	mux.HandleFunc("POST /stop-all", h.hmacAuth(h.handleStopAll))
+	mux.HandleFunc("POST /message", h.hmacAuth(h.handleMessage))
+	mux.HandleFunc("POST /promote", h.hmacAuth(h.handlePromote))
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
 	mux.HandleFunc("GET /health", h.handleHealth)
 }
@@ -95,6 +106,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		MCPAPIKey:   payload.MCPAPIKey,
 		BaseBranch:  payload.BaseBranch,
 		RunnerImage: payload.RunnerImage,
+		Interactive: payload.Interactive,
 	})
 
 	writeJSON(w, http.StatusAccepted, Response{OK: true, Message: "container starting"})
@@ -155,9 +167,152 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                  true,
+		"ok":                 true,
 		"running_containers": h.tracker.Count(),
 	})
+}
+
+// maxMessageContent is the maximum allowed byte length for a user message.
+const maxMessageContent = 8192
+
+// streamUserMsg is the Claude Code stream-json shape for a user turn.
+type streamUserMsg struct {
+	Type    string `json:"type"`
+	Message struct {
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"message"`
+}
+
+// handleMessage accepts a user chat message and writes it to the target
+// container's stdin as a Claude Code stream-json user turn.
+func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
+	body := r.Context().Value(bodyKey{}).([]byte)
+
+	var payload MessagePayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if payload.CardID == "" || payload.Project == "" || payload.Content == "" {
+		writeError(w, http.StatusBadRequest, "card_id, project, and content are required")
+		return
+	}
+	if len(payload.Content) > maxMessageContent {
+		writeError(w, http.StatusRequestEntityTooLarge, "content exceeds 8192 bytes")
+		return
+	}
+
+	// 404 if no container is tracked for this (project, card_id).
+	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
+		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+		return
+	}
+
+	// Build the Claude Code stream-json user message.
+	b, err := buildUserStreamJSON(payload.Content)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal message")
+		return
+	}
+
+	// Write to stdin first; distinguish 409 (no stdin attached) from other
+	// errors. Publish only after a successful write so no phantom echo
+	// appears in the browser on a non-interactive container.
+	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
+		if errors.Is(err, tracker.ErrNoStdinAttached) {
+			writeError(w, http.StatusConflict, "container is not in interactive mode")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "stdin write failed")
+		return
+	}
+
+	if h.broadcaster != nil {
+		h.broadcaster.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			CardID:    payload.CardID,
+			Project:   payload.Project,
+			Type:      "user",
+			Content:   payload.Content,
+		})
+	}
+
+	writeJSON(w, http.StatusAccepted, Response{OK: true, MessageID: payload.MessageID})
+}
+
+// buildUserStreamJSON marshals a Claude Code stream-json user turn containing
+// content as a single text block. The returned slice is newline-terminated.
+func buildUserStreamJSON(content string) ([]byte, error) {
+	var msg streamUserMsg
+	msg.Type = "user"
+	msg.Message.Role = "user"
+	msg.Message.Content = []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{{Type: "text", Text: content}}
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
+const autonomousContent = "Autonomous mode has been enabled. Continue the workflow without waiting for further user input. When the work is complete, create an appropriately named feature branch, commit all changes, push it, and open a PR against the base branch. Call `complete_task` on the ContextMatrix MCP server when done."
+
+// handlePromote switches a running interactive session to autonomous mode by
+// publishing a system log entry and writing a canned user message to stdin.
+func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
+	body := r.Context().Value(bodyKey{}).([]byte)
+
+	var payload PromotePayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if payload.CardID == "" || payload.Project == "" {
+		writeError(w, http.StatusBadRequest, "card_id and project are required")
+		return
+	}
+
+	// 404 if no container is tracked for this (project, card_id).
+	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
+		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+		return
+	}
+
+	// Publish system LogEntry BEFORE the stdin write so the browser sees the
+	// mode switch in the correct order.
+	if h.broadcaster != nil {
+		h.broadcaster.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			CardID:    payload.CardID,
+			Project:   payload.Project,
+			Type:      "system",
+			Content:   "promoted to autonomous mode",
+		})
+	}
+
+	b, err := buildUserStreamJSON(autonomousContent)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal message")
+		return
+	}
+
+	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
+		if errors.Is(err, tracker.ErrNoStdinAttached) {
+			writeError(w, http.StatusConflict, "container is not in interactive mode")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "stdin write failed")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, Response{OK: true})
 }
 
 // handleLogs streams log entries via Server-Sent Events (SSE).

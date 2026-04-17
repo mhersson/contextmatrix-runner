@@ -385,6 +385,8 @@ All webhooks are signed with HMAC-SHA256 using a shared secret.
 | CM → Runner | `POST /trigger`           | Start a task                    |
 | CM → Runner | `POST /kill`              | Stop a specific task            |
 | CM → Runner | `POST /stop-all`          | Stop all tasks (or per-project) |
+| CM → Runner | `POST /message`           | Send a user message to an interactive session |
+| CM → Runner | `POST /promote`           | Promote interactive session to autonomous     |
 | Runner → CM | `POST /api/runner/status` | Report container status         |
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
@@ -403,16 +405,20 @@ non-zero exit), `completed` (clean exit).
 | `mcp_url`      | string | yes      | ContextMatrix MCP endpoint URL                                                           |
 | `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                      |
 | `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted. |
-| `runner_image` | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.          |
+| `runner_image`  | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.          |
+| `interactive`   | bool   | no       | When `true`, runs Claude in stream-json HITL mode and attaches to container stdin. Use `/message` and `/promote` to interact. |
 
 ## API Endpoints
 
-| Method | Path        | Description                                  |
-| ------ | ----------- | -------------------------------------------- |
-| POST   | `/trigger`  | Start a container for a card (HMAC required) |
-| POST   | `/kill`     | Kill a specific container (HMAC required)    |
-| POST   | `/stop-all` | Kill all containers (HMAC required)          |
-| GET    | `/health`   | Health check (no auth)                       |
+| Method | Path        | Auth | Description                                               |
+| ------ | ----------- | ---- | --------------------------------------------------------- |
+| POST   | `/trigger`  | HMAC | Start a container for a card                              |
+| POST   | `/kill`     | HMAC | Kill a specific container                                 |
+| POST   | `/stop-all` | HMAC | Kill all containers                                       |
+| POST   | `/message`  | HMAC | Send a user message to an interactive (HITL) session      |
+| POST   | `/promote`  | HMAC | Promote an interactive session to autonomous mode         |
+| GET    | `/logs`     | none | SSE log stream for all active containers                  |
+| GET    | `/health`   | none | Health check                                              |
 
 ## Security Model
 

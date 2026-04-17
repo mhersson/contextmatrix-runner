@@ -669,6 +669,90 @@ func TestBaseBranch_EnvVarPresentWhenSet(t *testing.T) {
 
 // TestBaseBranch_EnvVarAbsentWhenEmpty verifies that CM_BASE_BRANCH is not
 // injected into the container env when RunConfig.BaseBranch is empty.
+// TestInteractive_EnvVarPresentWhenTrue verifies that CM_INTERACTIVE=1 is injected
+// into the container env when RunConfig.Interactive is true.
+func TestInteractive_EnvVarPresentWhenTrue(t *testing.T) {
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			assert.Contains(t, cfg.Env, "CM_INTERACTIVE=1")
+			return container.CreateResponse{ID: "interactive-test-ctr"}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	payload.Interactive = true
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+}
+
+// TestInteractive_EnvVarAbsentWhenFalse verifies that CM_INTERACTIVE is not injected
+// into the container env when RunConfig.Interactive is false (the default).
+func TestInteractive_EnvVarAbsentWhenFalse(t *testing.T) {
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			for _, e := range cfg.Env {
+				assert.False(t, strings.HasPrefix(e, "CM_INTERACTIVE="), "CM_INTERACTIVE must not be set when Interactive is false")
+			}
+			return container.CreateResponse{ID: "non-interactive-test-ctr"}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	// Interactive is intentionally left false (zero value).
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+}
+
 func TestBaseBranch_EnvVarAbsentWhenEmpty(t *testing.T) {
 	mock := &MockDockerClient{
 		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
@@ -708,6 +792,116 @@ func TestBaseBranch_EnvVarAbsentWhenEmpty(t *testing.T) {
 
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
+}
+
+// TestInteractive_StdinConfigFlags verifies that ContainerCreate receives
+// OpenStdin=true, AttachStdin=true, Tty=false, StdinOnce=false when Interactive=true.
+func TestInteractive_StdinConfigFlags(t *testing.T) {
+	var capturedCfg *container.Config
+	var attachCalled int
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			capturedCfg = cfg
+			return container.CreateResponse{ID: "stdin-test-ctr"}, nil
+		},
+		ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+			attachCalled++
+			_, pw := io.Pipe()
+			return &HijackedResponse{Conn: pw}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	payload.Interactive = true
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	require.NotNil(t, capturedCfg)
+	assert.True(t, capturedCfg.OpenStdin, "OpenStdin must be true when Interactive=true")
+	assert.True(t, capturedCfg.AttachStdin, "AttachStdin must be true when Interactive=true")
+	assert.False(t, capturedCfg.Tty, "Tty must be false when Interactive=true")
+	assert.False(t, capturedCfg.StdinOnce, "StdinOnce must be false when Interactive=true")
+	assert.Equal(t, 1, attachCalled, "ContainerAttach must be called exactly once when Interactive=true")
+}
+
+// TestInteractive_FalseNoStdinFlagsNoAttach verifies that ContainerCreate does
+// NOT receive stdin flags and ContainerAttach is NOT called when Interactive=false.
+func TestInteractive_FalseNoStdinFlagsNoAttach(t *testing.T) {
+	var capturedCfg *container.Config
+	var attachCalled int
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			capturedCfg = cfg
+			return container.CreateResponse{ID: "non-interactive-stdin-ctr"}, nil
+		},
+		ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+			attachCalled++
+			_, pw := io.Pipe()
+			return &HijackedResponse{Conn: pw}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	// Interactive is intentionally left false (zero value).
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	require.NotNil(t, capturedCfg)
+	assert.False(t, capturedCfg.OpenStdin, "OpenStdin must be false when Interactive=false")
+	assert.False(t, capturedCfg.AttachStdin, "AttachStdin must be false when Interactive=false")
+	assert.Equal(t, 0, attachCalled, "ContainerAttach must not be called when Interactive=false")
 }
 
 func TestSanitizeContainerName(t *testing.T) {

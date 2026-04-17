@@ -21,7 +21,9 @@ type LogEntry struct {
 	Timestamp time.Time `json:"ts"`
 	CardID    string    `json:"card_id"`
 	Project   string    `json:"project"`
-	// Type is one of: text, thinking, tool_call, stderr, system.
+	// Type is one of: text, thinking, tool_call, stderr, system, user.
+	// "user" is a message submitted via the HITL chat input — published
+	// directly by the /message webhook handler, bypassing logparser.Redact.
 	Type    string `json:"type"`
 	Content string `json:"content"`
 }
