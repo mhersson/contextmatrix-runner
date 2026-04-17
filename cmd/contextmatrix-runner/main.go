@@ -44,16 +44,30 @@ func main() {
 	}
 	defer func() { _ = docker.Close() }()
 
-	// GitHub App token provider.
-	tokenProvider, err := github.NewTokenProvider(
-		cfg.GitHubApp.AppID,
-		cfg.GitHubApp.InstallationID,
-		cfg.GitHubApp.PrivateKeyPath,
-		github.WithAPIBaseURL(cfg.GitHubApp.APIBaseURL),
-	)
-	if err != nil {
-		logger.Error("failed to create GitHub token provider", "error", err)
-		os.Exit(1)
+	// Select GitHub auth provider based on config.
+	var tokenProvider github.TokenGenerator
+	switch {
+	case cfg.GitHubPAT.Token != "":
+		tp, err := github.NewPATProvider(cfg.GitHubPAT.Token)
+		if err != nil {
+			logger.Error("failed to create GitHub PAT provider", "error", err)
+			os.Exit(1)
+		}
+		tokenProvider = tp
+		logger.Info("github auth mode", "mode", "pat")
+	default:
+		tp, err := github.NewTokenProvider(
+			cfg.GitHubApp.AppID,
+			cfg.GitHubApp.InstallationID,
+			cfg.GitHubApp.PrivateKeyPath,
+			github.WithAPIBaseURL(cfg.GitHubApp.APIBaseURL),
+		)
+		if err != nil {
+			logger.Error("failed to create GitHub token provider", "error", err)
+			os.Exit(1)
+		}
+		tokenProvider = tp
+		logger.Info("github auth mode", "mode", "app")
 	}
 
 	// Core components.

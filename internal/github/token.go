@@ -23,6 +23,13 @@ const (
 	tokenRequestTimeout = 10 * time.Second
 )
 
+// TokenGenerator produces a git credential for the current request.
+type TokenGenerator interface {
+	GenerateToken(ctx context.Context) (string, error)
+}
+
+var _ TokenGenerator = (*TokenProvider)(nil)
+
 // Option is a functional option for configuring a TokenProvider.
 type Option func(*TokenProvider)
 

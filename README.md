@@ -35,7 +35,7 @@ cards, execute work, and report completion.
 - Go 1.26+
 - Docker (daemon running)
 - A running ContextMatrix instance
-- A GitHub account (for the GitHub App)
+- A GitHub account with either a GitHub App or a fine-grained personal access token
 
 ## Quick Start
 
@@ -87,16 +87,26 @@ To validate the script with shellcheck:
 make lint-sh
 ```
 
+## GitHub Setup
+
+The runner requires credentials to generate a git token for each container. Two
+methods are supported — configure exactly one.
+
+| Method | When to use |
+| ------ | ----------- |
+| **GitHub App** | Recommended for most setups. Short-lived, repo-scoped tokens; private key never leaves the host. |
+| **Personal Access Token (PAT)** | Use in GitHub Enterprise environments where App creation is restricted, or for quick testing. |
+
+**No inbound connections required.** The runner only makes outbound HTTPS calls
+to the GitHub API (`api.github.com` or your enterprise endpoint). It works on a
+local LAN with no public domain.
+
 ## GitHub App Setup
 
 The runner uses a GitHub App to generate short-lived installation tokens for git
 operations inside containers. This is the most secure approach: the App's
 private key stays on the runner host, and only ephemeral tokens (valid for 1
 hour) enter containers.
-
-**No inbound connections required.** The runner only makes outbound HTTPS calls
-to the GitHub API (`api.github.com` or your enterprise endpoint). It works on a
-local LAN with no public domain.
 
 ### Step 1: Create the GitHub App
 
@@ -156,6 +166,41 @@ The git host inside containers is derived automatically from the repo URL, so no
 extra git configuration is required. Set the matching `github.host` (or
 `github.api_base_url`) in ContextMatrix so both sides target the same enterprise
 instance.
+
+## GitHub PAT Setup
+
+Use a fine-grained personal access token when you cannot create a GitHub App
+(common in GitHub Enterprise environments with restricted App creation).
+
+**Note:** PAT is mutually exclusive with `github_app` — configure exactly one.
+
+### Step 1: Create a Fine-Grained PAT
+
+1. Go to **GitHub Settings** → **Developer settings** → **Personal access
+   tokens** → **Fine-grained tokens** → **Generate new token**
+2. Set a descriptive name (e.g., `contextmatrix-runner`) and an expiration
+3. Under **Repository access**, select the repositories the runner should access
+4. Under **Repository permissions**, set:
+   - **Contents**: Read & Write (for clone and push)
+   - **Pull requests**: Read & Write (for creating PRs)
+5. Click **Generate token** and copy it immediately
+
+### Step 2: Configure the Runner
+
+Add the token to your `config.yaml`:
+
+```yaml
+github_pat:
+  token: "github_pat_..."  # Env: CMR_GITHUB_PAT_TOKEN
+```
+
+Or set it via environment variable:
+
+```bash
+export CMR_GITHUB_PAT_TOKEN="github_pat_..."
+```
+
+Remove or leave blank the entire `github_app` block when using a PAT.
 
 ## Configuration
 
@@ -231,12 +276,18 @@ anthropic_api_key: ""
 # Env: CMR_CLAUDE_SETTINGS
 # claude_settings: '{"includeCoAuthoredBy":false}'
 
-# GitHub App credentials (see setup above).
+# GitHub credentials — configure exactly one of github_app or github_pat.
+
+# GitHub App (recommended): short-lived, repo-scoped tokens.
 github_app:
   app_id: 0 # CMR_GITHUB_APP_ID
   installation_id: 0 # CMR_GITHUB_INSTALLATION_ID
   private_key_path: "" # CMR_GITHUB_PRIVATE_KEY_PATH
   # api_base_url: "https://api.acme.ghe.com"  # CMR_GITHUB_API_BASE_URL (GHEC-DR/GHES only)
+
+# Fine-grained PAT (alternative — use when GitHub App creation is not possible).
+# github_pat:
+#   token: ""  # CMR_GITHUB_PAT_TOKEN
 
 # Log level: debug, info, warn, error.
 # Env: CMR_LOG_LEVEL
@@ -273,12 +324,12 @@ remote_execution:
 
 1. User clicks **Run Now** on an autonomous card in the ContextMatrix web UI
 2. ContextMatrix sends a signed `/trigger` webhook to the runner
-3. Runner generates a short-lived GitHub App token
+3. Runner generates a git credential token (GitHub App installation token or PAT)
 4. Runner pulls the Docker image and starts a hardened container with:
    - Alpine 3.23 base with Go 1.26, Node.js 22, GitHub CLI, and golangci-lint
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
-   - GitHub App token for git operations
+   - Git credential token for clone/push operations
    - Claude Code auth (OAuth dir mount, OAuth token, or API key —
      highest-priority configured method only)
    - All capabilities dropped, no-new-privileges, memory and PID limits
@@ -394,7 +445,9 @@ Every container is launched with the following restrictions:
 - **HMAC-SHA256 webhook signing** in both directions (shared secret, never
   transmitted)
 - **GitHub App tokens**: short-lived (1 hour), repo-scoped, only ephemeral
-  tokens enter containers
+  tokens enter containers. **PAT alternative**: the static token is injected
+  as an env var per-container — use a token with minimal repository scope and
+  set an expiration
 - **Read-only mounts**: OAuth token directory mounted read-only when using
   `claude_auth_dir`; long-lived OAuth tokens and API keys injected as env vars
   when using the other auth methods
@@ -406,9 +459,17 @@ Every container is launched with the following restrictions:
 
 ### Container fails with "generate git token" error
 
+**GitHub App:**
+
 - Verify `github_app.private_key_path` points to a valid PEM file
 - Verify `github_app.app_id` and `installation_id` are correct
 - Check that the GitHub App is installed on the target repositories
+
+**PAT:**
+
+- Verify `github_pat.token` (or `CMR_GITHUB_PAT_TOKEN`) is set and non-empty
+- Check the token has not expired and has `Contents: Read & Write` and
+  `Pull requests: Read & Write` permissions on the target repositories
 
 ### Container fails with git clone error
 

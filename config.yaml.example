@@ -105,6 +105,17 @@ github_app:
   # Env: CMR_GITHUB_API_BASE_URL
   # api_base_url: "https://api.acme.ghe.com"  # GHEC-DR or GHES API endpoint (optional)
 
+# ----- GitHub PAT (alternative to GitHub App) -----
+# Use a fine-grained personal access token instead of a GitHub App.
+# Useful in enterprise environments where GitHub App creation is restricted.
+# MUTUALLY EXCLUSIVE with github_app — configure exactly one.
+# Required fine-grained PAT scopes: contents: write, pull_requests: write.
+
+# github_pat:
+#   # Fine-grained personal access token.
+#   # Env: CMR_GITHUB_PAT_TOKEN
+#   token: ""
+
 # ----- Logging -----
 
 # Log level: debug, info, warn, error.

@@ -291,6 +291,7 @@ func TestValidate_InvalidContainerTimeout(t *testing.T) {
 func TestValidate_GitHubAppMissingFields(t *testing.T) {
 	dir := t.TempDir()
 
+	// Neither App nor PAT configured → "either ... is required".
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -302,8 +303,9 @@ func TestValidate_GitHubAppMissingFields(t *testing.T) {
 		GitHubApp:        GitHubApp{},
 	}
 	err := cfg.Validate()
-	assert.ErrorContains(t, err, "github_app: app_id is required")
+	assert.ErrorContains(t, err, "either github_app or github_pat is required")
 
+	// Once any App field is set the App path is taken — missing fields surface.
 	cfg.GitHubApp.AppID = 1
 	err = cfg.Validate()
 	assert.ErrorContains(t, err, "github_app: installation_id is required")
@@ -499,4 +501,148 @@ func TestLogLevelSlog(t *testing.T) {
 		cfg := &Config{LogLevel: tt.level}
 		assert.Equal(t, tt.expected, int(cfg.LogLevelSlog()), "level: %s", tt.level)
 	}
+}
+
+// baseValidConfig returns a minimal valid config that satisfies all fields
+// except the GitHub auth method, which the test can set.
+func baseValidConfigNoGitHub(t *testing.T) *Config {
+	t.Helper()
+	return &Config{
+		ContextMatrixURL: "http://localhost",
+		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:        "img",
+		ImagePullPolicy:  PullAlways,
+		MaxConcurrent:    1,
+		ContainerTimeout: "1h",
+		AnthropicAPIKey:  "sk-ant-test",
+	}
+}
+
+func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	tests := []struct {
+		name        string
+		app         GitHubApp
+		pat         GitHubPAT
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name: "app-only configured is valid",
+			app: GitHubApp{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
+			pat:     GitHubPAT{},
+			wantErr: false,
+		},
+		{
+			name:    "pat-only configured is valid",
+			app:     GitHubApp{},
+			pat:     GitHubPAT{Token: "ghp_testtoken"},
+			wantErr: false,
+		},
+		{
+			name: "both configured is an error",
+			app: GitHubApp{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
+			pat:         GitHubPAT{Token: "ghp_testtoken"},
+			wantErr:     true,
+			errContains: "exactly one of github_app or github_pat may be configured",
+		},
+		{
+			name:        "neither configured is an error",
+			app:         GitHubApp{},
+			pat:         GitHubPAT{},
+			wantErr:     true,
+			errContains: "either github_app or github_pat is required",
+		},
+		{
+			name:    "pat-only does not trigger GitHubApp.validate errors",
+			app:     GitHubApp{}, // missing app_id etc. — should NOT surface
+			pat:     GitHubPAT{Token: "ghp_patonly"},
+			wantErr: false,
+		},
+		{
+			name: "any app field set counts as app-configured (app_id only)",
+			app:  GitHubApp{AppID: 1}, // partial — triggers validate()
+			pat:  GitHubPAT{},
+			wantErr:     true,
+			errContains: "github_app: installation_id is required",
+		},
+		{
+			name: "any app field set counts as app-configured (installation_id only)",
+			app:  GitHubApp{InstallationID: 1}, // partial — triggers validate()
+			pat:  GitHubPAT{},
+			wantErr:     true,
+			errContains: "github_app: app_id is required",
+		},
+		{
+			name: "any app field set counts as app-configured (private_key_path only)",
+			app:  GitHubApp{PrivateKeyPath: "/tmp/key.pem"}, // partial — triggers validate()
+			pat:  GitHubPAT{},
+			wantErr:     true,
+			errContains: "github_app: app_id is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfigNoGitHub(t)
+			cfg.GitHubApp = tt.app
+			cfg.GitHubPAT = tt.pat
+			err := cfg.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.errContains)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestLoad_GitHubPAT_EnvOverride(t *testing.T) {
+	dir := t.TempDir()
+
+	// Config with no GitHub auth at all — env override provides the PAT.
+	content := `
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker:latest"
+anthropic_api_key: "sk-ant-test"
+`
+	path := writeConfig(t, dir, content)
+
+	t.Setenv("CMR_GITHUB_PAT_TOKEN", "ghp_envtoken123")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "ghp_envtoken123", cfg.GitHubPAT.Token)
+}
+
+func TestLoad_GitHubPAT_YAMLOverriddenByEnv(t *testing.T) {
+	dir := t.TempDir()
+
+	content := `
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker:latest"
+anthropic_api_key: "sk-ant-test"
+github_pat:
+  token: "ghp_fromyaml"
+`
+	path := writeConfig(t, dir, content)
+
+	t.Setenv("CMR_GITHUB_PAT_TOKEN", "ghp_fromenv")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "ghp_fromenv", cfg.GitHubPAT.Token)
 }

@@ -57,7 +57,7 @@ type Manager struct {
 	docker      DockerClient
 	tracker     *tracker.Tracker
 	callback    *callback.Client
-	token       *github.TokenProvider
+	token       github.TokenGenerator
 	broadcaster *logbroadcast.Broadcaster
 	cfg         *config.Config
 	logger      *slog.Logger
@@ -69,7 +69,7 @@ func NewManager(
 	docker DockerClient,
 	tracker *tracker.Tracker,
 	cb *callback.Client,
-	token *github.TokenProvider,
+	token github.TokenGenerator,
 	broadcaster *logbroadcast.Broadcaster,
 	cfg *config.Config,
 	logger *slog.Logger,

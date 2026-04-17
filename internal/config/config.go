@@ -40,6 +40,7 @@ type Config struct {
 	AnthropicAPIKey      string    `yaml:"anthropic_api_key"`
 	ClaudeSettings       string    `yaml:"claude_settings"`
 	GitHubApp            GitHubApp `yaml:"github_app"`
+	GitHubPAT            GitHubPAT `yaml:"github_pat"`
 	LogLevel             string    `yaml:"log_level"`
 
 	containerTimeoutDuration time.Duration
@@ -51,6 +52,12 @@ type GitHubApp struct {
 	InstallationID int64  `yaml:"installation_id"`
 	PrivateKeyPath string `yaml:"private_key_path"`
 	APIBaseURL     string `yaml:"api_base_url"`
+}
+
+// GitHubPAT holds a fine-grained personal access token used instead of a
+// GitHub App in enterprise environments where App creation is restricted.
+type GitHubPAT struct {
+	Token string `yaml:"token"`
 }
 
 // Load reads a YAML config file and applies environment variable overrides.
@@ -148,8 +155,17 @@ func (c *Config) Validate() error {
 	if c.ClaudeSettings != "" && !json.Valid([]byte(c.ClaudeSettings)) {
 		return fmt.Errorf("claude_settings is not valid JSON")
 	}
-	if err := c.GitHubApp.validate(); err != nil {
-		return fmt.Errorf("github_app: %w", err)
+	appConfigured := c.GitHubApp.AppID != 0 || c.GitHubApp.InstallationID != 0 || c.GitHubApp.PrivateKeyPath != ""
+	patConfigured := c.GitHubPAT.Token != ""
+	switch {
+	case appConfigured && patConfigured:
+		return fmt.Errorf("exactly one of github_app or github_pat may be configured")
+	case !appConfigured && !patConfigured:
+		return fmt.Errorf("either github_app or github_pat is required")
+	case appConfigured:
+		if err := c.GitHubApp.validate(); err != nil {
+			return fmt.Errorf("github_app: %w", err)
+		}
 	}
 	return nil
 }
@@ -233,6 +249,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("CMR_GITHUB_API_BASE_URL"); v != "" {
 		cfg.GitHubApp.APIBaseURL = v
+	}
+	if v := os.Getenv("CMR_GITHUB_PAT_TOKEN"); v != "" {
+		cfg.GitHubPAT.Token = v
 	}
 	if v := os.Getenv("CMR_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v

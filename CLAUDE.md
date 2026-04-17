@@ -21,7 +21,7 @@ internal/container/               → Docker SDK abstraction, container lifecycl
 internal/logparser/               → Parses Claude Code stream-json output, logs relevant events
 internal/tracker/                 → Thread-safe card_id → container mapping
 internal/callback/                → HMAC-signed status callbacks to CM
-internal/github/                  → GitHub App JWT → installation token exchange
+internal/github/                  → TokenGenerator interface; App (JWT → installation token) and PAT providers
 docker/                           → Dockerfile.worker + entrypoint.sh
 ```
 

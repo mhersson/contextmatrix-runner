@@ -61,7 +61,7 @@ func testConfig() *config.Config {
 }
 
 // testTokenProvider creates a mock GitHub token server and TokenProvider.
-func testTokenProvider(t *testing.T) *github.TokenProvider {
+func testTokenProvider(t *testing.T) github.TokenGenerator {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
@@ -75,6 +75,13 @@ func testTokenProvider(t *testing.T) *github.TokenProvider {
 	tp, err := github.NewTokenProviderWithKey(12345, 67890, testRSAKey(), srv.URL)
 	require.NoError(t, err)
 	return tp
+}
+
+func testPATProvider(t *testing.T) github.TokenGenerator {
+	t.Helper()
+	p, err := github.NewPATProvider("ghp_test_pat")
+	require.NoError(t, err)
+	return p
 }
 
 func testPayload() RunConfig {
@@ -159,6 +166,48 @@ func TestRun_Success(t *testing.T) {
 
 	// Should have reported "running".
 	assert.Contains(t, reportedStatuses, "running")
+}
+
+func TestRun_PATProvider(t *testing.T) {
+	var createdEnv []string
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			createdEnv = cfg.Env
+			return container.CreateResponse{ID: "pat-test-ctr"}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	assert.Contains(t, createdEnv, "CM_GIT_TOKEN=ghp_test_pat")
 }
 
 func TestRun_NonZeroExit(t *testing.T) {
