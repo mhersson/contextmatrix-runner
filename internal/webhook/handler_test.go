@@ -18,6 +18,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
+	"github.com/mhersson/contextmatrix-runner/internal/streammsg"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -600,7 +601,7 @@ func TestHandleMessage_HappyPath(t *testing.T) {
 	line := fw.buf
 	assert.Equal(t, byte('\n'), line[len(line)-1], "stream-json line must end with newline")
 
-	var got streamUserMsg
+	var got streammsg.UserMessage
 	require.NoError(t, json.Unmarshal(line[:len(line)-1], &got))
 	assert.Equal(t, "user", got.Type)
 	assert.Equal(t, "user", got.Message.Role)
@@ -789,7 +790,7 @@ func TestHandlePromote_HappyPath(t *testing.T) {
 	line := fw.buf
 	assert.Equal(t, byte('\n'), line[len(line)-1], "stream-json line must end with newline")
 
-	var got streamUserMsg
+	var got streammsg.UserMessage
 	require.NoError(t, json.Unmarshal(line[:len(line)-1], &got))
 	assert.Equal(t, "user", got.Type)
 	assert.Equal(t, "user", got.Message.Role)
@@ -960,7 +961,7 @@ func TestHandleMessage_Escaping(t *testing.T) {
 	require.NotEmpty(t, fw.buf)
 
 	line := fw.buf
-	var got streamUserMsg
+	var got streammsg.UserMessage
 	require.NoError(t, json.Unmarshal(line[:len(line)-1], &got), "captured bytes must be valid JSON")
 	require.Len(t, got.Message.Content, 1)
 	assert.Equal(t, content, got.Message.Content[0].Text, "text must round-trip byte-for-byte")

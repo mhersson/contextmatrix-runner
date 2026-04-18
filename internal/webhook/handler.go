@@ -14,6 +14,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
+	"github.com/mhersson/contextmatrix-runner/internal/streammsg"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -175,18 +176,6 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // maxMessageContent is the maximum allowed byte length for a user message.
 const maxMessageContent = 8192
 
-// streamUserMsg is the Claude Code stream-json shape for a user turn.
-type streamUserMsg struct {
-	Type    string `json:"type"`
-	Message struct {
-		Role    string `json:"role"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	} `json:"message"`
-}
-
 // handleMessage accepts a user chat message and writes it to the target
 // container's stdin as a Claude Code stream-json user turn.
 func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +202,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build the Claude Code stream-json user message.
-	b, err := buildUserStreamJSON(payload.Content)
+	b, err := streammsg.BuildUserMessage(payload.Content)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to marshal message")
 		return
@@ -242,24 +231,6 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusAccepted, Response{OK: true, MessageID: payload.MessageID})
-}
-
-// buildUserStreamJSON marshals a Claude Code stream-json user turn containing
-// content as a single text block. The returned slice is newline-terminated.
-func buildUserStreamJSON(content string) ([]byte, error) {
-	var msg streamUserMsg
-	msg.Type = "user"
-	msg.Message.Role = "user"
-	msg.Message.Content = []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}{{Type: "text", Text: content}}
-
-	b, err := json.Marshal(msg)
-	if err != nil {
-		return nil, err
-	}
-	return append(b, '\n'), nil
 }
 
 const autonomousContent = "Autonomous mode has been enabled. Continue the workflow without waiting for further user input. When the work is complete, create an appropriately named feature branch, commit all changes, push it, and open a PR against the base branch. Call `complete_task` on the ContextMatrix MCP server when done."
@@ -297,7 +268,7 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	b, err := buildUserStreamJSON(autonomousContent)
+	b, err := streammsg.BuildUserMessage(autonomousContent)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to marshal message")
 		return
