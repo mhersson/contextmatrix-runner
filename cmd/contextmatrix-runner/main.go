@@ -82,7 +82,7 @@ func main() {
 	}
 
 	// Webhook handler.
-	wh := webhook.NewHandler(mgr, trk, broadcaster, cfg.APIKey, cfg.MaxConcurrent, logger)
+	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, logger)
 	mux := http.NewServeMux()
 	wh.Register(mux)
 

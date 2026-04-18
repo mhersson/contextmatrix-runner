@@ -130,3 +130,51 @@ func TestReportStatus_HMACFormat(t *testing.T) {
 	err := client.ReportStatus(context.Background(), "TEST-001", "proj", "failed", "crash")
 	require.NoError(t, err)
 }
+
+func TestPromoteCard_Success(t *testing.T) {
+	var receivedMethod, receivedPath string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":true}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "any-key", testLogger())
+	err := client.PromoteCard(context.Background(), "my-project", "PROJ-001")
+	require.NoError(t, err)
+
+	assert.Equal(t, http.MethodPost, receivedMethod)
+	assert.Equal(t, "/api/projects/my-project/cards/PROJ-001/promote", receivedPath)
+}
+
+func TestPromoteCard_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"internal error"}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "any-key", testLogger())
+	err := client.PromoteCard(context.Background(), "my-project", "PROJ-001")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "500")
+}
+
+func TestPromoteCard_409_Conflict(t *testing.T) {
+	// 409 on already-autonomous is a client error — not retried.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"already autonomous"}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "any-key", testLogger())
+	err := client.PromoteCard(context.Background(), "my-project", "PROJ-001")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "409")
+}

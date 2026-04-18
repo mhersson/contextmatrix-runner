@@ -86,6 +86,37 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 	return fmt.Errorf("callback failed after %d attempts: %w", maxRetries, lastErr)
 }
 
+// PromoteCard calls the contextmatrix promote endpoint to flip the card's
+// autonomous flag server-side. Returns an error on any non-2xx response.
+// This must succeed before writing the canned stdin message in handlePromote.
+func (c *Client) PromoteCard(ctx context.Context, project, cardID string) error {
+	url := fmt.Sprintf("%s/api/projects/%s/cards/%s/promote", c.contextMatrixURL, project, cardID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("create promote request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send promote request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read promote response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return &callbackError{
+			statusCode: resp.StatusCode,
+			body:       string(respBody),
+		}
+	}
+	return nil
+}
+
 func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts string) error {
 	url := c.contextMatrixURL + "/api/runner/status"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))

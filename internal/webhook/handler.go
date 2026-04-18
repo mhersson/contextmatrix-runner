@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
@@ -33,6 +34,7 @@ type Handler struct {
 	manager       ContainerRunner
 	tracker       *tracker.Tracker
 	broadcaster   *logbroadcast.Broadcaster
+	cmClient      *callback.Client // contextmatrix callback client for promote API call
 	apiKey        string
 	maxConcurrent int
 	logger        *slog.Logger
@@ -43,6 +45,7 @@ func NewHandler(
 	manager ContainerRunner,
 	tracker *tracker.Tracker,
 	broadcaster *logbroadcast.Broadcaster,
+	cmClient *callback.Client,
 	apiKey string,
 	maxConcurrent int,
 	logger *slog.Logger,
@@ -51,6 +54,7 @@ func NewHandler(
 		manager:       manager,
 		tracker:       tracker,
 		broadcaster:   broadcaster,
+		cmClient:      cmClient,
 		apiKey:        apiKey,
 		maxConcurrent: maxConcurrent,
 		logger:        logger,
@@ -233,10 +237,12 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, Response{OK: true, MessageID: payload.MessageID})
 }
 
-const autonomousContent = "Autonomous mode has been enabled. Continue the workflow without waiting for further user input. When the work is complete, create an appropriately named feature branch, commit all changes, push it, and open a PR against the base branch. Call `complete_task` on the ContextMatrix MCP server when done."
+const autonomousContent = "Autonomous mode has been enabled (card flag flipped). Check the card with `get_card` at your next gate and continue on the autonomous branch. Do not wait for further user input."
 
-// handlePromote switches a running interactive session to autonomous mode by
-// publishing a system log entry and writing a canned user message to stdin.
+// handlePromote switches a running interactive session to autonomous mode.
+// It calls the contextmatrix promote API first to flip the card's autonomous flag
+// server-side. Only on success does it write the canned stdin message.
+// If the API call fails, it returns 502 and does NOT write to stdin (fail closed).
 func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	body := r.Context().Value(bodyKey{}).([]byte)
 
@@ -254,6 +260,20 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
 		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
 		return
+	}
+
+	// Call contextmatrix to flip the autonomous flag server-side FIRST.
+	// Fail closed: if this fails, do NOT write the stdin message.
+	if h.cmClient != nil {
+		if err := h.cmClient.PromoteCard(r.Context(), payload.Project, payload.CardID); err != nil {
+			slog.Error("contextmatrix promote API call failed",
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"error", err,
+			)
+			writeError(w, http.StatusBadGateway, "contextmatrix promote API call failed: "+err.Error())
+			return
+		}
 	}
 
 	// Publish system LogEntry BEFORE the stdin write so the browser sees the

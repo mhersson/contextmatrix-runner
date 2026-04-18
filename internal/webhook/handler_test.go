@@ -8,12 +8,14 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
@@ -111,7 +113,7 @@ func TestHmacAuth_ValidSignature(t *testing.T) {
 
 func TestHandleTrigger_MissingFields(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(nil, tr, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "POST", "/trigger", map[string]string{"card_id": "A-001"})
@@ -133,7 +135,7 @@ func TestHandleTrigger_ConcurrencyLimit(t *testing.T) {
 		})
 	}
 
-	h := NewHandler(nil, tr, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
@@ -154,7 +156,7 @@ func TestHandleTrigger_Duplicate(t *testing.T) {
 		Project: "my-project",
 	})
 
-	h := NewHandler(nil, tr, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
@@ -182,7 +184,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 		Project: "my-project",
 	})
 
-	h := NewHandler(nil, tr, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
@@ -205,7 +207,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 
 func TestHandleKill_NotFound(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(testManager(tr), tr, nil, testAPIKey, 3, nil)
+	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "POST", "/kill", KillPayload{
@@ -221,7 +223,7 @@ func TestHandleHealth(t *testing.T) {
 	tr := tracker.New()
 	_ = tr.Add(&tracker.ContainerInfo{CardID: "A-001", Project: "proj"})
 
-	h := NewHandler(nil, tr, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -303,7 +305,7 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := tracker.New()
 			fake := newFakeRunner()
-			h := NewHandler(fake, tr, nil, testAPIKey, 3, nil)
+			h := NewHandler(fake, tr, nil, nil, testAPIKey, 3, nil)
 
 			payload := TriggerPayload{
 				CardID:      "PROJ-100",
@@ -330,7 +332,7 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 
 func TestHandleLogs_SSEHeaders(t *testing.T) {
 	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
 
 	// Cancel the context immediately so handleLogs exits after setup.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -349,7 +351,7 @@ func TestHandleLogs_SSEHeaders(t *testing.T) {
 
 func TestHandleLogs_InitialConnectedKeepalive(t *testing.T) {
 	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -366,7 +368,7 @@ func TestHandleLogs_InitialConnectedKeepalive(t *testing.T) {
 
 func TestHandleLogs_EventStreamed(t *testing.T) {
 	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
 
 	// Use an httptest.Server so we have a real connection with proper flushing.
 	mux := http.NewServeMux()
@@ -433,7 +435,7 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 
 func TestHandleLogs_ProjectFilter(t *testing.T) {
 	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
@@ -493,7 +495,7 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 
 func TestHandleLogs_ClientDisconnect(t *testing.T) {
 	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
@@ -556,7 +558,7 @@ func setupMessageHandler(t *testing.T, withStdin bool) (*Handler, *tracker.Track
 	t.Helper()
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tr, b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -737,7 +739,7 @@ func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *tracker.Track
 	t.Helper()
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tr, b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -886,7 +888,7 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 	stdinWritten := make(chan struct{}, 1)
 	controlled := &controlledWriteCloser{writeCh: stdinWritten}
 
-	h := NewHandler(nil, tr, b, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -919,6 +921,79 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 	default:
 		t.Fatal("stdin was not written")
 	}
+}
+
+func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
+	// When cmClient is set, the contextmatrix API must be called BEFORE stdin write.
+	// On API success, stdin write proceeds normally.
+	var apiCalled bool
+	apiOrder := make([]string, 0)
+	mu := &sync.Mutex{}
+
+	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		apiCalled = true
+		apiOrder = append(apiOrder, "api")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":true}`))
+	}))
+	defer cmServer.Close()
+
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster()
+	cmClient := callback.NewClient(cmServer.URL, "key", nil)
+
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, nil)
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "POST", "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	assert.Equal(t, http.StatusAccepted, w.Code)
+	assert.True(t, apiCalled, "contextmatrix promote API must be called")
+	assert.NotEmpty(t, fw.buf, "stdin must be written after API success")
+}
+
+func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
+	// When the contextmatrix API call fails, the handler returns 502 and must NOT
+	// write anything to stdin (fail closed — card stays in HITL mode).
+	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"internal error"}`))
+	}))
+	defer cmServer.Close()
+
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster()
+	cmClient := callback.NewClient(cmServer.URL, "key", nil)
+
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, nil)
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "POST", "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code, "API failure must produce 502")
+	assert.Empty(t, fw.buf, "stdin must NOT be written when API call fails")
+
+	var resp Response
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
 }
 
 // controlledWriteCloser records writes and signals via writeCh.
