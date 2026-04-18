@@ -95,7 +95,7 @@ sides sign as `HMAC-SHA256(key, timestamp + "." + body)`, hex-encoded. Headers:
 When `interactive: true` is set in the `/trigger` payload:
 
 - The runner sets `CM_INTERACTIVE=1` in the container environment and attaches to the container's stdin.
-- `entrypoint.sh` branches on `CM_INTERACTIVE`: instead of the one-shot `run-autonomous` invocation, it runs `claude` with `--input-format stream-json --output-format stream-json` and a prompt instructing Claude to wait for the user's first message.
+- `entrypoint.sh` branches on `CM_INTERACTIVE`: instead of the one-shot `run-autonomous` invocation, it runs `claude` with `--input-format stream-json --output-format stream-json` and a prompt that auto-invokes `get_skill(skill_name='create-plan', ...)` immediately — the user provides approval at the skill's built-in gates (plan approval, execution decision, review) via stream-json input rather than typing a first message to start the workflow.
 - The tracker stashes the stdin writer; `tracker.WriteStdin` serialises concurrent writes with a per-entry mutex.
 - Operators interact with the running session via:
   - `POST /message` — writes a stream-json user message to the container stdin and echoes it as a `user`-typed `LogEntry`.

@@ -226,8 +226,10 @@ func TestEntrypointInteractiveBranching(t *testing.T) {
 			"interactive path must include --input-format stream-json")
 		assert.Contains(t, args, "--output-format\nstream-json",
 			"interactive path must include --output-format stream-json")
-		assert.Contains(t, args, "Wait for the user's first message",
-			"interactive path must include the interactive prompt")
+		assert.Contains(t, args, "get_skill(skill_name='create-plan'",
+			"interactive path must auto-invoke create-plan via get_skill")
+		assert.NotContains(t, args, "Wait for the user's first message",
+			"interactive path must not tell Claude to wait for the user's first message")
 		assert.NotContains(t, args, "run-autonomous workflow",
 			"interactive path must not include the autonomous workflow prompt")
 	})
@@ -260,9 +262,9 @@ func TestEntrypointInteractiveContent(t *testing.T) {
 	assert.True(t, strings.Contains(src, "run-autonomous workflow"),
 		"one-shot branch must reference run-autonomous workflow")
 
-	// Interactive branch must include the interactive prompt text.
-	assert.Contains(t, src, "Wait for the user's first message",
-		"interactive branch must include the wait-for-user prompt")
+	// Interactive branch must auto-invoke create-plan via get_skill.
+	assert.Contains(t, src, "get_skill(skill_name='create-plan'",
+		"interactive branch must auto-invoke create-plan via get_skill")
 
 	// Interactive branch must NOT include the autonomous steps.
 	// (Both must not coexist in same exec block — verified by presence of if/else/fi.)
