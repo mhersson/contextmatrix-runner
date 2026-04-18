@@ -95,9 +95,14 @@ func (m *MockDockerClient) ContainerAttach(ctx context.Context, containerID stri
 	if m.ContainerAttachFn != nil {
 		return m.ContainerAttachFn(ctx, containerID, options)
 	}
-	// Default: return a no-op hijacked response backed by a discarding pipe.
-	_, pw := io.Pipe()
-	return &HijackedResponse{Conn: pw}, nil
+	// Default: discard all writes so priming writes never block.
+	return &HijackedResponse{Conn: nopWriteCloser{}}, nil
 }
+
+// nopWriteCloser discards all writes and is always open.
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopWriteCloser) Close() error                { return nil }
 
 func (m *MockDockerClient) Close() error { return nil }

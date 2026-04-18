@@ -810,8 +810,8 @@ func TestInteractive_StdinConfigFlags(t *testing.T) {
 		},
 		ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
 			attachCalled++
-			_, pw := io.Pipe()
-			return &HijackedResponse{Conn: pw}, nil
+			// Use a discarding writer so the priming write does not block.
+			return &HijackedResponse{Conn: nopWriteCloser{}}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
@@ -850,8 +850,246 @@ func TestInteractive_StdinConfigFlags(t *testing.T) {
 	assert.Equal(t, 1, attachCalled, "ContainerAttach must be called exactly once when Interactive=true")
 }
 
-// TestInteractive_FalseNoStdinFlagsNoAttach verifies that ContainerCreate does
-// NOT receive stdin flags and ContainerAttach is NOT called when Interactive=false.
+// TestPrimingMessage_WrittenWhenInteractive verifies that a valid stream-json
+// user message is written to the container's stdin exactly once when
+// RunConfig.Interactive is true. It also verifies no priming write occurs when
+// Interactive is false.
+func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
+	t.Run("interactive=true writes exactly one priming message", func(t *testing.T) {
+		var writtenBytes [][]byte
+		var writeMu sync.Mutex
+
+		// A WriteCloser that captures all Write calls.
+		pr, pw := io.Pipe()
+		go func() { _, _ = io.ReadAll(pr) }() // drain so writes don't block
+
+		spyWriter := &spyWriteCloser{
+			WriteCloser: pw,
+			onWrite: func(b []byte) {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				// Make a copy — the slice backing b may be reused.
+				buf := make([]byte, len(b))
+				copy(buf, b)
+				writtenBytes = append(writtenBytes, buf)
+			},
+		}
+
+		mock := &MockDockerClient{
+			ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader("")), nil
+			},
+			ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+				return &HijackedResponse{Conn: spyWriter}, nil
+			},
+			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+				ch := make(chan container.WaitResponse, 1)
+				ch <- container.WaitResponse{StatusCode: 0}
+				return ch, make(chan error)
+			},
+		}
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer cbSrv.Close()
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testTokenProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+		payload := testPayload()
+		payload.Interactive = true
+		payload.CardID = "PROJ-099"
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		writeMu.Lock()
+		defer writeMu.Unlock()
+
+		// Exactly one priming write must have landed.
+		require.Len(t, writtenBytes, 1, "expected exactly one priming stdin write")
+
+		// Parse the written bytes as a stream-json user message.
+		raw := writtenBytes[0]
+		assert.True(t, len(raw) > 0 && raw[len(raw)-1] == '\n', "priming message must be newline-terminated")
+
+		var msg struct {
+			Type    string `json:"type"`
+			Message struct {
+				Role    string `json:"role"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+		require.NoError(t, json.Unmarshal(raw[:len(raw)-1], &msg), "priming bytes must be valid JSON")
+		assert.Equal(t, "user", msg.Type)
+		assert.Equal(t, "user", msg.Message.Role)
+		require.Len(t, msg.Message.Content, 1)
+		assert.Equal(t, "text", msg.Message.Content[0].Type)
+		assert.Contains(t, msg.Message.Content[0].Text, "get_skill(skill_name='create-plan'")
+		assert.Contains(t, msg.Message.Content[0].Text, payload.CardID)
+	})
+
+	t.Run("interactive=false writes no priming message", func(t *testing.T) {
+		var attachCalled int
+
+		mock := &MockDockerClient{
+			ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader("")), nil
+			},
+			ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+				attachCalled++
+				_, pw := io.Pipe()
+				return &HijackedResponse{Conn: pw}, nil
+			},
+			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+				ch := make(chan container.WaitResponse, 1)
+				ch <- container.WaitResponse{StatusCode: 0}
+				return ch, make(chan error)
+			},
+		}
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer cbSrv.Close()
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testTokenProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+		payload := testPayload()
+		// Interactive is false (zero value): no attach, no priming write.
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		assert.Equal(t, 0, attachCalled, "ContainerAttach must not be called when Interactive=false")
+	})
+
+	t.Run("interactive=true with BaseBranch appends branch context", func(t *testing.T) {
+		var writtenBytes [][]byte
+		var writeMu sync.Mutex
+
+		pr, pw := io.Pipe()
+		go func() { _, _ = io.ReadAll(pr) }()
+
+		spyWriter := &spyWriteCloser{
+			WriteCloser: pw,
+			onWrite: func(b []byte) {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				buf := make([]byte, len(b))
+				copy(buf, b)
+				writtenBytes = append(writtenBytes, buf)
+			},
+		}
+
+		mock := &MockDockerClient{
+			ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader("")), nil
+			},
+			ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+				return &HijackedResponse{Conn: spyWriter}, nil
+			},
+			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+				ch := make(chan container.WaitResponse, 1)
+				ch <- container.WaitResponse{StatusCode: 0}
+				return ch, make(chan error)
+			},
+		}
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer cbSrv.Close()
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testTokenProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+		payload := testPayload()
+		payload.Interactive = true
+		payload.BaseBranch = "feature/my-branch"
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		writeMu.Lock()
+		defer writeMu.Unlock()
+
+		require.Len(t, writtenBytes, 1)
+		var msg struct {
+			Message struct {
+				Content []struct{ Text string `json:"text"` } `json:"content"`
+			} `json:"message"`
+		}
+		raw := writtenBytes[0]
+		require.NoError(t, json.Unmarshal(raw[:len(raw)-1], &msg))
+		require.Len(t, msg.Message.Content, 1)
+		assert.Contains(t, msg.Message.Content[0].Text, "feature/my-branch")
+	})
+}
+
+// spyWriteCloser wraps an io.WriteCloser and calls onWrite for every Write call.
+type spyWriteCloser struct {
+	io.WriteCloser
+	onWrite func([]byte)
+}
+
+func (s *spyWriteCloser) Write(p []byte) (int, error) {
+	if s.onWrite != nil {
+		s.onWrite(p)
+	}
+	return s.WriteCloser.Write(p)
+}
+
+// TestBuildPrimingContent verifies the priming content helper directly.
+func TestBuildPrimingContent(t *testing.T) {
+	t.Run("without base branch", func(t *testing.T) {
+		payload := RunConfig{CardID: "PROJ-123", Project: "myproj"}
+		content := buildPrimingContent(payload)
+		assert.Contains(t, content, "PROJ-123")
+		assert.Contains(t, content, "get_skill(skill_name='create-plan'")
+		assert.Contains(t, content, "card_id='PROJ-123'")
+		assert.NotContains(t, content, "base branch")
+	})
+
+	t.Run("with base branch", func(t *testing.T) {
+		payload := RunConfig{CardID: "PROJ-456", Project: "myproj", BaseBranch: "main"}
+		content := buildPrimingContent(payload)
+		assert.Contains(t, content, "PROJ-456")
+		assert.Contains(t, content, "get_skill(skill_name='create-plan'")
+		assert.Contains(t, content, "main")
+		assert.Contains(t, content, "base branch")
+	})
+}
+
 func TestInteractive_FalseNoStdinFlagsNoAttach(t *testing.T) {
 	var capturedCfg *container.Config
 	var attachCalled int

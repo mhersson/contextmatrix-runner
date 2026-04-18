@@ -81,11 +81,7 @@ if [ "${CM_INTERACTIVE:-}" = "1" ]; then
         --output-format stream-json \
         --verbose --dangerously-skip-permissions \
         "You are running inside a disposable container spawned by contextmatrix-runner for card ${CM_CARD_ID}.
-A human user is watching this session and will provide approval at interactive gates, but you should begin work immediately — do NOT wait for a first message.
-
-Steps:
-1. Call get_skill(skill_name='create-plan', card_id='${CM_CARD_ID}', caller_model='sonnet')
-2. Follow the returned skill instructions exactly. Plan drafting runs immediately; the skill's built-in checkpoints (plan approval, execution decision, review approval, commit/push confirmation) are where you wait for the user via stream-json input.
+A human user may send you approval messages at interactive gates.
 
 IMPORTANT:
 - Always use MCP tools for all ContextMatrix interactions.

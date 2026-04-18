@@ -25,6 +25,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/github"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/logparser"
+	"github.com/mhersson/contextmatrix-runner/internal/streammsg"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -269,10 +270,50 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			m.logger.Warn("failed to attach stdin to container", "container_id", resp.ID, "error", err)
 		} else {
 			m.tracker.SetStdin(payload.Project, payload.CardID, attached.Conn, attached.Close)
+
+			// Write the priming stream-json user message so Claude begins work
+			// immediately without waiting for a human to type something first.
+			content := buildPrimingContent(payload)
+			b, buildErr := streammsg.BuildUserMessage(content)
+			if buildErr != nil {
+				m.logger.Warn("failed to build priming message",
+					"container_id", truncateID(resp.ID),
+					"card_id", payload.CardID,
+					"project", payload.Project,
+					"error", buildErr)
+			} else if writeErr := m.tracker.WriteStdin(payload.Project, payload.CardID, b); writeErr != nil {
+				m.logger.Warn("failed to write priming message to container stdin",
+					"container_id", truncateID(resp.ID),
+					"card_id", payload.CardID,
+					"project", payload.Project,
+					"error", writeErr)
+			}
 		}
 	}
 
 	return resp.ID, nil
+}
+
+// buildPrimingContent returns the text of the priming stream-json user message
+// sent to the container on interactive start. The message instructs Claude to
+// begin executing the card immediately via the create-plan skill.
+func buildPrimingContent(payload RunConfig) string {
+	content := fmt.Sprintf(
+		"Begin work on card `%s` now. "+
+			"Call `get_skill(skill_name='create-plan', card_id='%s', caller_model='sonnet')` "+
+			"via the contextmatrix MCP server and follow the returned skill instructions exactly. "+
+			"Use MCP tools only. Never push to main or master. "+
+			"Call heartbeat every 5 minutes during idle waits and `report_usage` after each heartbeat. "+
+			"On completion, call `release_card` after transitioning to done.",
+		payload.CardID, payload.CardID,
+	)
+	if payload.BaseBranch != "" {
+		content += fmt.Sprintf(
+			" The base branch for this task is %s; create PRs targeting that branch.",
+			payload.BaseBranch,
+		)
+	}
+	return content
 }
 
 func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payload RunConfig, log *slog.Logger) {
