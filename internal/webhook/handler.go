@@ -339,6 +339,11 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// Subscribe before writing ": connected" so receiving that line is a
+	// client-observable guarantee that the subscription is live.
+	ch, unsubscribe := h.broadcaster.Subscribe(project)
+	defer unsubscribe()
+
 	// Flush headers and send initial keepalive to trigger client onopen.
 	flusher.Flush()
 	if _, err := fmt.Fprintf(w, ": connected\n\n"); err != nil {
@@ -348,9 +353,6 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flusher.Flush()
-
-	ch, unsubscribe := h.broadcaster.Subscribe(project)
-	defer unsubscribe()
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
