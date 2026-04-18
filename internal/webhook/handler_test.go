@@ -924,16 +924,16 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 }
 
 func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
-	// When cmClient is set, the contextmatrix API must be called BEFORE stdin write.
-	// On API success, stdin write proceeds normally.
+	// When cmClient is set, the contextmatrix verify-autonomous GET must be called
+	// BEFORE stdin write. On autonomous=true, stdin write proceeds normally.
 	var apiCalled bool
-	apiOrder := make([]string, 0)
+	var receivedMethod string
 	mu := &sync.Mutex{}
 
 	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		apiCalled = true
-		apiOrder = append(apiOrder, "api")
+		receivedMethod = r.Method
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":true}`))
@@ -958,13 +958,15 @@ func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	assert.Equal(t, http.StatusAccepted, w.Code)
-	assert.True(t, apiCalled, "contextmatrix promote API must be called")
-	assert.NotEmpty(t, fw.buf, "stdin must be written after API success")
+	assert.True(t, apiCalled, "contextmatrix verify-autonomous GET must be called")
+	// Must use GET to avoid re-triggering the promote webhook loop.
+	assert.Equal(t, http.MethodGet, receivedMethod, "must use GET, not POST")
+	assert.NotEmpty(t, fw.buf, "stdin must be written after autonomous=true verification")
 }
 
 func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
-	// When the contextmatrix API call fails, the handler returns 502 and must NOT
-	// write anything to stdin (fail closed — card stays in HITL mode).
+	// When the contextmatrix GET returns a server error, the handler returns 502
+	// and must NOT write anything to stdin (fail closed — card stays in HITL mode).
 	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error":"internal error"}`))
@@ -988,12 +990,47 @@ func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 	req := signedRequest(t, "POST", "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
-	assert.Equal(t, http.StatusBadGateway, w.Code, "API failure must produce 502")
-	assert.Empty(t, fw.buf, "stdin must NOT be written when API call fails")
+	assert.Equal(t, http.StatusBadGateway, w.Code, "CM error must produce 502")
+	assert.Empty(t, fw.buf, "stdin must NOT be written when CM returns error")
 
 	var resp Response
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
+}
+
+func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
+	// When CM returns autonomous=false the card has not been promoted yet.
+	// The handler must return 403 and NOT write to stdin.
+	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":false}`))
+	}))
+	defer cmServer.Close()
+
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster()
+	cmClient := callback.NewClient(cmServer.URL, "key", nil)
+
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, nil)
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "POST", "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code, "autonomous=false must produce 403")
+	assert.Empty(t, fw.buf, "stdin must NOT be written when autonomous=false")
+
+	var resp Response
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+	assert.Contains(t, resp.Error, "autonomous flag is not set")
 }
 
 // controlledWriteCloser records writes and signals via writeCh.

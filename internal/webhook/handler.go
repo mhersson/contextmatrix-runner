@@ -240,9 +240,10 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 const autonomousContent = "Autonomous mode has been enabled (card flag flipped). Check the card with `get_card` at your next gate and continue on the autonomous branch. Do not wait for further user input."
 
 // handlePromote switches a running interactive session to autonomous mode.
-// It calls the contextmatrix promote API first to flip the card's autonomous flag
-// server-side. Only on success does it write the canned stdin message.
-// If the API call fails, it returns 502 and does NOT write to stdin (fail closed).
+// It verifies via a read-only GET that CM has already set the card's autonomous
+// flag before writing the canned stdin message. Using GET (not POST) prevents
+// re-triggering the webhook and breaking an infinite promote loop. If the flag
+// is not confirmed, it returns an error and does NOT write to stdin (fail closed).
 func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	body := r.Context().Value(bodyKey{}).([]byte)
 
@@ -262,16 +263,27 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Call contextmatrix to flip the autonomous flag server-side FIRST.
-	// Fail closed: if this fails, do NOT write the stdin message.
+	// Verify that CM has already flipped the autonomous flag via a read-only GET.
+	// Using GET (not POST) avoids re-triggering the webhook and breaking the
+	// infinite promote loop. Fail closed: refuse to write stdin unless CM
+	// confirms autonomous=true.
 	if h.cmClient != nil {
-		if err := h.cmClient.PromoteCard(r.Context(), payload.Project, payload.CardID); err != nil {
-			slog.Error("contextmatrix promote API call failed",
+		autonomous, err := h.cmClient.VerifyAutonomous(r.Context(), payload.Project, payload.CardID)
+		if err != nil {
+			slog.Error("contextmatrix verify-autonomous request failed",
 				"card_id", payload.CardID,
 				"project", payload.Project,
 				"error", err,
 			)
-			writeError(w, http.StatusBadGateway, "contextmatrix promote API call failed: "+err.Error())
+			writeError(w, http.StatusBadGateway, "contextmatrix verify-autonomous request failed: "+err.Error())
+			return
+		}
+		if !autonomous {
+			slog.Warn("promote rejected: card autonomous flag is not set on contextmatrix",
+				"card_id", payload.CardID,
+				"project", payload.Project,
+			)
+			writeError(w, http.StatusForbidden, "card autonomous flag is not set on contextmatrix")
 			return
 		}
 	}

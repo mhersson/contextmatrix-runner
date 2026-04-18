@@ -86,35 +86,48 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 	return fmt.Errorf("callback failed after %d attempts: %w", maxRetries, lastErr)
 }
 
-// PromoteCard calls the contextmatrix promote endpoint to flip the card's
-// autonomous flag server-side. Returns an error on any non-2xx response.
-// This must succeed before writing the canned stdin message in handlePromote.
-func (c *Client) PromoteCard(ctx context.Context, project, cardID string) error {
-	url := fmt.Sprintf("%s/api/projects/%s/cards/%s/promote", c.contextMatrixURL, project, cardID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
+// cardResponse is the minimal subset of a CM card needed to verify the
+// autonomous flag. Only the fields used by VerifyAutonymous are decoded.
+type cardResponse struct {
+	Autonomous bool `json:"autonomous"`
+}
+
+// VerifyAutonomous fetches the card from ContextMatrix via a read-only GET and
+// reports whether its autonomous flag is set. It returns (false, err) on any
+// non-2xx response so callers can remain fail-closed without issuing any
+// state-changing request back to CM (which would trigger an infinite loop).
+func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (bool, error) {
+	url := fmt.Sprintf("%s/api/projects/%s/cards/%s", c.contextMatrixURL, project, cardID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
-		return fmt.Errorf("create promote request: %w", err)
+		return false, fmt.Errorf("create verify-autonomous request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send promote request: %w", err)
+		return false, fmt.Errorf("send verify-autonomous request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return fmt.Errorf("read promote response: %w", err)
+		return false, fmt.Errorf("read verify-autonomous response: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
-		return &callbackError{
+		return false, &callbackError{
 			statusCode: resp.StatusCode,
 			body:       string(respBody),
 		}
 	}
-	return nil
+
+	var card cardResponse
+	if err := json.Unmarshal(respBody, &card); err != nil {
+		return false, fmt.Errorf("parse verify-autonomous response: %w", err)
+	}
+
+	return card.Autonomous, nil
 }
 
 func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts string) error {

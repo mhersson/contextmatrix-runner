@@ -131,7 +131,7 @@ func TestReportStatus_HMACFormat(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestPromoteCard_Success(t *testing.T) {
+func TestVerifyAutonomous_True(t *testing.T) {
 	var receivedMethod, receivedPath string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -143,14 +143,32 @@ func TestPromoteCard_Success(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "any-key", testLogger())
-	err := client.PromoteCard(context.Background(), "my-project", "PROJ-001")
+	autonomous, err := client.VerifyAutonomous(context.Background(), "my-project", "PROJ-001")
 	require.NoError(t, err)
+	assert.True(t, autonomous)
 
-	assert.Equal(t, http.MethodPost, receivedMethod)
-	assert.Equal(t, "/api/projects/my-project/cards/PROJ-001/promote", receivedPath)
+	// Must use GET, not POST, so CM does not re-trigger the promote webhook.
+	assert.Equal(t, http.MethodGet, receivedMethod)
+	assert.Equal(t, "/api/projects/my-project/cards/PROJ-001", receivedPath)
 }
 
-func TestPromoteCard_ServerError(t *testing.T) {
+func TestVerifyAutonomous_False(t *testing.T) {
+	// autonomous=false means the card has not been promoted yet — caller should
+	// refuse to write stdin.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":false}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "any-key", testLogger())
+	autonomous, err := client.VerifyAutonomous(context.Background(), "my-project", "PROJ-001")
+	require.NoError(t, err)
+	assert.False(t, autonomous)
+}
+
+func TestVerifyAutonomous_ServerError(t *testing.T) {
+	// 5xx → (false, err); caller must not write stdin.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error":"internal error"}`))
@@ -158,23 +176,23 @@ func TestPromoteCard_ServerError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "any-key", testLogger())
-	err := client.PromoteCard(context.Background(), "my-project", "PROJ-001")
+	autonomous, err := client.VerifyAutonomous(context.Background(), "my-project", "PROJ-001")
 	require.Error(t, err)
+	assert.False(t, autonomous)
 	assert.Contains(t, err.Error(), "500")
 }
 
-func TestPromoteCard_409_Conflict(t *testing.T) {
-	// 409 on already-autonomous is a client error — not retried.
-	var calls atomic.Int32
+func TestVerifyAutonomous_NotFound(t *testing.T) {
+	// 404 → (false, err); caller must not write stdin.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"error":"already autonomous"}`))
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
 	}))
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "any-key", testLogger())
-	err := client.PromoteCard(context.Background(), "my-project", "PROJ-001")
+	autonomous, err := client.VerifyAutonomous(context.Background(), "my-project", "PROJ-001")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "409")
+	assert.False(t, autonomous)
+	assert.Contains(t, err.Error(), "404")
 }
