@@ -110,13 +110,21 @@ When `interactive: true` is set in the `/trigger` payload:
 |------------|---------------------------------------------|-----------|
 | `text`     | Claude assistant text block (stdout)        | yes       |
 | `thinking` | Claude thinking block (stdout)              | yes       |
-| `tool_call`| Claude tool_use block (non-MCP, stdout)     | no        |
+| `tool_call`| Claude tool_use block (non-MCP, stdout)     | yes       |
 | `stderr`   | Container stderr line                       | yes       |
 | `system`   | Runner lifecycle event (start/stop/error)   | no        |
 | `user`     | HITL chat message via /message webhook      | no        |
 
-`logparser.Redact` is applied only to `text`, `thinking`, and `stderr` entries
-(i.e. container output paths). It is never called on `user` or `system` entries.
+`logparser.Redact` is applied to `text`, `thinking`, `stderr`, and `tool_call`
+entries. It is never called on `user` or `system` entries.
+
+`tool_call` content is formatted as `Name: <summary>` (e.g.
+`Bash: git status`, `Read: /tmp/foo.go`). The summary is a per-tool extract of
+the most relevant argument: first line of `command` for Bash; `file_path` for
+Read/Edit/Write/MultiEdit/NotebookEdit; `pattern [in <path>]` for Glob/Grep;
+`url` for WebFetch; `query` for WebSearch; `description` for Task/Agent; `N
+todos` for TodoWrite; compact JSON fallback for unknown tools. The result is
+whitespace-collapsed and truncated at 200 runes with a trailing `…`.
 
 ## Verification
 

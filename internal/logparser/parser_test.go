@@ -3,6 +3,7 @@ package logparser
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -78,27 +79,27 @@ func TestProcessStream(t *testing.T) {
 		},
 		{
 			name:          "non-MCP tool_use is logged",
-			input:         `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}`,
+			input:         `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/foo.go"}}]}}`,
 			wantLevel:     slog.LevelInfo,
 			wantKey:       "claude_tool",
-			wantValue:     "Read",
+			wantValue:     "Read: /tmp/foo.go",
 			wantRecords:   1,
 			wantEmitType:  "tool_call",
 			wantEmitCount: 1,
 		},
 		{
 			name:          "Bash tool is logged",
-			input:         `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}`,
+			input:         `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]}}`,
 			wantLevel:     slog.LevelInfo,
 			wantKey:       "claude_tool",
-			wantValue:     "Bash",
+			wantValue:     "Bash: git status",
 			wantRecords:   1,
 			wantEmitType:  "tool_call",
 			wantEmitCount: 1,
 		},
 		{
 			name:          "MCP tool_use is skipped",
-			input:         `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__contextmatrix__heartbeat","input":{}}]}}`,
+			input:         `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__contextmatrix__heartbeat","input":{"card_id":"CTXMAX-1"}}]}}`,
 			wantRecords:   0,
 			wantEmitCount: 0,
 		},
@@ -322,4 +323,216 @@ func TestProcessStream_RedactsSecrets(t *testing.T) {
 	assert.Len(t, emitted, 1)
 	assert.Equal(t, "text", emitted[0].Type)
 	assert.Equal(t, "token is [REDACTED]", emitted[0].Content)
+}
+
+// TestFormatToolCall covers formatToolCall per-tool branches, whitespace
+// collapsing, truncation, and fallback behaviour.
+func TestFormatToolCall(t *testing.T) {
+	tests := []struct {
+		name  string
+		tool  string
+		input string
+		want  string
+	}{
+		// Bash: single-line command.
+		{
+			name:  "Bash single-line",
+			tool:  "Bash",
+			input: `{"command":"git status"}`,
+			want:  "Bash: git status",
+		},
+		// Bash: multi-line command — keeps only first line.
+		{
+			name:  "Bash multi-line keeps first line",
+			tool:  "Bash",
+			input: `{"command":"git add .\ngit commit -m \"wip\""}`,
+			want:  "Bash: git add .",
+		},
+		// Read uses file_path.
+		{
+			name:  "Read with file_path",
+			tool:  "Read",
+			input: `{"file_path":"/tmp/foo.go"}`,
+			want:  "Read: /tmp/foo.go",
+		},
+		// Edit uses file_path.
+		{
+			name:  "Edit with file_path",
+			tool:  "Edit",
+			input: `{"file_path":"/src/main.go","old_string":"a","new_string":"b"}`,
+			want:  "Edit: /src/main.go",
+		},
+		// Write uses file_path.
+		{
+			name:  "Write with file_path",
+			tool:  "Write",
+			input: `{"file_path":"/out/result.txt","content":"hello"}`,
+			want:  "Write: /out/result.txt",
+		},
+		// Glob pattern only.
+		{
+			name:  "Glob pattern only",
+			tool:  "Glob",
+			input: `{"pattern":"**/*.go"}`,
+			want:  "Glob: **/*.go",
+		},
+		// Glob pattern + path.
+		{
+			name:  "Glob pattern and path",
+			tool:  "Glob",
+			input: `{"pattern":"**/*.go","path":"/src"}`,
+			want:  "Glob: **/*.go in /src",
+		},
+		// Grep pattern only.
+		{
+			name:  "Grep pattern only",
+			tool:  "Grep",
+			input: `{"pattern":"TODO"}`,
+			want:  "Grep: TODO",
+		},
+		// Grep pattern + path.
+		{
+			name:  "Grep pattern and path",
+			tool:  "Grep",
+			input: `{"pattern":"TODO","path":"./internal"}`,
+			want:  "Grep: TODO in ./internal",
+		},
+		// WebFetch uses url.
+		{
+			name:  "WebFetch url",
+			tool:  "WebFetch",
+			input: `{"url":"https://example.com/api"}`,
+			want:  "WebFetch: https://example.com/api",
+		},
+		// WebSearch uses query.
+		{
+			name:  "WebSearch query",
+			tool:  "WebSearch",
+			input: `{"query":"golang context cancellation"}`,
+			want:  "WebSearch: golang context cancellation",
+		},
+		// Task uses description.
+		{
+			name:  "Task description",
+			tool:  "Task",
+			input: `{"description":"implement feature X"}`,
+			want:  "Task: implement feature X",
+		},
+		// Agent uses description.
+		{
+			name:  "Agent description",
+			tool:  "Agent",
+			input: `{"description":"run linter on all files"}`,
+			want:  "Agent: run linter on all files",
+		},
+		// TodoWrite: 3-element todos array.
+		{
+			name:  "TodoWrite 3 todos",
+			tool:  "TodoWrite",
+			input: `{"todos":[{"id":"1","content":"a"},{"id":"2","content":"b"},{"id":"3","content":"c"}]}`,
+			want:  "TodoWrite: 3 todos",
+		},
+		// Unknown tool falls back to compact JSON.
+		{
+			name:  "Unknown tool compact JSON fallback",
+			tool:  "MyCustomTool",
+			input: `{"foo":"bar"}`,
+			want:  `MyCustomTool: {"foo":"bar"}`,
+		},
+		// Empty object → name only.
+		{
+			name:  "empty object returns name only",
+			tool:  "Read",
+			input: `{}`,
+			want:  "Read",
+		},
+		// Null input → name only.
+		{
+			name:  "null input returns name only",
+			tool:  "Read",
+			input: `null`,
+			want:  "Read",
+		},
+		// Missing input (empty raw message) → name only.
+		{
+			name:  "absent input returns name only",
+			tool:  "Read",
+			input: ``,
+			want:  "Read",
+		},
+		// Bash with missing command field → name only (no crash).
+		{
+			name:  "Bash missing command returns name only",
+			tool:  "Bash",
+			input: `{"description":"something else"}`,
+			want:  `Bash: {"description":"something else"}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatToolCall(tc.tool, json.RawMessage(tc.input))
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestFormatToolCall_Truncation verifies that a summary exceeding maxToolCallLen
+// runes is truncated to exactly maxToolCallLen runes with a trailing ellipsis.
+func TestFormatToolCall_Truncation(t *testing.T) {
+	// Build a command that will produce a formatted string > 200 runes.
+	// "Bash: " is 6 chars, so the command must be >= 195 chars to trigger truncation.
+	longCmd := strings.Repeat("x", 210)
+	input := `{"command":"` + longCmd + `"}`
+
+	got := formatToolCall("Bash", json.RawMessage(input))
+	runes := []rune(got)
+
+	// Must be exactly maxToolCallLen + 1 rune (the ellipsis character '…').
+	assert.Equal(t, maxToolCallLen+1, len(runes), "truncated string should be maxToolCallLen runes + ellipsis")
+	assert.Equal(t, '…', runes[len(runes)-1], "last rune should be ellipsis")
+}
+
+// TestFormatToolCall_Truncation_InProcessStream ensures the truncated value
+// is what ProcessStream logs and emits.
+func TestFormatToolCall_Truncation_InProcessStream(t *testing.T) {
+	longCmd := strings.Repeat("a", 210)
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"` + longCmd + `"}}]}}`
+
+	logger, records := newTestLogger()
+	var emitted []logbroadcast.LogEntry
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	assert.Len(t, *records, 1)
+	logged := attr((*records)[0], "claude_tool")
+	loggedRunes := []rune(logged)
+	assert.Equal(t, maxToolCallLen+1, len(loggedRunes))
+	assert.Equal(t, '…', loggedRunes[len(loggedRunes)-1])
+
+	assert.Len(t, emitted, 1)
+	assert.Equal(t, logged, emitted[0].Content)
+}
+
+// TestProcessStream_ToolUseRedactsSecrets verifies that secrets in tool
+// arguments are redacted in both the slog value and the emitted content.
+func TestProcessStream_ToolUseRedactsSecrets(t *testing.T) {
+	secret := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo ` + secret + `"}}]}}`
+
+	logger, records := newTestLogger()
+	var emitted []logbroadcast.LogEntry
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	assert.Len(t, *records, 1)
+	logged := attr((*records)[0], "claude_tool")
+	assert.NotContains(t, logged, secret, "slog value must not contain the raw secret")
+	assert.Contains(t, logged, "[REDACTED]", "slog value must contain [REDACTED]")
+
+	assert.Len(t, emitted, 1)
+	assert.NotContains(t, emitted[0].Content, secret, "emitted content must not contain the raw secret")
+	assert.Contains(t, emitted[0].Content, "[REDACTED]", "emitted content must contain [REDACTED]")
 }
