@@ -193,6 +193,71 @@ func drainWithTimeout(t *testing.T, ch <-chan logbroadcast.LogEntry, n int, time
 	return out
 }
 
+// TestUserEntryFanOutVerbatim verifies that a "user"-typed LogEntry is delivered
+// to all subscribers exactly as published — no content transformation applied.
+func TestUserEntryFanOutVerbatim(t *testing.T) {
+	b := logbroadcast.NewBroadcaster()
+
+	ch1, unsub1 := b.Subscribe("")
+	ch2, unsub2 := b.Subscribe("")
+	defer unsub1()
+	defer unsub2()
+
+	entry := logbroadcast.LogEntry{
+		Timestamp: time.Now(),
+		CardID:    "CARD-42",
+		Project:   "proj-hitl",
+		Type:      "user",
+		Content:   "What is the status of the deployment?",
+	}
+	b.Publish(entry)
+
+	for i, ch := range []<-chan logbroadcast.LogEntry{ch1, ch2} {
+		select {
+		case got := <-ch:
+			assert.Equal(t, "user", got.Type, "subscriber %d: wrong type", i+1)
+			assert.Equal(t, entry.Content, got.Content, "subscriber %d: content must be unchanged", i+1)
+			assert.Equal(t, entry.CardID, got.CardID, "subscriber %d: card_id must match", i+1)
+		case <-time.After(time.Second):
+			t.Fatalf("subscriber %d timed out waiting for user entry", i+1)
+		}
+	}
+}
+
+// TestUserEntryNotRedacted is a regression test asserting that user-submitted
+// content containing a Bearer token is delivered verbatim to broadcaster
+// subscribers. The Broadcaster.Publish path does not invoke logparser.Redact;
+// redaction only occurs inside logparser.ProcessStream (for assistant text/
+// thinking blocks) and the stderr scanner in container/manager.go.
+// User-typed secrets are the user's own responsibility.
+func TestUserEntryNotRedacted(t *testing.T) {
+	b := logbroadcast.NewBroadcaster()
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	// A Bearer token that logparser.Redact would normally replace with [REDACTED].
+	secretContent := "Please use Bearer abcdefghijklmnopqrstuvwxyz1234567890 for auth"
+
+	b.Publish(logbroadcast.LogEntry{
+		Timestamp: time.Now(),
+		CardID:    "CARD-42",
+		Project:   "proj-hitl",
+		Type:      "user",
+		Content:   secretContent,
+	})
+
+	select {
+	case got := <-ch:
+		assert.Equal(t, "user", got.Type)
+		// Content must arrive exactly as published — no [REDACTED] substitution.
+		assert.Equal(t, secretContent, got.Content,
+			"user entry content must not be redacted by the broadcaster")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for user entry")
+	}
+}
+
 // TestConcurrentSafety exercises concurrent subscribe/unsubscribe/publish to
 // check for data races (run with -race).
 func TestConcurrentSafety(t *testing.T) {

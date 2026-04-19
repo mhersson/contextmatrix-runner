@@ -14,6 +14,23 @@ import (
 	dockertypes "github.com/docker/docker/api/types"
 )
 
+// HijackedResponse wraps the Docker SDK's hijacked connection and exposes only
+// the write side. This avoids leaking the SDK type through the DockerClient
+// interface, keeping it fully mockable.
+type HijackedResponse struct {
+	// Conn is the write side of the hijacked stdin connection.
+	Conn io.WriteCloser
+	// close releases the underlying network connection.
+	close func()
+}
+
+// Close releases the underlying network connection.
+func (h *HijackedResponse) Close() {
+	if h.close != nil {
+		h.close()
+	}
+}
+
 // DockerClient abstracts the Docker SDK methods used by the manager.
 // This interface enables testing with mocks.
 type DockerClient interface {
@@ -26,6 +43,7 @@ type DockerClient interface {
 	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
 	ContainerLogs(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
 	ContainerList(ctx context.Context, options container.ListOptions) ([]DockerContainer, error)
+	ContainerAttach(ctx context.Context, containerID string, options container.AttachOptions) (*HijackedResponse, error)
 	Close() error
 }
 
@@ -91,6 +109,17 @@ func (c *RealDockerClient) ContainerList(ctx context.Context, options container.
 		result[i] = DockerContainer{ID: ctr.ID, Labels: ctr.Labels}
 	}
 	return result, nil
+}
+
+func (c *RealDockerClient) ContainerAttach(ctx context.Context, containerID string, options container.AttachOptions) (*HijackedResponse, error) {
+	resp, err := c.cli.ContainerAttach(ctx, containerID, options)
+	if err != nil {
+		return nil, err
+	}
+	return &HijackedResponse{
+		Conn:  resp.Conn,
+		close: resp.Close,
+	}, nil
 }
 
 func (c *RealDockerClient) Close() error {

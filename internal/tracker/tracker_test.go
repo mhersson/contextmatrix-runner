@@ -1,6 +1,10 @@
 package tracker
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -158,3 +162,212 @@ func TestConcurrentAccess(t *testing.T) {
 
 	assert.Equal(t, 0, tr.Count())
 }
+
+// TestWriteStdin_NoStdinAttached verifies WriteStdin returns an error when no
+// stdin has been set for the key.
+func TestWriteStdin_NoStdinAttached(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	err := tr.WriteStdin("proj", "PROJ-001", []byte("hello\n"))
+	assert.ErrorContains(t, err, "no stdin attached")
+}
+
+// TestWriteStdin_ErrNoStdinAttached verifies that errors.Is matches
+// ErrNoStdinAttached when WriteStdin is called without stdin set.
+func TestWriteStdin_ErrNoStdinAttached(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	err := tr.WriteStdin("proj", "PROJ-001", []byte("hello\n"))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrNoStdinAttached),
+		"expected errors.Is(err, ErrNoStdinAttached) to be true, got: %v", err)
+}
+
+// TestWriteStdin_NotTracked verifies WriteStdin returns an error when the
+// container is not tracked at all.
+func TestWriteStdin_NotTracked(t *testing.T) {
+	tr := New()
+
+	err := tr.WriteStdin("proj", "PROJ-999", []byte("hello\n"))
+	assert.ErrorContains(t, err, "no container tracked")
+}
+
+// TestWriteStdin_AfterSetStdin verifies that WriteStdin succeeds after SetStdin
+// has been called.
+func TestWriteStdin_AfterSetStdin(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	pr, pw := io.Pipe()
+	tr.SetStdin("proj", "PROJ-001", pw, nil)
+
+	// Write in a goroutine so the pipe doesn't block.
+	done := make(chan error, 1)
+	go func() {
+		done <- tr.WriteStdin("proj", "PROJ-001", []byte("hello\n"))
+		_ = pw.Close()
+	}()
+
+	got, err := io.ReadAll(pr)
+	require.NoError(t, err)
+	require.NoError(t, <-done)
+	assert.Equal(t, "hello\n", string(got))
+}
+
+// TestWriteStdin_ConcurrentNoInterleave verifies that concurrent writes from
+// multiple goroutines do not interleave lines (each write is a complete line).
+func TestWriteStdin_ConcurrentNoInterleave(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	pr, pw := io.Pipe()
+	tr.SetStdin("proj", "PROJ-001", pw, nil)
+
+	const writers = 20
+	const line = "this-is-a-whole-line\n"
+
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = tr.WriteStdin("proj", "PROJ-001", []byte(line))
+		}()
+	}
+
+	// Close the write end after all goroutines finish so ReadAll terminates.
+	go func() {
+		wg.Wait()
+		_ = pw.Close()
+	}()
+
+	got, err := io.ReadAll(pr)
+	require.NoError(t, err)
+
+	// Each scanned line must be exactly the expected line (no partial writes).
+	scanner := bufio.NewScanner(bytes.NewReader(got))
+	count := 0
+	for scanner.Scan() {
+		assert.Equal(t, "this-is-a-whole-line", scanner.Text(),
+			"line %d was interleaved or truncated", count)
+		count++
+	}
+	assert.Equal(t, writers, count, "expected %d lines, got %d", writers, count)
+}
+
+// TestRemove_ClosesStdin verifies that Remove closes the stdin writer exactly
+// once, and subsequent writes via WriteStdin return an error.
+func TestRemove_ClosesStdin(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	closeCount := 0
+	var mu sync.Mutex
+	w := &countingWriteCloser{
+		closeFn: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+			closeCount++
+			return nil
+		},
+	}
+	tr.SetStdin("proj", "PROJ-001", w, nil)
+
+	tr.Remove("proj", "PROJ-001")
+
+	mu.Lock()
+	assert.Equal(t, 1, closeCount, "stdin should be closed exactly once on Remove")
+	mu.Unlock()
+
+	// Subsequent WriteStdin must fail because the container is no longer tracked.
+	err := tr.WriteStdin("proj", "PROJ-001", []byte("x"))
+	assert.Error(t, err)
+}
+
+// countingWriteCloser is a WriteCloser that counts Close calls for testing.
+type countingWriteCloser struct {
+	closeFn func() error
+}
+
+func (c *countingWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (c *countingWriteCloser) Close() error {
+	if c.closeFn != nil {
+		return c.closeFn()
+	}
+	return nil
+}
+
+// TestWriteStdin_AfterRemoveReturnsError verifies that WriteStdin returns an
+// error after Remove closes the stdin and removes the entry.
+func TestWriteStdin_AfterRemoveReturnsError(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	pr, pw := io.Pipe()
+	defer func() { _ = pr.Close() }()
+	tr.SetStdin("proj", "PROJ-001", pw, nil)
+
+	tr.Remove("proj", "PROJ-001")
+
+	err := tr.WriteStdin("proj", "PROJ-001", []byte("hello"))
+	assert.Error(t, err)
+}
+
+// TestRemove_InvokesOnClose verifies that Remove calls the onClose callback
+// exactly once when a stdin with an onClose is registered.
+func TestRemove_InvokesOnClose(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	var mu sync.Mutex
+	closeCount := 0
+	onClose := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		closeCount++
+	}
+
+	fw := &fakeWriteCloserSimple{}
+	tr.SetStdin("proj", "PROJ-001", fw, onClose)
+
+	tr.Remove("proj", "PROJ-001")
+
+	mu.Lock()
+	assert.Equal(t, 1, closeCount, "onClose should be called exactly once on Remove")
+	mu.Unlock()
+}
+
+// TestRemove_NoOnClose verifies that Remove does not panic when no onClose
+// callback was provided (nil onClose).
+func TestRemove_NoOnClose(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	fw := &fakeWriteCloserSimple{}
+	tr.SetStdin("proj", "PROJ-001", fw, nil)
+
+	// Must not panic.
+	assert.NotPanics(t, func() {
+		tr.Remove("proj", "PROJ-001")
+	})
+}
+
+// TestRemove_NoStdin verifies that Remove does not panic when no stdin was set.
+func TestRemove_NoStdin(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	// Must not panic when no stdin was registered.
+	assert.NotPanics(t, func() {
+		tr.Remove("proj", "PROJ-001")
+	})
+}
+
+// fakeWriteCloserSimple is a minimal WriteCloser for tests that don't need
+// to inspect what was written.
+type fakeWriteCloserSimple struct{}
+
+func (f *fakeWriteCloserSimple) Write(p []byte) (int, error) { return len(p), nil }
+func (f *fakeWriteCloserSimple) Close() error                 { return nil }

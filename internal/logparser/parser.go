@@ -30,6 +30,11 @@ var secretPatterns = []*regexp.Regexp{
 }
 
 // Redact replaces recognized secret patterns with [REDACTED].
+//
+// Redact is called only on container output: assistant text/thinking blocks
+// inside ProcessStream, and stderr lines in container/manager.go. It is NOT
+// applied to "user" or "system" LogEntry values, which are published directly
+// by webhook handlers without passing through this function.
 func Redact(s string) string {
 	for _, re := range secretPatterns {
 		s = re.ReplaceAllString(s, "[REDACTED]")

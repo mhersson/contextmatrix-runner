@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,19 +11,30 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
+	"github.com/mhersson/contextmatrix-runner/internal/streammsg"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
 type bodyKey struct{}
 
+// ContainerRunner is the subset of container.Manager used by the webhook handler.
+// Using an interface here enables handler tests to inject fakes without needing
+// the Docker daemon or the full Manager dependency graph.
+type ContainerRunner interface {
+	Run(ctx context.Context, payload container.RunConfig)
+	Kill(project, cardID string) error
+}
+
 // Handler processes incoming webhooks from ContextMatrix.
 type Handler struct {
-	manager       *container.Manager
+	manager       ContainerRunner
 	tracker       *tracker.Tracker
 	broadcaster   *logbroadcast.Broadcaster
+	cmClient      *callback.Client // contextmatrix callback client for promote API call
 	apiKey        string
 	maxConcurrent int
 	logger        *slog.Logger
@@ -30,9 +42,10 @@ type Handler struct {
 
 // NewHandler creates a webhook handler.
 func NewHandler(
-	manager *container.Manager,
+	manager ContainerRunner,
 	tracker *tracker.Tracker,
 	broadcaster *logbroadcast.Broadcaster,
+	cmClient *callback.Client,
 	apiKey string,
 	maxConcurrent int,
 	logger *slog.Logger,
@@ -41,6 +54,7 @@ func NewHandler(
 		manager:       manager,
 		tracker:       tracker,
 		broadcaster:   broadcaster,
+		cmClient:      cmClient,
 		apiKey:        apiKey,
 		maxConcurrent: maxConcurrent,
 		logger:        logger,
@@ -52,6 +66,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /trigger", h.hmacAuth(h.handleTrigger))
 	mux.HandleFunc("POST /kill", h.hmacAuth(h.handleKill))
 	mux.HandleFunc("POST /stop-all", h.hmacAuth(h.handleStopAll))
+	mux.HandleFunc("POST /message", h.hmacAuth(h.handleMessage))
+	mux.HandleFunc("POST /promote", h.hmacAuth(h.handlePromote))
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
 	mux.HandleFunc("GET /health", h.handleHealth)
 }
@@ -95,6 +111,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		MCPAPIKey:   payload.MCPAPIKey,
 		BaseBranch:  payload.BaseBranch,
 		RunnerImage: payload.RunnerImage,
+		Interactive: payload.Interactive,
 	})
 
 	writeJSON(w, http.StatusAccepted, Response{OK: true, Message: "container starting"})
@@ -155,9 +172,150 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                  true,
+		"ok":                 true,
 		"running_containers": h.tracker.Count(),
 	})
+}
+
+// maxMessageContent is the maximum allowed byte length for a user message.
+const maxMessageContent = 8192
+
+// handleMessage accepts a user chat message and writes it to the target
+// container's stdin as a Claude Code stream-json user turn.
+func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
+	body := r.Context().Value(bodyKey{}).([]byte)
+
+	var payload MessagePayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if payload.CardID == "" || payload.Project == "" || payload.Content == "" {
+		writeError(w, http.StatusBadRequest, "card_id, project, and content are required")
+		return
+	}
+	if len(payload.Content) > maxMessageContent {
+		writeError(w, http.StatusRequestEntityTooLarge, "content exceeds 8192 bytes")
+		return
+	}
+
+	// 404 if no container is tracked for this (project, card_id).
+	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
+		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+		return
+	}
+
+	// Build the Claude Code stream-json user message.
+	b, err := streammsg.BuildUserMessage(payload.Content)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal message")
+		return
+	}
+
+	// Write to stdin first; distinguish 409 (no stdin attached) from other
+	// errors. Publish only after a successful write so no phantom echo
+	// appears in the browser on a non-interactive container.
+	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
+		if errors.Is(err, tracker.ErrNoStdinAttached) {
+			writeError(w, http.StatusConflict, "container is not in interactive mode")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "stdin write failed")
+		return
+	}
+
+	if h.broadcaster != nil {
+		h.broadcaster.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			CardID:    payload.CardID,
+			Project:   payload.Project,
+			Type:      "user",
+			Content:   payload.Content,
+		})
+	}
+
+	writeJSON(w, http.StatusAccepted, Response{OK: true, MessageID: payload.MessageID})
+}
+
+const autonomousContent = "Autonomous mode has been enabled (card flag flipped). Check the card with `get_card` at your next gate and continue on the autonomous branch. Do not wait for further user input."
+
+// handlePromote switches a running interactive session to autonomous mode.
+// It verifies via a read-only GET that CM has already set the card's autonomous
+// flag before writing the canned stdin message. Using GET (not POST) prevents
+// re-triggering the webhook and breaking an infinite promote loop. If the flag
+// is not confirmed, it returns an error and does NOT write to stdin (fail closed).
+func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
+	body := r.Context().Value(bodyKey{}).([]byte)
+
+	var payload PromotePayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if payload.CardID == "" || payload.Project == "" {
+		writeError(w, http.StatusBadRequest, "card_id and project are required")
+		return
+	}
+
+	// 404 if no container is tracked for this (project, card_id).
+	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
+		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+		return
+	}
+
+	// Verify that CM has already flipped the autonomous flag via a read-only GET.
+	// Using GET (not POST) avoids re-triggering the webhook and breaking the
+	// infinite promote loop. Fail closed: refuse to write stdin unless CM
+	// confirms autonomous=true.
+	if h.cmClient != nil {
+		autonomous, err := h.cmClient.VerifyAutonomous(r.Context(), payload.Project, payload.CardID)
+		if err != nil {
+			slog.Error("contextmatrix verify-autonomous request failed",
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"error", err,
+			)
+			writeError(w, http.StatusBadGateway, "contextmatrix verify-autonomous request failed: "+err.Error())
+			return
+		}
+		if !autonomous {
+			slog.Warn("promote rejected: card autonomous flag is not set on contextmatrix",
+				"card_id", payload.CardID,
+				"project", payload.Project,
+			)
+			writeError(w, http.StatusForbidden, "card autonomous flag is not set on contextmatrix")
+			return
+		}
+	}
+
+	// Publish system LogEntry BEFORE the stdin write so the browser sees the
+	// mode switch in the correct order.
+	if h.broadcaster != nil {
+		h.broadcaster.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			CardID:    payload.CardID,
+			Project:   payload.Project,
+			Type:      "system",
+			Content:   "promoted to autonomous mode",
+		})
+	}
+
+	b, err := streammsg.BuildUserMessage(autonomousContent)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal message")
+		return
+	}
+
+	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
+		if errors.Is(err, tracker.ErrNoStdinAttached) {
+			writeError(w, http.StatusConflict, "container is not in interactive mode")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "stdin write failed")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, Response{OK: true})
 }
 
 // handleLogs streams log entries via Server-Sent Events (SSE).
@@ -184,6 +342,11 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// Subscribe before writing ": connected" so receiving that line is a
+	// client-observable guarantee that the subscription is live.
+	ch, unsubscribe := h.broadcaster.Subscribe(project)
+	defer unsubscribe()
+
 	// Flush headers and send initial keepalive to trigger client onopen.
 	flusher.Flush()
 	if _, err := fmt.Fprintf(w, ": connected\n\n"); err != nil {
@@ -193,9 +356,6 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flusher.Flush()
-
-	ch, unsubscribe := h.broadcaster.Subscribe(project)
-	defer unsubscribe()
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
