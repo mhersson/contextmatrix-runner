@@ -40,6 +40,7 @@ type RunConfig struct {
 	BaseBranch  string
 	RunnerImage string
 	Interactive bool
+	Model       string
 }
 
 const (
@@ -192,6 +193,9 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	}
 	if payload.Interactive {
 		env = append(env, "CM_INTERACTIVE=1")
+	}
+	if payload.Model != "" {
+		env = append(env, "CM_ORCHESTRATOR_MODEL="+payload.Model)
 	}
 
 	if m.cfg.ClaudeSettings != "" {

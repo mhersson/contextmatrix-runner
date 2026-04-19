@@ -112,6 +112,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		BaseBranch:  payload.BaseBranch,
 		RunnerImage: payload.RunnerImage,
 		Interactive: payload.Interactive,
+		Model:       payload.Model,
 	})
 
 	writeJSON(w, http.StatusAccepted, Response{OK: true, Message: "container starting"})

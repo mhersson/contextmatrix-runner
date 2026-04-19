@@ -76,7 +76,7 @@ fi
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
 if [ "${CM_INTERACTIVE:-}" = "1" ]; then
-    exec claude -p --model claude-sonnet-4-6 \
+    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
         --input-format stream-json \
         --output-format stream-json \
         --verbose --dangerously-skip-permissions \
@@ -91,7 +91,7 @@ IMPORTANT:
 - On completion, call release_card after transitioning to done — do NOT skip this.
 ${BASE_BRANCH_CONTEXT}"
 else
-    exec claude -p --model claude-sonnet-4-6 --output-format stream-json --verbose --dangerously-skip-permissions \
+    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" --output-format stream-json --verbose --dangerously-skip-permissions \
         "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
 
