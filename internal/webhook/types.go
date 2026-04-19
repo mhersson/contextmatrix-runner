@@ -10,6 +10,7 @@ type TriggerPayload struct {
 	BaseBranch  string `json:"base_branch,omitempty"`
 	RunnerImage string `json:"runner_image,omitempty"`
 	Interactive bool   `json:"interactive,omitempty"`
+	Model       string `json:"model,omitempty"`
 }
 
 // KillPayload is received from ContextMatrix to stop a specific task.
