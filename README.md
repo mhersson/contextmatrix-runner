@@ -326,7 +326,7 @@ remote_execution:
 2. ContextMatrix sends a signed `/trigger` webhook to the runner
 3. Runner generates a git credential token (GitHub App installation token or PAT)
 4. Runner pulls the Docker image and starts a hardened container with:
-   - Alpine 3.23 base with Go 1.26, Node.js 22, GitHub CLI, and golangci-lint
+   - Debian bookworm-slim base with Go 1.26, Node.js 25, GitHub CLI, and golangci-lint
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
    - Git credential token for clone/push operations
@@ -345,7 +345,7 @@ discarded.
 
 ## Worker Image
 
-The worker image (`docker/Dockerfile.worker`) is Alpine-based and runs
+The worker image (`docker/Dockerfile.worker`) is Debian-based and runs
 everything as a non-root `user` account (UID 1000). No privilege escalation or
 dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
 
