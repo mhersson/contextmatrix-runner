@@ -67,6 +67,7 @@ func TestFanOutToMultipleSubscribers(t *testing.T) {
 	ch1, unsub1 := b.Subscribe("")
 	ch2, unsub2 := b.Subscribe("")
 	ch3, unsub3 := b.Subscribe("")
+
 	defer unsub1()
 	defer unsub2()
 	defer unsub3()
@@ -102,8 +103,10 @@ func TestSlowSubscriberDrop(t *testing.T) {
 	// Fill the slow subscriber's buffer (256 entries) plus a few extras to
 	// trigger drops, while verifying Publish never blocks.
 	done := make(chan struct{})
+
 	go func() {
 		defer close(done)
+
 		for i := range 270 {
 			b.Publish(logbroadcast.LogEntry{
 				Timestamp: time.Now(),
@@ -112,6 +115,7 @@ func TestSlowSubscriberDrop(t *testing.T) {
 				Type:      "text",
 				Content:   "msg",
 			})
+
 			_ = i
 		}
 	}()
@@ -126,6 +130,7 @@ func TestSlowSubscriberDrop(t *testing.T) {
 	// Fast subscriber should have received at least some entries (up to its
 	// buffer limit of 256).
 	received := 0
+
 drain:
 	for {
 		select {
@@ -135,7 +140,8 @@ drain:
 			break drain
 		}
 	}
-	assert.Greater(t, received, 0, "fast subscriber should have received entries")
+
+	assert.Positive(t, received, "fast subscriber should have received entries")
 }
 
 // TestProjectFiltering verifies that a subscriber with a project filter only
@@ -146,6 +152,7 @@ func TestProjectFiltering(t *testing.T) {
 	chAll, unsubAll := b.Subscribe("")       // receives everything
 	chA, unsubA := b.Subscribe("proj-alpha") // only proj-alpha
 	chB, unsubB := b.Subscribe("proj-beta")  // only proj-beta
+
 	defer unsubAll()
 	defer unsubA()
 	defer unsubB()
@@ -180,7 +187,9 @@ func TestProjectFiltering(t *testing.T) {
 // drainWithTimeout reads up to n entries from ch within the given timeout.
 func drainWithTimeout(t *testing.T, ch <-chan logbroadcast.LogEntry, n int, timeout time.Duration) []logbroadcast.LogEntry {
 	t.Helper()
+
 	deadline := time.After(timeout)
+
 	out := make([]logbroadcast.LogEntry, 0, n)
 	for range n {
 		select {
@@ -190,6 +199,7 @@ func drainWithTimeout(t *testing.T, ch <-chan logbroadcast.LogEntry, n int, time
 			return out
 		}
 	}
+
 	return out
 }
 
@@ -200,6 +210,7 @@ func TestUserEntryFanOutVerbatim(t *testing.T) {
 
 	ch1, unsub1 := b.Subscribe("")
 	ch2, unsub2 := b.Subscribe("")
+
 	defer unsub1()
 	defer unsub2()
 
@@ -263,16 +274,20 @@ func TestUserEntryNotRedacted(t *testing.T) {
 func TestConcurrentSafety(t *testing.T) {
 	b := logbroadcast.NewBroadcaster()
 
-	const goroutines = 20
-	const publishes = 50
+	const (
+		goroutines = 20
+		publishes  = 50
+	)
 
 	var wg sync.WaitGroup
 
 	// Publishers.
 	for range goroutines {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
+
 			for range publishes {
 				b.Publish(makeEntry("proj-concurrent"))
 			}
@@ -282,14 +297,18 @@ func TestConcurrentSafety(t *testing.T) {
 	// Concurrent subscribe/unsubscribe.
 	for range goroutines {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
+
 			ch, unsub := b.Subscribe("")
 			// Drain to avoid blocking publishers.
 			go func() {
-				for range ch {
+				for range ch { //nolint:revive
+					// drain
 				}
 			}()
+
 			time.Sleep(time.Millisecond)
 			unsub()
 		}()

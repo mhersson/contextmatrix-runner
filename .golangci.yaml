@@ -1,0 +1,51 @@
+version: "2"
+linters:
+  default: none
+  enable:
+  # Enabled by default -- Few false positives
+  - errcheck
+  - govet
+  - ineffassign
+  - staticcheck
+  - unused
+
+  # The following are additionally enabled
+  - containedctx
+  - gocritic
+  - godot
+  - gosec
+  - misspell
+  - nakedret
+  - nlreturn # new line before return
+  - noctx # check requests for context
+  - revive
+  - testifylint # use proper testify methods
+  - unconvert # Remove unnecessary type conversions
+  - unparam
+  - whitespace
+  - wsl_v5
+  settings:
+    nakedret:
+      max-func-lines: 5
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+  exclusions:
+    generated: lax
+    presets:
+    - common-false-positives
+    - std-error-handling
+    - comments
+    rules:
+    - path: "_test.go"
+      linters:
+      - gosec
+      text: "G101"
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 8
+  fix: true
+formatters:
+  enable:
+  - goimports

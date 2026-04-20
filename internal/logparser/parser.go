@@ -49,6 +49,7 @@ func Redact(s string) string {
 	for _, re := range secretPatterns {
 		s = re.ReplaceAllString(s, "[REDACTED]")
 	}
+
 	return s
 }
 
@@ -120,6 +121,7 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		}
 		// First line only.
 		first := strings.SplitN(args.Command, "\n", 2)[0]
+
 		return strings.TrimSpace(first)
 
 	case "Read", "Edit", "MultiEdit", "Write", "NotebookEdit":
@@ -129,6 +131,7 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		if err := json.Unmarshal(input, &args); err != nil || args.FilePath == "" {
 			return compactJSON(input)
 		}
+
 		return args.FilePath
 
 	case "Glob":
@@ -139,9 +142,11 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		if err := json.Unmarshal(input, &args); err != nil || args.Pattern == "" {
 			return compactJSON(input)
 		}
+
 		if args.Path != "" {
 			return args.Pattern + " in " + args.Path
 		}
+
 		return args.Pattern
 
 	case "Grep":
@@ -152,9 +157,11 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		if err := json.Unmarshal(input, &args); err != nil || args.Pattern == "" {
 			return compactJSON(input)
 		}
+
 		if args.Path != "" {
 			return args.Pattern + " in " + args.Path
 		}
+
 		return args.Pattern
 
 	case "WebFetch":
@@ -164,6 +171,7 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		if err := json.Unmarshal(input, &args); err != nil || args.URL == "" {
 			return compactJSON(input)
 		}
+
 		return args.URL
 
 	case "WebSearch":
@@ -173,6 +181,7 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		if err := json.Unmarshal(input, &args); err != nil || args.Query == "" {
 			return compactJSON(input)
 		}
+
 		return args.Query
 
 	case "Task", "Agent":
@@ -182,6 +191,7 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		if err := json.Unmarshal(input, &args); err != nil || args.Description == "" {
 			return compactJSON(input)
 		}
+
 		return args.Description
 
 	case "TodoWrite":
@@ -191,10 +201,12 @@ func extractToolSummary(name string, input json.RawMessage) string {
 		if err := json.Unmarshal(input, &args); err != nil {
 			return compactJSON(input)
 		}
+
 		n := len(args.Todos)
 		if n == 0 {
 			return compactJSON(input)
 		}
+
 		return fmt.Sprintf("%d todos", n)
 
 	default:
@@ -208,10 +220,12 @@ func compactJSON(input json.RawMessage) string {
 	if len(input) == 0 {
 		return ""
 	}
+
 	var buf bytes.Buffer
 	if err := json.Compact(&buf, input); err != nil {
 		return ""
 	}
+
 	s := buf.String()
 	// If the compact result is just an empty object, return empty.
 	if s == "{}" || s == "null" {
@@ -220,8 +234,10 @@ func compactJSON(input json.RawMessage) string {
 	// Count runes to avoid returning a huge JSON blob — truncate early.
 	if utf8.RuneCountInString(s) > maxToolCallLen {
 		runes := []rune(s)
+
 		return string(runes[:maxToolCallLen])
 	}
+
 	return s
 }
 
@@ -254,6 +270,7 @@ func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogE
 		var ev event
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			logger.Warn("logparser: malformed JSON line", "error", err)
+
 			continue
 		}
 
@@ -266,12 +283,14 @@ func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogE
 			case "text":
 				content := Redact(block.Text)
 				logger.Info("claude", "claude_text", content)
+
 				if emit != nil {
 					emit(logbroadcast.LogEntry{Type: "text", Content: content})
 				}
 			case "thinking":
 				content := Redact(block.Thinking)
 				logger.Info("claude", "claude_thinking", content)
+
 				if emit != nil {
 					emit(logbroadcast.LogEntry{Type: "thinking", Content: content})
 				}
@@ -279,8 +298,10 @@ func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogE
 				if strings.HasPrefix(block.Name, "mcp__") {
 					continue
 				}
+
 				content := Redact(formatToolCall(block.Name, block.Input))
 				logger.Info("claude", "claude_tool", content)
+
 				if emit != nil {
 					emit(logbroadcast.LogEntry{Type: "tool_call", Content: content})
 				}

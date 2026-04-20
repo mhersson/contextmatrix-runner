@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,10 +25,12 @@ printf '%s' "$GIT_HOST"
 // to this test file.
 func entrypointPath(t *testing.T) string {
 	t.Helper()
+
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok, "runtime.Caller failed")
 	// internal/container/entrypoint_host_test.go → up two dirs → repo root
 	root := filepath.Join(filepath.Dir(filename), "..", "..")
+
 	return filepath.Join(root, "docker", "entrypoint.sh")
 }
 
@@ -35,18 +38,21 @@ func entrypointPath(t *testing.T) string {
 // returns the resulting GIT_HOST value.
 func extractHost(t *testing.T, cmRepoURL string) string {
 	t.Helper()
-	cmd := exec.Command("sh", "-c", hostExtractionSnippet)
+
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", hostExtractionSnippet)
+
 	cmd.Env = append(os.Environ(), "CM_REPO_URL="+cmRepoURL)
 	out, err := cmd.Output()
 	require.NoError(t, err, "shell snippet failed for CM_REPO_URL=%q", cmRepoURL)
+
 	return string(out)
 }
 
 func TestEntrypointGitHostExtraction(t *testing.T) {
 	cases := []struct {
-		name       string
-		cmRepoURL  string
-		wantHost   string
+		name      string
+		cmRepoURL string
+		wantHost  string
 	}{
 		{
 			name:      "github.com HTTPS with .git suffix",
@@ -99,7 +105,7 @@ func TestEntrypointUsesDynamicGitHost(t *testing.T) {
 		"entrypoint.sh must not hardcode 'machine github.com'; it should use $GIT_HOST")
 
 	// Must contain the dynamic host-extraction sed snippet.
-	assert.True(t, strings.Contains(src, "sed -n 's#^https://\\([^/]*\\)/.*#\\1#p'"),
+	assert.Contains(t, src, "sed -n 's#^https://\\([^/]*\\)/.*#\\1#p'",
 		"entrypoint.sh must contain the host-extraction sed snippet")
 
 	// Must export GH_HOST (required by gh CLI for non-github.com hosts).
@@ -134,29 +140,20 @@ func runEntrypoint(t *testing.T, extraEnv []string) string {
 
 	// Mock claude: writes all args to argFile then exits 0.
 	claudeMock := filepath.Join(tmpDir, "claude")
-	err := os.WriteFile(claudeMock, []byte(`#!/bin/bash
-printf '%s\n' "$@" > `+argFile+`
-exit 0
-`), 0o755)
+	claudeScript := "#!/bin/bash\nprintf '%s\\n' \"$@\" > " + argFile + "\nexit 0\n"
+	err := os.WriteFile(claudeMock, []byte(claudeScript), 0o755) //nolint:gosec
 	require.NoError(t, err, "writing mock claude")
 
 	// Mock git: for "clone" create the workspace dir; for everything else succeed silently.
 	gitMock := filepath.Join(tmpDir, "git")
-	err = os.WriteFile(gitMock, []byte(`#!/bin/bash
-if [ "$1" = "clone" ]; then
-    mkdir -p `+workspace+`
-    exit 0
-fi
-exit 0
-`), 0o755)
+	gitScript := "#!/bin/bash\nif [ \"$1\" = \"clone\" ]; then\n    mkdir -p " + workspace + "\n    exit 0\nfi\nexit 0\n"
+	err = os.WriteFile(gitMock, []byte(gitScript), 0o755) //nolint:gosec
 	require.NoError(t, err, "writing mock git")
 
 	// Mock jq: needed for MCP config construction — return harmless JSON.
 	jqMock := filepath.Join(tmpDir, "jq")
-	err = os.WriteFile(jqMock, []byte(`#!/bin/bash
-echo '{}'
-exit 0
-`), 0o755)
+	jqScript := "#!/bin/bash\necho '{}'\nexit 0\n"
+	err = os.WriteFile(jqMock, []byte(jqScript), 0o755) //nolint:gosec
 	require.NoError(t, err, "writing mock jq")
 
 	// Base env: clear PATH to only our mocks + minimal system tools.
@@ -169,13 +166,15 @@ exit 0
 		"CM_REPO_URL=https://github.com/example/repo.git",
 	}
 
-	cmd := exec.Command("bash", ep)
-	cmd.Env = append(baseEnv, extraEnv...)
+	cmd := exec.CommandContext(context.Background(), "bash", ep)
+
+	cmd.Env = baseEnv
+	cmd.Env = append(cmd.Env, extraEnv...)
 	// entrypoint does "cd /home/user/workspace" after clone; since our mock
 	// creates tmpDir/workspace, we patch the path by intercepting at the shell
 	// level. The entrypoint hardcodes /home/user/workspace in the cd command,
 	// so we pre-create it to avoid a cd failure.
-	require.NoError(t, os.MkdirAll("/home/user/workspace", 0o755),
+	require.NoError(t, os.MkdirAll("/home/user/workspace", 0o755), //nolint:gosec
 		"creating /home/user/workspace for test (requires write access or run as root)")
 
 	out, err := cmd.CombinedOutput()
@@ -184,10 +183,12 @@ exit 0
 	if err != nil {
 		t.Logf("entrypoint output:\n%s", out)
 	}
+
 	require.NoError(t, err, "entrypoint.sh failed")
 
 	raw, err := os.ReadFile(argFile)
 	require.NoError(t, err, "reading captured claude args")
+
 	return string(raw)
 }
 
@@ -254,12 +255,12 @@ func TestEntrypointInteractiveContent(t *testing.T) {
 		"interactive branch must include --input-format stream-json")
 
 	// Both branches must share --output-format stream-json.
-	assert.True(t, strings.Count(src, "--output-format stream-json") >= 1,
+	assert.GreaterOrEqual(t, strings.Count(src, "--output-format stream-json"), 1,
 		"entrypoint.sh must include --output-format stream-json")
 
 	// One-shot branch must NOT include --input-format.
 	// Verify by checking the one-shot exec line has no input-format flag on its line.
-	assert.True(t, strings.Contains(src, "run-autonomous workflow"),
+	assert.Contains(t, src, "run-autonomous workflow",
 		"one-shot branch must reference run-autonomous workflow")
 
 	// Interactive branch must contain the minimal context hint.

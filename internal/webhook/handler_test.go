@@ -27,35 +27,37 @@ import (
 func testManager(tr *tracker.Tracker) *container.Manager {
 	cfg := &config.Config{ContainerTimeout: "1h"}
 	cfg.ParseContainerTimeout()
+
 	return container.NewManager(nil, tr, nil, nil, nil, cfg, nil)
 }
 
-
 const testAPIKey = "test-api-key-that-is-at-least-32-chars"
 
-func signedRequest(t *testing.T, method, url string, payload any) *http.Request {
+func signedRequest(t *testing.T, url string, payload any) *http.Request {
 	t.Helper()
+
 	body, err := json.Marshal(payload)
 	require.NoError(t, err)
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
 
-	req := httptest.NewRequest(method, url, strings.NewReader(string(body)))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, url, strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
+
 	return req
 }
 
 func TestHmacAuth_MissingSignature(t *testing.T) {
 	h := &Handler{apiKey: testAPIKey}
-	handler := h.hmacAuth(func(w http.ResponseWriter, _ *http.Request) {
+	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("handler should not be called")
 	})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/test", strings.NewReader("{}"))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader("{}"))
 	handler(w, req)
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -63,12 +65,12 @@ func TestHmacAuth_MissingSignature(t *testing.T) {
 
 func TestHmacAuth_MissingTimestamp(t *testing.T) {
 	h := &Handler{apiKey: testAPIKey}
-	handler := h.hmacAuth(func(w http.ResponseWriter, _ *http.Request) {
+	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("handler should not be called")
 	})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/test", strings.NewReader("{}"))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader("{}"))
 	req.Header.Set(cmhmac.SignatureHeader, "sha256=abc")
 	handler(w, req)
 
@@ -77,12 +79,12 @@ func TestHmacAuth_MissingTimestamp(t *testing.T) {
 
 func TestHmacAuth_InvalidSignature(t *testing.T) {
 	h := &Handler{apiKey: testAPIKey}
-	handler := h.hmacAuth(func(w http.ResponseWriter, _ *http.Request) {
+	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("handler should not be called")
 	})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/test", strings.NewReader("{}"))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader("{}"))
 	req.Header.Set(cmhmac.SignatureHeader, "sha256=invalid")
 	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
 	handler(w, req)
@@ -92,9 +94,12 @@ func TestHmacAuth_InvalidSignature(t *testing.T) {
 
 func TestHmacAuth_ValidSignature(t *testing.T) {
 	h := &Handler{apiKey: testAPIKey}
+
 	var called bool
+
 	handler := h.hmacAuth(func(w http.ResponseWriter, _ *http.Request) {
 		called = true
+
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -103,7 +108,7 @@ func TestHmacAuth_ValidSignature(t *testing.T) {
 	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/test", strings.NewReader(string(body)))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader(string(body)))
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
 	handler(w, req)
@@ -116,10 +121,11 @@ func TestHandleTrigger_MissingFields(t *testing.T) {
 	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/trigger", map[string]string{"card_id": "A-001"})
+	req := signedRequest(t, "/trigger", map[string]string{"card_id": "A-001"})
 	h.hmacAuth(h.handleTrigger)(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+
 	var resp Response
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
@@ -138,7 +144,7 @@ func TestHandleTrigger_ConcurrencyLimit(t *testing.T) {
 	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
+	req := signedRequest(t, "/trigger", TriggerPayload{
 		CardID:  "NEW-001",
 		Project: "proj",
 		RepoURL: "git@github.com:org/repo.git",
@@ -159,7 +165,7 @@ func TestHandleTrigger_Duplicate(t *testing.T) {
 	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
+	req := signedRequest(t, "/trigger", TriggerPayload{
 		CardID:     "PROJ-042",
 		Project:    "my-project",
 		RepoURL:    "git@github.com:org/repo.git",
@@ -187,7 +193,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/trigger", TriggerPayload{
+	req := signedRequest(t, "/trigger", TriggerPayload{
 		CardID:     "PROJ-200",
 		Project:    "my-project",
 		RepoURL:    "git@github.com:org/repo.git",
@@ -199,6 +205,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 	// 409 Conflict means the payload was parsed correctly (base_branch did not
 	// cause a 400) and the duplicate check fired as expected.
 	assert.Equal(t, http.StatusConflict, w.Code)
+
 	var resp Response
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
@@ -210,7 +217,7 @@ func TestHandleKill_NotFound(t *testing.T) {
 	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/kill", KillPayload{
+	req := signedRequest(t, "/kill", KillPayload{
 		CardID:  "PROJ-999",
 		Project: "proj",
 	})
@@ -226,26 +233,29 @@ func TestHandleHealth(t *testing.T) {
 	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/health", nil)
+	req := httptest.NewRequestWithContext(context.Background(), "GET", "/health", nil)
 	h.handleHealth(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
+
 	var resp map[string]any
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.Equal(t, true, resp["ok"])
-	assert.Equal(t, float64(1), resp["running_containers"])
+	assert.InDelta(t, float64(1), resp["running_containers"], 1e-9)
 }
 
 // signedGETRequest builds a signed GET request with an empty body.
 // The HMAC is computed over timestamp + "." + "" (empty body).
 func signedGETRequest(t *testing.T, url string) *http.Request {
 	t.Helper()
+
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
 
-	req := httptest.NewRequest("GET", url, nil)
+	req := httptest.NewRequestWithContext(context.Background(), "GET", url, nil)
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
+
 	return req
 }
 
@@ -265,12 +275,12 @@ func newFlushRecorder() *flushRecorder {
 
 func (f *flushRecorder) Flush() {
 	f.ResponseRecorder.Flush()
+
 	select {
 	case f.flushed <- struct{}{}:
 	default:
 	}
 }
-
 
 // fakeRunner is a test double for ContainerRunner that records the RunConfig
 // passed to Run so tests can assert on the propagated fields.
@@ -315,7 +325,7 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 				Interactive: tt.interactive,
 			}
 			w := httptest.NewRecorder()
-			req := signedRequest(t, "POST", "/trigger", payload)
+			req := signedRequest(t, "/trigger", payload)
 			h.hmacAuth(h.handleTrigger)(w, req)
 
 			require.Equal(t, http.StatusAccepted, w.Code)
@@ -373,13 +383,14 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 	// Use an httptest.Server so we have a real connection with proper flushing.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
+
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
 
-	req, err := http.NewRequest("GET", srv.URL+"/logs", nil)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs", nil)
 	require.NoError(t, err)
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -387,6 +398,7 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	require.NoError(t, err)
+
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -394,14 +406,18 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 
 	// Read the initial ": connected\n\n" line.
 	scanner := bufio.NewScanner(resp.Body)
+
 	var firstLine string
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line != "" {
 			firstLine = line
+
 			break
 		}
 	}
+
 	assert.Equal(t, ": connected", firstLine)
 
 	// Publish a log entry and verify it arrives as data: {json}\n\n.
@@ -414,10 +430,12 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 	b.Publish(entry)
 
 	var dataLine string
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data: ") {
 			dataLine = line
+
 			break
 		}
 	}
@@ -425,6 +443,7 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 	require.NotEmpty(t, dataLine, "expected a data: line from SSE stream")
 
 	jsonPart := strings.TrimPrefix(dataLine, "data: ")
+
 	var got logbroadcast.LogEntry
 	require.NoError(t, json.Unmarshal([]byte(jsonPart), &got))
 	assert.Equal(t, entry.CardID, got.CardID)
@@ -439,6 +458,7 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
+
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -446,7 +466,7 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
 
 	// Subscribe only to "alpha" project.
-	req, err := http.NewRequest("GET", srv.URL+"/logs?project=alpha", nil)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs?project=alpha", nil)
 	require.NoError(t, err)
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -454,6 +474,7 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	require.NoError(t, err)
+
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -473,11 +494,13 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 
 	// Collect lines until we get a data line or timeout.
 	lineCh := make(chan string, 16)
+
 	go func() {
 		for scanner.Scan() {
 			line := scanner.Text()
 			if strings.HasPrefix(line, "data: ") {
 				lineCh <- line
+
 				return
 			}
 		}
@@ -499,13 +522,14 @@ func TestHandleLogs_ClientDisconnect(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
+
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
 
-	req, err := http.NewRequest("GET", srv.URL+"/logs", nil)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs", nil)
 	require.NoError(t, err)
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -543,19 +567,22 @@ type fakeWriteCloser struct {
 
 func (f *fakeWriteCloser) Write(p []byte) (int, error) {
 	f.buf = append(f.buf, p...)
+
 	return len(p), nil
 }
 
 func (f *fakeWriteCloser) Close() error {
 	f.closed = true
+
 	return nil
 }
 
 // setupMessageHandler builds a Handler with a tracker that has a container
 // registered (optionally with stdin attached) and a broadcaster.
-// Returns handler, tracker, broadcaster, and the fake stdin.
-func setupMessageHandler(t *testing.T, withStdin bool) (*Handler, *tracker.Tracker, *logbroadcast.Broadcaster, *fakeWriteCloser) {
+// Returns handler, broadcaster, and the fake stdin.
+func setupMessageHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.Broadcaster, *fakeWriteCloser) {
 	t.Helper()
+
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster()
 	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
@@ -570,11 +597,12 @@ func setupMessageHandler(t *testing.T, withStdin bool) (*Handler, *tracker.Track
 		fw = &fakeWriteCloser{}
 		tr.SetStdin("my-project", "PROJ-001", fw, nil)
 	}
-	return h, tr, b, fw
+
+	return h, b, fw
 }
 
 func TestHandleMessage_HappyPath(t *testing.T) {
-	h, _, b, fw := setupMessageHandler(t, true)
+	h, b, fw := setupMessageHandler(t, true)
 
 	ch, unsub := b.Subscribe("")
 	defer unsub()
@@ -586,7 +614,7 @@ func TestHandleMessage_HappyPath(t *testing.T) {
 		MessageID: "msg-abc-123",
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/message", payload)
+	req := signedRequest(t, "/message", payload)
 	h.hmacAuth(h.handleMessage)(w, req)
 
 	require.Equal(t, http.StatusAccepted, w.Code)
@@ -634,23 +662,26 @@ func TestHandleMessage_400_MissingFields(t *testing.T) {
 		{"missing content", MessagePayload{CardID: "C-1", Project: "p"}},
 	}
 
-	h, _, _, _ := setupMessageHandler(t, false)
+	h, _, _ := setupMessageHandler(t, false)
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
+
 			var req *http.Request
+
 			if s, ok := tc.payload.(string); ok {
 				// Invalid JSON — sign a raw string body.
 				body := []byte(s)
 				ts := strconv.FormatInt(time.Now().Unix(), 10)
 				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
-				req = httptest.NewRequest("POST", "/message", strings.NewReader(s))
+				req = httptest.NewRequestWithContext(context.Background(), "POST", "/message", strings.NewReader(s))
 				req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 				req.Header.Set(cmhmac.TimestampHeader, ts)
 			} else {
-				req = signedRequest(t, "POST", "/message", tc.payload)
+				req = signedRequest(t, "/message", tc.payload)
 			}
+
 			h.hmacAuth(h.handleMessage)(w, req)
 			assert.Equal(t, http.StatusBadRequest, w.Code, tc.name)
 		})
@@ -658,7 +689,7 @@ func TestHandleMessage_400_MissingFields(t *testing.T) {
 }
 
 func TestHandleMessage_404_NotTracked(t *testing.T) {
-	h, _, _, _ := setupMessageHandler(t, false)
+	h, _, _ := setupMessageHandler(t, false)
 
 	payload := MessagePayload{
 		CardID:  "NONEXISTENT",
@@ -666,7 +697,7 @@ func TestHandleMessage_404_NotTracked(t *testing.T) {
 		Content: "hello",
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/message", payload)
+	req := signedRequest(t, "/message", payload)
 	h.hmacAuth(h.handleMessage)(w, req)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -674,7 +705,7 @@ func TestHandleMessage_404_NotTracked(t *testing.T) {
 
 func TestHandleMessage_409_NoStdin(t *testing.T) {
 	// Container tracked but stdin not attached (non-interactive mode).
-	h, _, b, _ := setupMessageHandler(t, false)
+	h, b, _ := setupMessageHandler(t, false)
 
 	ch, unsub := b.Subscribe("")
 	defer unsub()
@@ -685,10 +716,11 @@ func TestHandleMessage_409_NoStdin(t *testing.T) {
 		Content: "hello",
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/message", payload)
+	req := signedRequest(t, "/message", payload)
 	h.hmacAuth(h.handleMessage)(w, req)
 
 	assert.Equal(t, http.StatusConflict, w.Code)
+
 	var resp Response
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
@@ -703,7 +735,7 @@ func TestHandleMessage_409_NoStdin(t *testing.T) {
 }
 
 func TestHandleMessage_413_ContentTooLarge(t *testing.T) {
-	h, _, _, _ := setupMessageHandler(t, true)
+	h, _, _ := setupMessageHandler(t, true)
 
 	payload := MessagePayload{
 		CardID:  "PROJ-001",
@@ -711,17 +743,17 @@ func TestHandleMessage_413_ContentTooLarge(t *testing.T) {
 		Content: strings.Repeat("x", 8193),
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/message", payload)
+	req := signedRequest(t, "/message", payload)
 	h.hmacAuth(h.handleMessage)(w, req)
 
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
 func TestHandleMessage_403_InvalidHMAC(t *testing.T) {
-	h, _, _, _ := setupMessageHandler(t, true)
+	h, _, _ := setupMessageHandler(t, true)
 
 	body, _ := json.Marshal(MessagePayload{CardID: "PROJ-001", Project: "my-project", Content: "hi"})
-	req := httptest.NewRequest("POST", "/message", strings.NewReader(string(body)))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/message", strings.NewReader(string(body)))
 	req.Header.Set(cmhmac.SignatureHeader, "sha256=badhash")
 	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
 
@@ -735,8 +767,9 @@ func TestHandleMessage_403_InvalidHMAC(t *testing.T) {
 
 // setupPromoteHandler builds a Handler with a tracker that has a container
 // registered (optionally with stdin attached) and a broadcaster.
-func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *tracker.Tracker, *logbroadcast.Broadcaster, *fakeWriteCloser) {
+func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.Broadcaster, *fakeWriteCloser) {
 	t.Helper()
+
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster()
 	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
@@ -751,11 +784,12 @@ func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *tracker.Track
 		fw = &fakeWriteCloser{}
 		tr.SetStdin("my-project", "PROJ-001", fw, nil)
 	}
-	return h, tr, b, fw
+
+	return h, b, fw
 }
 
 func TestHandlePromote_HappyPath(t *testing.T) {
-	h, _, b, fw := setupPromoteHandler(t, true)
+	h, b, fw := setupPromoteHandler(t, true)
 
 	ch, unsub := b.Subscribe("")
 	defer unsub()
@@ -765,7 +799,7 @@ func TestHandlePromote_HappyPath(t *testing.T) {
 		Project: "my-project",
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/promote", payload)
+	req := signedRequest(t, "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	require.Equal(t, http.StatusAccepted, w.Code)
@@ -811,22 +845,25 @@ func TestHandlePromote_400_MissingFields(t *testing.T) {
 		{"missing project", PromotePayload{CardID: "PROJ-001"}},
 	}
 
-	h, _, _, _ := setupPromoteHandler(t, false)
+	h, _, _ := setupPromoteHandler(t, false)
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
+
 			var req *http.Request
+
 			if s, ok := tc.payload.(string); ok {
 				body := []byte(s)
 				ts := strconv.FormatInt(time.Now().Unix(), 10)
 				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
-				req = httptest.NewRequest("POST", "/promote", strings.NewReader(s))
+				req = httptest.NewRequestWithContext(context.Background(), "POST", "/promote", strings.NewReader(s))
 				req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 				req.Header.Set(cmhmac.TimestampHeader, ts)
 			} else {
-				req = signedRequest(t, "POST", "/promote", tc.payload)
+				req = signedRequest(t, "/promote", tc.payload)
 			}
+
 			h.hmacAuth(h.handlePromote)(w, req)
 			assert.Equal(t, http.StatusBadRequest, w.Code, tc.name)
 		})
@@ -834,14 +871,14 @@ func TestHandlePromote_400_MissingFields(t *testing.T) {
 }
 
 func TestHandlePromote_404_NotTracked(t *testing.T) {
-	h, _, _, _ := setupPromoteHandler(t, false)
+	h, _, _ := setupPromoteHandler(t, false)
 
 	payload := PromotePayload{
 		CardID:  "NONEXISTENT",
 		Project: "my-project",
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/promote", payload)
+	req := signedRequest(t, "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -849,27 +886,28 @@ func TestHandlePromote_404_NotTracked(t *testing.T) {
 
 func TestHandlePromote_409_NoStdin(t *testing.T) {
 	// Container tracked but stdin not attached (non-interactive mode).
-	h, _, _, _ := setupPromoteHandler(t, false)
+	h, _, _ := setupPromoteHandler(t, false)
 
 	payload := PromotePayload{
 		CardID:  "PROJ-001",
 		Project: "my-project",
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/promote", payload)
+	req := signedRequest(t, "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	assert.Equal(t, http.StatusConflict, w.Code)
+
 	var resp Response
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 }
 
 func TestHandlePromote_403_InvalidHMAC(t *testing.T) {
-	h, _, _, _ := setupPromoteHandler(t, true)
+	h, _, _ := setupPromoteHandler(t, true)
 
 	body, _ := json.Marshal(PromotePayload{CardID: "PROJ-001", Project: "my-project"})
-	req := httptest.NewRequest("POST", "/promote", strings.NewReader(string(body)))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/promote", strings.NewReader(string(body)))
 	req.Header.Set(cmhmac.SignatureHeader, "sha256=badhash")
 	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
 
@@ -900,7 +938,7 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 
 	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/promote", payload)
+	req := signedRequest(t, "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	require.Equal(t, http.StatusAccepted, w.Code)
@@ -926,8 +964,11 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
 	// When cmClient is set, the contextmatrix verify-autonomous GET must be called
 	// BEFORE stdin write. On autonomous=true, stdin write proceeds normally.
-	var apiCalled bool
-	var receivedMethod string
+	var (
+		apiCalled      bool
+		receivedMethod string
+	)
+
 	mu := &sync.Mutex{}
 
 	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -949,12 +990,13 @@ func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
 		CardID:  "PROJ-001",
 		Project: "my-project",
 	}))
+
 	fw := &fakeWriteCloser{}
 	tr.SetStdin("my-project", "PROJ-001", fw, nil)
 
 	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/promote", payload)
+	req := signedRequest(t, "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	assert.Equal(t, http.StatusAccepted, w.Code)
@@ -967,7 +1009,7 @@ func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
 func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 	// When the contextmatrix GET returns a server error, the handler returns 502
 	// and must NOT write anything to stdin (fail closed — card stays in HITL mode).
-	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error":"internal error"}`))
 	}))
@@ -982,12 +1024,13 @@ func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 		CardID:  "PROJ-001",
 		Project: "my-project",
 	}))
+
 	fw := &fakeWriteCloser{}
 	tr.SetStdin("my-project", "PROJ-001", fw, nil)
 
 	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/promote", payload)
+	req := signedRequest(t, "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	assert.Equal(t, http.StatusBadGateway, w.Code, "CM error must produce 502")
@@ -1001,7 +1044,7 @@ func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 	// When CM returns autonomous=false the card has not been promoted yet.
 	// The handler must return 403 and NOT write to stdin.
-	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":false}`))
 	}))
@@ -1016,12 +1059,13 @@ func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 		CardID:  "PROJ-001",
 		Project: "my-project",
 	}))
+
 	fw := &fakeWriteCloser{}
 	tr.SetStdin("my-project", "PROJ-001", fw, nil)
 
 	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/promote", payload)
+	req := signedRequest(t, "/promote", payload)
 	h.hmacAuth(h.handlePromote)(w, req)
 
 	assert.Equal(t, http.StatusForbidden, w.Code, "autonomous=false must produce 403")
@@ -1046,16 +1090,18 @@ func (c *controlledWriteCloser) Write(p []byte) (int, error) {
 	case c.writeCh <- struct{}{}:
 	default:
 	}
+
 	return len(p), nil
 }
 
 func (c *controlledWriteCloser) Close() error {
 	c.closed = true
+
 	return nil
 }
 
 func TestHandleMessage_Escaping(t *testing.T) {
-	h, _, _, fw := setupMessageHandler(t, true)
+	h, _, fw := setupMessageHandler(t, true)
 
 	// Content with embedded quotes, newlines, and non-ASCII.
 	content := "say \"hello\"\nand café 🚀"
@@ -1066,13 +1112,14 @@ func TestHandleMessage_Escaping(t *testing.T) {
 		Content: content,
 	}
 	w := httptest.NewRecorder()
-	req := signedRequest(t, "POST", "/message", payload)
+	req := signedRequest(t, "/message", payload)
 	h.hmacAuth(h.handleMessage)(w, req)
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 	require.NotEmpty(t, fw.buf)
 
 	line := fw.buf
+
 	var got streammsg.UserMessage
 	require.NoError(t, json.Unmarshal(line[:len(line)-1], &got), "captured bytes must be valid JSON")
 	require.Len(t, got.Message.Content, 1)

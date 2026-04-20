@@ -17,6 +17,7 @@ func NewPATProvider(token string) (*PATProvider, error) {
 	if token == "" {
 		return nil, errors.New("pat token is required")
 	}
+
 	return &PATProvider{token: token}, nil
 }
 

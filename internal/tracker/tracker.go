@@ -79,7 +79,9 @@ func (t *Tracker) Add(info *ContainerInfo) error {
 	if _, exists := t.containers[k]; exists {
 		return fmt.Errorf("container already tracked for %s", k)
 	}
+
 	t.containers[k] = info
+
 	return nil
 }
 
@@ -93,6 +95,7 @@ func (t *Tracker) Get(project, cardID string) (*ContainerInfo, bool) {
 	if !ok {
 		return nil, false
 	}
+
 	return info.copy(), true
 }
 
@@ -111,14 +114,17 @@ func (t *Tracker) UpdateContainerID(project, cardID, containerID string) {
 // (e.g. to release the underlying network connection for a HijackedResponse).
 func (t *Tracker) SetStdin(project, cardID string, w io.WriteCloser, onClose func()) {
 	t.mu.Lock()
+
 	info, ok := t.containers[key(project, cardID)]
 	if ok && info.stdin == nil {
 		info.stdin = &stdinState{}
 	}
 	t.mu.Unlock()
+
 	if !ok {
 		return
 	}
+
 	info.stdin.mu.Lock()
 	info.stdin.stdin = w
 	info.stdin.onClose = onClose
@@ -131,24 +137,31 @@ func (t *Tracker) WriteStdin(project, cardID string, b []byte) error {
 	t.mu.RLock()
 	info, ok := t.containers[key(project, cardID)]
 	t.mu.RUnlock()
+
 	if !ok {
 		return fmt.Errorf("no container tracked for %s/%s", project, cardID)
 	}
+
 	if info.stdin == nil {
 		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
 	}
+
 	info.stdin.mu.Lock()
 	defer info.stdin.mu.Unlock()
+
 	if info.stdin.stdin == nil {
 		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
 	}
+
 	_, err := info.stdin.stdin.Write(b)
+
 	return err
 }
 
 // Remove deletes a container from the tracker and closes any attached stdin.
 func (t *Tracker) Remove(project, cardID string) {
 	t.mu.Lock()
+
 	info, ok := t.containers[key(project, cardID)]
 	if ok {
 		delete(t.containers, key(project, cardID))
@@ -161,8 +174,10 @@ func (t *Tracker) Remove(project, cardID string) {
 			_ = info.stdin.stdin.Close()
 			info.stdin.stdin = nil
 		}
+
 		onClose := info.stdin.onClose
 		info.stdin.mu.Unlock()
+
 		if onClose != nil {
 			onClose()
 		}
@@ -184,11 +199,13 @@ func (t *Tracker) ListByProject(project string) []*ContainerInfo {
 	defer t.mu.RUnlock()
 
 	var result []*ContainerInfo
+
 	for _, info := range t.containers {
 		if info.Project == project {
 			result = append(result, info.copy())
 		}
 	}
+
 	return result
 }
 
@@ -201,11 +218,14 @@ func (t *Tracker) AddIfUnderLimit(info *ContainerInfo, limit int) error {
 	if len(t.containers) >= limit {
 		return fmt.Errorf("container limit reached (%d)", limit)
 	}
+
 	k := key(info.Project, info.CardID)
 	if _, exists := t.containers[k]; exists {
 		return fmt.Errorf("container already tracked for %s/%s", info.Project, info.CardID)
 	}
+
 	t.containers[k] = info
+
 	return nil
 }
 
@@ -219,5 +239,6 @@ func (t *Tracker) All() []*ContainerInfo {
 	for _, info := range t.containers {
 		result = append(result, info.copy())
 	}
+
 	return result
 }

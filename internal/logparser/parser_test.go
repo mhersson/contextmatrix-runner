@@ -21,6 +21,7 @@ type recordHandler struct {
 func (h *recordHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
 	*h.records = append(*h.records, r)
+
 	return nil
 }
 func (h *recordHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
@@ -30,32 +31,37 @@ func (h *recordHandler) WithGroup(_ string) slog.Handler      { return h }
 func newTestLogger() (*slog.Logger, *[]slog.Record) {
 	records := make([]slog.Record, 0)
 	h := &recordHandler{records: &records}
+
 	return slog.New(h), &records
 }
 
 // attr returns the value of the named attribute from a record, or empty string.
 func attr(r slog.Record, key string) string {
 	var val string
+
 	r.Attrs(func(a slog.Attr) bool {
 		if a.Key == key {
 			val = a.Value.String()
+
 			return false
 		}
+
 		return true
 	})
+
 	return val
 }
 
 func TestProcessStream(t *testing.T) {
 	tests := []struct {
-		name           string
-		input          string
-		wantLevel      slog.Level
-		wantKey        string
-		wantValue      string
-		wantRecords    int
-		wantEmitType   string
-		wantEmitCount  int
+		name          string
+		input         string
+		wantLevel     slog.Level
+		wantKey       string
+		wantValue     string
+		wantRecords   int
+		wantEmitType  string
+		wantEmitCount int
 	}{
 		{
 			name:          "text block is logged",
@@ -140,6 +146,7 @@ func TestProcessStream(t *testing.T) {
 			logger, records := newTestLogger()
 
 			var emitted []logbroadcast.LogEntry
+
 			emit := func(e logbroadcast.LogEntry) {
 				emitted = append(emitted, e)
 			}
@@ -169,7 +176,9 @@ func TestProcessStream_MalformedJSON(t *testing.T) {
 		`{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}` + "\n"
 
 	logger, records := newTestLogger()
+
 	var emitted []logbroadcast.LogEntry
+
 	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})
@@ -194,7 +203,9 @@ func TestProcessStream_MultipleContentBlocks(t *testing.T) {
 		`]}}`
 
 	logger, records := newTestLogger()
+
 	var emitted []logbroadcast.LogEntry
+
 	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})
@@ -218,7 +229,9 @@ func TestProcessStream_LargeThinkingBlock(t *testing.T) {
 		bigThinking + `"}]}}`
 
 	logger, records := newTestLogger()
+
 	var emitted []logbroadcast.LogEntry
+
 	ProcessStream(bytes.NewBufferString(line), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})
@@ -233,7 +246,9 @@ func TestProcessStream_LargeThinkingBlock(t *testing.T) {
 
 func TestProcessStream_EmptyReader(t *testing.T) {
 	logger, records := newTestLogger()
+
 	var emitted []logbroadcast.LogEntry
+
 	ProcessStream(strings.NewReader(""), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})
@@ -311,7 +326,9 @@ func TestProcessStream_RedactsSecrets(t *testing.T) {
 	input := `{"type":"assistant","message":{"content":[{"type":"text","text":"token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"}]}}`
 
 	logger, records := newTestLogger()
+
 	var emitted []logbroadcast.LogEntry
+
 	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})
@@ -489,7 +506,7 @@ func TestFormatToolCall_Truncation(t *testing.T) {
 	runes := []rune(got)
 
 	// Must be exactly maxToolCallLen + 1 rune (the ellipsis character '…').
-	assert.Equal(t, maxToolCallLen+1, len(runes), "truncated string should be maxToolCallLen runes + ellipsis")
+	assert.Len(t, runes, maxToolCallLen+1, "truncated string should be maxToolCallLen runes + ellipsis")
 	assert.Equal(t, '…', runes[len(runes)-1], "last rune should be ellipsis")
 }
 
@@ -500,7 +517,9 @@ func TestFormatToolCall_Truncation_InProcessStream(t *testing.T) {
 	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"` + longCmd + `"}}]}}`
 
 	logger, records := newTestLogger()
+
 	var emitted []logbroadcast.LogEntry
+
 	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})
@@ -508,7 +527,7 @@ func TestFormatToolCall_Truncation_InProcessStream(t *testing.T) {
 	assert.Len(t, *records, 1)
 	logged := attr((*records)[0], "claude_tool")
 	loggedRunes := []rune(logged)
-	assert.Equal(t, maxToolCallLen+1, len(loggedRunes))
+	assert.Len(t, loggedRunes, maxToolCallLen+1)
 	assert.Equal(t, '…', loggedRunes[len(loggedRunes)-1])
 
 	assert.Len(t, emitted, 1)
@@ -522,7 +541,9 @@ func TestProcessStream_ToolUseRedactsSecrets(t *testing.T) {
 	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo ` + secret + `"}}]}}`
 
 	logger, records := newTestLogger()
+
 	var emitted []logbroadcast.LogEntry
+
 	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})

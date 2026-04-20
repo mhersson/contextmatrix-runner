@@ -30,6 +30,7 @@ func (m *MockDockerClient) ImagePull(ctx context.Context, ref string, options im
 	if m.ImagePullFn != nil {
 		return m.ImagePullFn(ctx, ref, options)
 	}
+
 	return io.NopCloser(io.LimitReader(nil, 0)), nil
 }
 
@@ -37,6 +38,7 @@ func (m *MockDockerClient) ImageInspectWithRaw(ctx context.Context, imageID stri
 	if m.ImageInspectWithRawFn != nil {
 		return m.ImageInspectWithRawFn(ctx, imageID)
 	}
+
 	return dockertypes.ImageInspect{}, nil, fmt.Errorf("image not found")
 }
 
@@ -44,6 +46,7 @@ func (m *MockDockerClient) ContainerCreate(ctx context.Context, config *containe
 	if m.ContainerCreateFn != nil {
 		return m.ContainerCreateFn(ctx, config, hostConfig, networkConfig, platform, name)
 	}
+
 	return container.CreateResponse{ID: "mock-container-id"}, nil
 }
 
@@ -51,6 +54,7 @@ func (m *MockDockerClient) ContainerStart(ctx context.Context, containerID strin
 	if m.ContainerStartFn != nil {
 		return m.ContainerStartFn(ctx, containerID, options)
 	}
+
 	return nil
 }
 
@@ -58,8 +62,10 @@ func (m *MockDockerClient) ContainerWait(ctx context.Context, containerID string
 	if m.ContainerWaitFn != nil {
 		return m.ContainerWaitFn(ctx, containerID, condition)
 	}
+
 	ch := make(chan container.WaitResponse, 1)
 	ch <- container.WaitResponse{StatusCode: 0}
+
 	return ch, make(chan error)
 }
 
@@ -67,6 +73,7 @@ func (m *MockDockerClient) ContainerStop(ctx context.Context, containerID string
 	if m.ContainerStopFn != nil {
 		return m.ContainerStopFn(ctx, containerID, options)
 	}
+
 	return nil
 }
 
@@ -74,6 +81,7 @@ func (m *MockDockerClient) ContainerRemove(ctx context.Context, containerID stri
 	if m.ContainerRemoveFn != nil {
 		return m.ContainerRemoveFn(ctx, containerID, options)
 	}
+
 	return nil
 }
 
@@ -81,6 +89,7 @@ func (m *MockDockerClient) ContainerLogs(ctx context.Context, containerID string
 	if m.ContainerLogsFn != nil {
 		return m.ContainerLogsFn(ctx, containerID, options)
 	}
+
 	return io.NopCloser(io.LimitReader(nil, 0)), nil
 }
 
@@ -88,6 +97,7 @@ func (m *MockDockerClient) ContainerList(ctx context.Context, options container.
 	if m.ContainerListFn != nil {
 		return m.ContainerListFn(ctx, options)
 	}
+
 	return nil, nil
 }
 

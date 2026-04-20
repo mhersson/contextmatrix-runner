@@ -28,6 +28,7 @@ func SignPayloadWithTimestamp(key string, body []byte, ts string) string {
 	mac.Write([]byte(ts))
 	mac.Write([]byte("."))
 	mac.Write(body)
+
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -38,10 +39,13 @@ func VerifySignatureWithTimestamp(key, signature, timestamp string, body []byte,
 	if err != nil {
 		return false
 	}
+
 	age := time.Since(time.Unix(ts, 0))
 	if age < -maxSkew || age > maxSkew {
 		return false
 	}
+
 	expected := SignPayloadWithTimestamp(key, body, timestamp)
+
 	return hmac.Equal([]byte(expected), []byte(signature))
 }

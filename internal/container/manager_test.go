@@ -37,11 +37,13 @@ var (
 func testRSAKey() *rsa.PrivateKey {
 	cachedKeyOnce.Do(func() {
 		var err error
+
 		cachedKey, err = rsa.GenerateKey(rand.Reader, 2048)
 		if err != nil {
 			panic(err)
 		}
 	})
+
 	return cachedKey
 }
 
@@ -57,12 +59,14 @@ func testConfig() *config.Config {
 	}
 	// Parse the container timeout duration without full validation.
 	cfg.ParseContainerTimeout()
+
 	return cfg
 }
 
 // testTokenProvider creates a mock GitHub token server and TokenProvider.
 func testTokenProvider(t *testing.T) github.TokenGenerator {
 	t.Helper()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -74,13 +78,16 @@ func testTokenProvider(t *testing.T) github.TokenGenerator {
 
 	tp, err := github.NewTokenProviderWithKey(12345, 67890, testRSAKey(), srv.URL)
 	require.NoError(t, err)
+
 	return tp
 }
 
 func testPATProvider(t *testing.T) github.TokenGenerator {
 	t.Helper()
+
 	p, err := github.NewPATProvider("ghp_test_pat")
 	require.NoError(t, err)
+
 	return p
 }
 
@@ -94,9 +101,11 @@ func testPayload() RunConfig {
 }
 
 func TestRun_Success(t *testing.T) {
-	var createdEnv []string
-	var createdLabels map[string]string
-	var reportedStatuses []string
+	var (
+		createdEnv       []string
+		createdLabels    map[string]string
+		reportedStatuses []string
+	)
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -107,17 +116,21 @@ func TestRun_Success(t *testing.T) {
 	mock := &MockDockerClient{
 		ImagePullFn: func(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
 			assert.Equal(t, "test-image:latest", ref)
+
 			return io.NopCloser(strings.NewReader("")), nil
 		},
 		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
 			createdEnv = cfg.Env
 			createdLabels = cfg.Labels
+
 			assert.Contains(t, name, "cmr-")
+
 			return container.CreateResponse{ID: "test-ctr-123"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -125,9 +138,14 @@ func TestRun_Success(t *testing.T) {
 	// Track reported statuses.
 	origCbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		var req struct{ RunnerStatus string `json:"runner_status"` }
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+		}
+
 		_ = json.Unmarshal(body, &req)
 		reportedStatuses = append(reportedStatuses, req.RunnerStatus)
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -177,11 +195,13 @@ func TestRun_PATProvider(t *testing.T) {
 		},
 		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			createdEnv = cfg.Env
+
 			return container.CreateResponse{ID: "pat-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -215,9 +235,14 @@ func TestRun_NonZeroExit(t *testing.T) {
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		var req struct{ RunnerStatus string `json:"runner_status"` }
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+		}
+
 		_ = json.Unmarshal(body, &req)
 		reportedStatuses = append(reportedStatuses, req.RunnerStatus)
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -230,6 +255,7 @@ func TestRun_NonZeroExit(t *testing.T) {
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 1}
+
 			return ch, make(chan error)
 		},
 	}
@@ -258,11 +284,16 @@ func TestRun_ImagePullFailure(t *testing.T) {
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		var req struct{ RunnerStatus string `json:"runner_status"` }
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+		}
+
 		_ = json.Unmarshal(body, &req)
 		if req.RunnerStatus == "failed" {
 			failureReported.Store(true)
 		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -299,11 +330,13 @@ func TestRun_CustomImage(t *testing.T) {
 	mock := &MockDockerClient{
 		ImagePullFn: func(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
 			pulledImage = ref
+
 			return io.NopCloser(strings.NewReader("")), nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -341,6 +374,7 @@ func TestKill(t *testing.T) {
 	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
 
 	canceled := false
+
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:      "PROJ-001",
 		Project:     "proj",
@@ -364,6 +398,7 @@ func TestKill_NotFound(t *testing.T) {
 
 func TestCleanupOrphans(t *testing.T) {
 	var removedIDs []string
+
 	mock := &MockDockerClient{
 		ContainerListFn: func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
 			return []DockerContainer{
@@ -373,6 +408,7 @@ func TestCleanupOrphans(t *testing.T) {
 		},
 		ContainerRemoveFn: func(_ context.Context, id string, _ container.RemoveOptions) error {
 			removedIDs = append(removedIDs, id)
+
 			return nil
 		},
 	}
@@ -405,6 +441,7 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -445,14 +482,17 @@ func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mount
 		},
 		ContainerCreateFn: func(_ context.Context, c *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			env = c.Env
+
 			for _, m := range hc.Mounts {
 				mounts = append(mounts, m.Target)
 			}
+
 			return container.CreateResponse{ID: "auth-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -518,6 +558,7 @@ func TestAuthPriority_OAuthToken(t *testing.T) {
 
 	// Only CLAUDE_CODE_OAUTH_TOKEN should be injected.
 	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-tok")
+
 	for _, e := range env {
 		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when OAuth token takes priority")
 	}
@@ -535,6 +576,7 @@ func TestAuthPriority_APIKeyOnly(t *testing.T) {
 
 	assert.Empty(t, mounts, "no mounts should be present when using API key only")
 	assert.Contains(t, env, "ANTHROPIC_API_KEY=sk-only")
+
 	for _, e := range env {
 		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be set when only API key is configured")
 	}
@@ -552,6 +594,7 @@ func TestAuthPriority_OAuthTokenOnly(t *testing.T) {
 
 	assert.Empty(t, mounts, "no mounts should be present when using OAuth token only")
 	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-only")
+
 	for _, e := range env {
 		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when only OAuth token is configured")
 	}
@@ -635,11 +678,13 @@ func TestOrchestratorModel_EnvVarPresentWhenSet(t *testing.T) {
 		},
 		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			assert.Contains(t, cfg.Env, "CM_ORCHESTRATOR_MODEL=claude-opus-4-7")
+
 			return container.CreateResponse{ID: "model-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -679,11 +724,13 @@ func TestOrchestratorModel_EnvVarAbsentWhenEmpty(t *testing.T) {
 				assert.False(t, strings.HasPrefix(e, "CM_ORCHESTRATOR_MODEL="),
 					"CM_ORCHESTRATOR_MODEL must not be set when Model is empty")
 			}
+
 			return container.CreateResponse{ID: "no-model-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -720,11 +767,13 @@ func TestBaseBranch_EnvVarPresentWhenSet(t *testing.T) {
 		},
 		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			assert.Contains(t, cfg.Env, "CM_BASE_BRANCH=main")
+
 			return container.CreateResponse{ID: "bb-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -763,11 +812,13 @@ func TestInteractive_EnvVarPresentWhenTrue(t *testing.T) {
 		},
 		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			assert.Contains(t, cfg.Env, "CM_INTERACTIVE=1")
+
 			return container.CreateResponse{ID: "interactive-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -806,11 +857,13 @@ func TestInteractive_EnvVarAbsentWhenFalse(t *testing.T) {
 			for _, e := range cfg.Env {
 				assert.False(t, strings.HasPrefix(e, "CM_INTERACTIVE="), "CM_INTERACTIVE must not be set when Interactive is false")
 			}
+
 			return container.CreateResponse{ID: "non-interactive-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -847,11 +900,13 @@ func TestBaseBranch_EnvVarAbsentWhenEmpty(t *testing.T) {
 			for _, e := range cfg.Env {
 				assert.False(t, strings.HasPrefix(e, "CM_BASE_BRANCH="), "CM_BASE_BRANCH must not be set when BaseBranch is empty")
 			}
+
 			return container.CreateResponse{ID: "bb-test-ctr"}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -882,8 +937,10 @@ func TestBaseBranch_EnvVarAbsentWhenEmpty(t *testing.T) {
 // TestInteractive_StdinConfigFlags verifies that ContainerCreate receives
 // OpenStdin=true, AttachStdin=true, Tty=false, StdinOnce=false when Interactive=true.
 func TestInteractive_StdinConfigFlags(t *testing.T) {
-	var capturedCfg *container.Config
-	var attachCalled int
+	var (
+		capturedCfg  *container.Config
+		attachCalled int
+	)
 
 	mock := &MockDockerClient{
 		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
@@ -891,6 +948,7 @@ func TestInteractive_StdinConfigFlags(t *testing.T) {
 		},
 		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			capturedCfg = cfg
+
 			return container.CreateResponse{ID: "stdin-test-ctr"}, nil
 		},
 		ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
@@ -901,6 +959,7 @@ func TestInteractive_StdinConfigFlags(t *testing.T) {
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}
@@ -941,11 +1000,14 @@ func TestInteractive_StdinConfigFlags(t *testing.T) {
 // Interactive is false.
 func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 	t.Run("interactive=true writes exactly one priming message", func(t *testing.T) {
-		var writtenBytes [][]byte
-		var writeMu sync.Mutex
+		var (
+			writtenBytes [][]byte
+			writeMu      sync.Mutex
+		)
 
 		// A WriteCloser that captures all Write calls.
 		pr, pw := io.Pipe()
+
 		go func() { _, _ = io.ReadAll(pr) }() // drain so writes don't block
 
 		spyWriter := &spyWriteCloser{
@@ -970,6 +1032,7 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 				ch := make(chan container.WaitResponse, 1)
 				ch <- container.WaitResponse{StatusCode: 0}
+
 				return ch, make(chan error)
 			},
 		}
@@ -1036,11 +1099,13 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 			ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
 				attachCalled++
 				_, pw := io.Pipe()
+
 				return &HijackedResponse{Conn: pw}, nil
 			},
 			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 				ch := make(chan container.WaitResponse, 1)
 				ch <- container.WaitResponse{StatusCode: 0}
+
 				return ch, make(chan error)
 			},
 		}
@@ -1071,10 +1136,13 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 	})
 
 	t.Run("interactive=true with BaseBranch appends branch context", func(t *testing.T) {
-		var writtenBytes [][]byte
-		var writeMu sync.Mutex
+		var (
+			writtenBytes [][]byte
+			writeMu      sync.Mutex
+		)
 
 		pr, pw := io.Pipe()
+
 		go func() { _, _ = io.ReadAll(pr) }()
 
 		spyWriter := &spyWriteCloser{
@@ -1082,6 +1150,7 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 			onWrite: func(b []byte) {
 				writeMu.Lock()
 				defer writeMu.Unlock()
+
 				buf := make([]byte, len(b))
 				copy(buf, b)
 				writtenBytes = append(writtenBytes, buf)
@@ -1098,6 +1167,7 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 				ch := make(chan container.WaitResponse, 1)
 				ch <- container.WaitResponse{StatusCode: 0}
+
 				return ch, make(chan error)
 			},
 		}
@@ -1129,11 +1199,15 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 		defer writeMu.Unlock()
 
 		require.Len(t, writtenBytes, 1)
+
 		var msg struct {
 			Message struct {
-				Content []struct{ Text string `json:"text"` } `json:"content"`
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
 			} `json:"message"`
 		}
+
 		raw := writtenBytes[0]
 		require.NoError(t, json.Unmarshal(raw[:len(raw)-1], &msg))
 		require.Len(t, msg.Message.Content, 1)
@@ -1151,6 +1225,7 @@ func (s *spyWriteCloser) Write(p []byte) (int, error) {
 	if s.onWrite != nil {
 		s.onWrite(p)
 	}
+
 	return s.WriteCloser.Write(p)
 }
 
@@ -1176,8 +1251,10 @@ func TestBuildPrimingContent(t *testing.T) {
 }
 
 func TestInteractive_FalseNoStdinFlagsNoAttach(t *testing.T) {
-	var capturedCfg *container.Config
-	var attachCalled int
+	var (
+		capturedCfg  *container.Config
+		attachCalled int
+	)
 
 	mock := &MockDockerClient{
 		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
@@ -1185,16 +1262,19 @@ func TestInteractive_FalseNoStdinFlagsNoAttach(t *testing.T) {
 		},
 		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			capturedCfg = cfg
+
 			return container.CreateResponse{ID: "non-interactive-stdin-ctr"}, nil
 		},
 		ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
 			attachCalled++
 			_, pw := io.Pipe()
+
 			return &HijackedResponse{Conn: pw}, nil
 		},
 		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 			ch := make(chan container.WaitResponse, 1)
 			ch <- container.WaitResponse{StatusCode: 0}
+
 			return ch, make(chan error)
 		},
 	}

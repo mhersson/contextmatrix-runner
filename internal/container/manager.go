@@ -92,6 +92,7 @@ func NewManager(
 // Use Wait to block until all launched goroutines have finished.
 func (m *Manager) Run(ctx context.Context, payload RunConfig) {
 	m.wg.Add(1)
+
 	go func() {
 		defer m.wg.Done()
 		defer func() {
@@ -102,6 +103,7 @@ func (m *Manager) Run(ctx context.Context, payload RunConfig) {
 				m.reportFailure(context.Background(), payload, fmt.Sprintf("internal error: %v", r))
 			}
 		}()
+
 		m.run(ctx, payload)
 	}()
 }
@@ -119,6 +121,7 @@ func (m *Manager) run(ctx context.Context, payload RunConfig) {
 		log.Error("failed to start container", "error", err)
 		m.reportFailure(ctx, payload, fmt.Sprintf("start failed: %v", err))
 		m.tracker.Remove(payload.Project, payload.CardID)
+
 		return
 	}
 
@@ -153,12 +156,15 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	// Validate image against allowlist.
 	if len(m.cfg.AllowedImages) > 0 {
 		allowed := false
+
 		for _, ai := range m.cfg.AllowedImages {
 			if img == ai {
 				allowed = true
+
 				break
 			}
 		}
+
 		if !allowed {
 			return "", fmt.Errorf("image %q not in allowed_images list", img)
 		}
@@ -188,12 +194,15 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	if payload.MCPAPIKey != "" {
 		env = append(env, "CM_MCP_API_KEY="+payload.MCPAPIKey)
 	}
+
 	if payload.BaseBranch != "" {
 		env = append(env, "CM_BASE_BRANCH="+payload.BaseBranch)
 	}
+
 	if payload.Interactive {
 		env = append(env, "CM_INTERACTIVE=1")
 	}
+
 	if payload.Model != "" {
 		env = append(env, "CM_ORCHESTRATOR_MODEL="+payload.Model)
 	}
@@ -205,7 +214,9 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	// Apply highest-priority auth method only.
 	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
 	var mounts []mount.Mount
-	if m.cfg.ClaudeAuthDir != "" {
+
+	switch {
+	case m.cfg.ClaudeAuthDir != "":
 		// Mount the auth directory; no auth env vars injected.
 		mounts = append(mounts, mount.Mount{
 			Type:     mount.TypeBind,
@@ -213,9 +224,9 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			Target:   "/claude-auth",
 			ReadOnly: true,
 		})
-	} else if m.cfg.ClaudeOAuthToken != "" {
+	case m.cfg.ClaudeOAuthToken != "":
 		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+m.cfg.ClaudeOAuthToken)
-	} else if m.cfg.AnthropicAPIKey != "" {
+	case m.cfg.AnthropicAPIKey != "":
 		env = append(env, "ANTHROPIC_API_KEY="+m.cfg.AnthropicAPIKey)
 	}
 
@@ -241,7 +252,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		containerCfg,
 		&container.HostConfig{
 			Mounts:      mounts,
-			ExtraHosts:  m.buildExtraHosts(payload.MCPURL),
+			ExtraHosts:  m.buildExtraHosts(ctx, payload.MCPURL),
 			CapDrop:     strslice.StrSlice{"ALL"},
 			SecurityOpt: []string{"no-new-privileges"},
 			Resources: container.Resources{
@@ -260,6 +271,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		if rmErr := m.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); rmErr != nil {
 			m.logger.Warn("failed to remove container after start failure", "container_id", resp.ID, "error", rmErr)
 		}
+
 		return "", fmt.Errorf("start container: %w", err)
 	}
 
@@ -278,6 +290,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			// Write the priming stream-json user message so Claude begins work
 			// immediately without waiting for a human to type something first.
 			content := buildPrimingContent(payload)
+
 			b, buildErr := streammsg.BuildUserMessage(content)
 			if buildErr != nil {
 				m.logger.Warn("failed to build priming message",
@@ -317,6 +330,7 @@ func buildPrimingContent(payload RunConfig) string {
 			payload.BaseBranch,
 		)
 	}
+
 	return content
 }
 
@@ -329,6 +343,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 
 	// Apply container timeout.
 	timeout := m.cfg.ContainerTimeoutDuration()
+
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -337,13 +352,16 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 	select {
 	case result := <-waitCh:
 		<-logDone // drain remaining log output
+
 		if result.StatusCode != 0 {
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
 			log.Warn(msg, "exit_code", result.StatusCode)
 			m.emitSystem(payload, "container failed: "+msg)
 			m.reportFailure(context.Background(), payload, msg)
+
 			return
 		}
+
 		log.Info("container completed successfully")
 		m.emitSystem(payload, "container completed")
 		m.reportCompleted(context.Background(), payload)
@@ -357,8 +375,10 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 			<-logDone
 			m.emitSystem(payload, "container failed: "+msg)
 			m.reportFailure(context.Background(), payload, msg)
+
 			return
 		}
+
 		msg := fmt.Sprintf("wait error: %v", err)
 		log.Error(msg)
 		m.killContainer(context.Background(), containerID, log)
@@ -388,6 +408,7 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 	if err != nil {
 		log.Warn("failed to attach to container logs", "error", err)
 		close(done)
+
 		return done
 	}
 
@@ -400,6 +421,7 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 
 		go func() {
 			defer func() { _ = stdoutPw.Close(); _ = stderrPw.Close() }()
+
 			_, _ = stdcopy.StdCopy(stdoutPw, stderrPw, reader)
 		}()
 
@@ -407,9 +429,11 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 		go func() {
 			scanner := bufio.NewScanner(stderrPr)
 			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
 			for scanner.Scan() {
 				line := scanner.Text()
 				log.Warn("container stderr", "line", line)
+
 				if m.broadcaster != nil {
 					m.broadcaster.Publish(logbroadcast.LogEntry{
 						Timestamp: time.Now(),
@@ -472,6 +496,7 @@ func (m *Manager) emitSystem(payload RunConfig, content string) {
 	if m.broadcaster == nil {
 		return
 	}
+
 	m.broadcaster.Publish(logbroadcast.LogEntry{
 		Timestamp: time.Now(),
 		CardID:    payload.CardID,
@@ -519,6 +544,7 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 	if len(containers) > 0 {
 		m.logger.Info("orphan cleanup complete", "removed", len(containers))
 	}
+
 	return nil
 }
 
@@ -535,6 +561,7 @@ func (m *Manager) pullImage(ctx context.Context, img string) error {
 	if policy == config.PullIfNotPresent {
 		if _, _, err := m.docker.ImageInspectWithRaw(ctx, img); err == nil {
 			m.logger.Debug("image already present locally, skipping pull", "image", img)
+
 			return nil
 		}
 	}
@@ -546,9 +573,11 @@ func (m *Manager) pullImage(ctx context.Context, img string) error {
 	if err != nil {
 		return fmt.Errorf("pull image %s: %w", img, err)
 	}
+
 	if _, err := io.Copy(io.Discard, reader); err != nil {
 		m.logger.Warn("failed to drain image pull output", "error", err)
 	}
+
 	if err := reader.Close(); err != nil {
 		m.logger.Warn("failed to close image pull reader", "error", err)
 	}
@@ -567,15 +596,16 @@ var scpRe = regexp.MustCompile(`^([^@:/\s]+@)?([^:/\s]+):([^/].*)$`)
 // HTTPS equivalents so the container can authenticate with a token rather
 // than an SSH key.
 //
-//   git@github.com:org/repo.git        → https://github.com/org/repo.git
-//   ssh://git@github.com/org/repo.git  → https://github.com/org/repo.git
-//   ssh://github.com/org/repo.git      → https://github.com/org/repo.git
-//   https://github.com/org/repo.git    → (unchanged)
+//	git@github.com:org/repo.git        → https://github.com/org/repo.git
+//	ssh://git@github.com/org/repo.git  → https://github.com/org/repo.git
+//	ssh://github.com/org/repo.git      → https://github.com/org/repo.git
+//	https://github.com/org/repo.git    → (unchanged)
 func normalizeRepoURL(rawURL string) string {
 	// SCP-style: [user@]host:path (path must not start with /).
 	if m := scpRe.FindStringSubmatch(rawURL); m != nil {
 		host := m[2]
 		path := m[3]
+
 		return "https://" + host + "/" + path
 	}
 
@@ -589,6 +619,7 @@ func normalizeRepoURL(rawURL string) string {
 		// Strip the user info (e.g. "git@") and rewrite to https.
 		u.Scheme = "https"
 		u.User = nil
+
 		return u.String()
 	}
 
@@ -598,6 +629,7 @@ func normalizeRepoURL(rawURL string) string {
 func sanitizeContainerName(project, cardID string) string {
 	name := fmt.Sprintf("cmr-%s-%s", project, cardID)
 	name = strings.ToLower(name)
+
 	return containerNameRe.ReplaceAllString(name, "-")
 }
 
@@ -607,6 +639,7 @@ func truncateID(id string) string {
 	if len(id) > 12 {
 		return id[:12]
 	}
+
 	return id
 }
 
@@ -614,7 +647,7 @@ func truncateID(id string) string {
 // Always includes host.docker.internal. If the MCP URL contains a hostname
 // that resolves on the host (e.g. via /etc/hosts), it's added so containers
 // can reach it too.
-func (m *Manager) buildExtraHosts(mcpURL string) []string {
+func (m *Manager) buildExtraHosts(ctx context.Context, mcpURL string) []string {
 	hosts := []string{"host.docker.internal:host-gateway"}
 
 	u, err := url.Parse(mcpURL)
@@ -628,13 +661,15 @@ func (m *Manager) buildExtraHosts(mcpURL string) []string {
 		return hosts
 	}
 
-	addrs, err := net.LookupHost(hostname)
+	addrs, err := net.DefaultResolver.LookupHost(ctx, hostname)
 	if err != nil || len(addrs) == 0 {
 		m.logger.Warn("could not resolve MCP hostname for container", "hostname", hostname, "error", err)
+
 		return hosts
 	}
 
 	hosts = append(hosts, hostname+":"+addrs[0])
 	m.logger.Info("added MCP host to container", "hostname", hostname, "ip", addrs[0])
+
 	return hosts
 }

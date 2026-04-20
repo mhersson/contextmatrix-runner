@@ -45,5 +45,5 @@ func TestBuildUserMessage_EmptyContent(t *testing.T) {
 	assert.Equal(t, "user", got.Message.Role)
 	require.Len(t, got.Message.Content, 1)
 	assert.Equal(t, "text", got.Message.Content[0].Type)
-	assert.Equal(t, "", got.Message.Content[0].Text)
+	assert.Empty(t, got.Message.Content[0].Text)
 }

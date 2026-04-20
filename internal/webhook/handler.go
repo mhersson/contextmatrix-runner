@@ -78,14 +78,18 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 	var payload TriggerPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+
 		return
 	}
+
 	if payload.CardID == "" || payload.Project == "" || payload.RepoURL == "" || payload.MCPURL == "" {
 		writeError(w, http.StatusBadRequest, "card_id, project, repo_url, and mcp_url are required")
+
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	err := h.tracker.AddIfUnderLimit(&tracker.ContainerInfo{
 		CardID:    payload.CardID,
 		Project:   payload.Project,
@@ -95,11 +99,13 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 	}, h.maxConcurrent)
 	if err != nil {
 		cancel()
+
 		if strings.Contains(err.Error(), "container limit reached") {
 			writeError(w, http.StatusTooManyRequests, err.Error())
 		} else {
 			writeError(w, http.StatusConflict, "task already running: "+payload.CardID)
 		}
+
 		return
 	}
 
@@ -124,15 +130,19 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 	var payload KillPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+
 		return
 	}
+
 	if payload.CardID == "" || payload.Project == "" {
 		writeError(w, http.StatusBadRequest, "card_id and project are required")
+
 		return
 	}
 
 	if err := h.manager.Kill(payload.Project, payload.CardID); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+
 		return
 	}
 
@@ -145,6 +155,7 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 	var payload StopAllPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+
 		return
 	}
 
@@ -156,12 +167,15 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	killed := 0
+
 	for _, info := range containers {
 		if err := h.manager.Kill(info.Project, info.CardID); err != nil {
 			h.logger.Warn("failed to kill container during stop-all",
 				"card_id", info.CardID, "error", err)
+
 			continue
 		}
+
 		killed++
 	}
 
@@ -189,20 +203,26 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	var payload MessagePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+
 		return
 	}
+
 	if payload.CardID == "" || payload.Project == "" || payload.Content == "" {
 		writeError(w, http.StatusBadRequest, "card_id, project, and content are required")
+
 		return
 	}
+
 	if len(payload.Content) > maxMessageContent {
 		writeError(w, http.StatusRequestEntityTooLarge, "content exceeds 8192 bytes")
+
 		return
 	}
 
 	// 404 if no container is tracked for this (project, card_id).
 	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
 		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+
 		return
 	}
 
@@ -210,6 +230,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	b, err := streammsg.BuildUserMessage(payload.Content)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to marshal message")
+
 		return
 	}
 
@@ -219,9 +240,12 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
 		if errors.Is(err, tracker.ErrNoStdinAttached) {
 			writeError(w, http.StatusConflict, "container is not in interactive mode")
+
 			return
 		}
+
 		writeError(w, http.StatusInternalServerError, "stdin write failed")
+
 		return
 	}
 
@@ -251,16 +275,20 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	var payload PromotePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+
 		return
 	}
+
 	if payload.CardID == "" || payload.Project == "" {
 		writeError(w, http.StatusBadRequest, "card_id and project are required")
+
 		return
 	}
 
 	// 404 if no container is tracked for this (project, card_id).
 	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
 		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+
 		return
 	}
 
@@ -277,14 +305,17 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 				"error", err,
 			)
 			writeError(w, http.StatusBadGateway, "contextmatrix verify-autonomous request failed: "+err.Error())
+
 			return
 		}
+
 		if !autonomous {
 			slog.Warn("promote rejected: card autonomous flag is not set on contextmatrix",
 				"card_id", payload.CardID,
 				"project", payload.Project,
 			)
 			writeError(w, http.StatusForbidden, "card autonomous flag is not set on contextmatrix")
+
 			return
 		}
 	}
@@ -304,15 +335,19 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	b, err := streammsg.BuildUserMessage(autonomousContent)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to marshal message")
+
 		return
 	}
 
 	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
 		if errors.Is(err, tracker.ErrNoStdinAttached) {
 			writeError(w, http.StatusConflict, "container is not in interactive mode")
+
 			return
 		}
+
 		writeError(w, http.StatusInternalServerError, "stdin write failed")
+
 		return
 	}
 
@@ -325,6 +360,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
+
 		return
 	}
 
@@ -350,12 +386,15 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	// Flush headers and send initial keepalive to trigger client onopen.
 	flusher.Flush()
+
 	if _, err := fmt.Fprintf(w, ": connected\n\n"); err != nil {
 		if h.logger != nil {
 			h.logger.Debug("SSE initial write failed", "error", err)
 		}
+
 		return
 	}
+
 	flusher.Flush()
 
 	ticker := time.NewTicker(15 * time.Second)
@@ -377,6 +416,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 					"remote_addr", r.RemoteAddr,
 				)
 			}
+
 			return
 
 		case <-ticker.C:
@@ -384,27 +424,34 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 				if h.logger != nil {
 					h.logger.Debug("SSE keepalive write failed", "error", err)
 				}
+
 				return
 			}
+
 			flusher.Flush()
 
 		case entry, ok := <-ch:
 			if !ok {
 				return
 			}
+
 			data, err := json.Marshal(entry)
 			if err != nil {
 				if h.logger != nil {
 					h.logger.Debug("SSE marshal failed", "error", err)
 				}
+
 				continue
 			}
+
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 				if h.logger != nil {
 					h.logger.Debug("SSE event write failed", "error", err)
 				}
+
 				return
 			}
+
 			flusher.Flush()
 		}
 	}
@@ -416,17 +463,21 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		sigHeader := r.Header.Get(cmhmac.SignatureHeader)
 		if sigHeader == "" {
 			writeError(w, http.StatusForbidden, "missing signature")
+
 			return
 		}
+
 		tsHeader := r.Header.Get(cmhmac.TimestampHeader)
 		if tsHeader == "" {
 			writeError(w, http.StatusForbidden, "missing timestamp")
+
 			return
 		}
 
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "failed to read body")
+
 			return
 		}
 
@@ -435,7 +486,9 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 			if h.logger != nil {
 				h.logger.Warn("webhook authentication failed", "remote_addr", r.RemoteAddr)
 			}
+
 			writeError(w, http.StatusForbidden, "invalid signature")
+
 			return
 		}
 

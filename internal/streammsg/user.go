@@ -18,6 +18,7 @@ type UserMessage struct {
 // content as a single text block. The returned slice is newline-terminated.
 func BuildUserMessage(content string) ([]byte, error) {
 	var msg UserMessage
+
 	msg.Type = "user"
 	msg.Message.Role = "user"
 	msg.Message.Content = []struct {
@@ -29,5 +30,6 @@ func BuildUserMessage(content string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return append(b, '\n'), nil
 }

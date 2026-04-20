@@ -3,7 +3,6 @@ package tracker
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -64,7 +63,7 @@ func TestUpdateContainerID(t *testing.T) {
 	assert.Equal(t, "new-ctr-id", got.ContainerID)
 }
 
-func TestUpdateContainerID_NotFound(t *testing.T) {
+func TestUpdateContainerID_NotFound(_ *testing.T) {
 	tr := New()
 	tr.UpdateContainerID("proj", "PROJ-999", "ctr-id") // should not panic
 }
@@ -125,39 +124,49 @@ func TestAll(t *testing.T) {
 
 func TestConcurrentAccess(t *testing.T) {
 	tr := New()
+
 	var wg sync.WaitGroup
 
 	// Concurrent adds
 	for i := range 50 {
 		wg.Add(1)
+
 		go func(i int) {
 			defer wg.Done()
-			cardID := "PROJ-" + string(rune('A'+i%26)) + string(rune('0'+i/26))
+
+			cardID := "PROJ-" + string(rune('A'+i%26)) + string(rune('0'+i/26)) //nolint:gosec
 			_ = tr.Add(info("proj", cardID))
 		}(i)
 	}
+
 	wg.Wait()
 
 	// Concurrent reads
 	for range 50 {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
+
 			_ = tr.Count()
 			_ = tr.All()
 			_ = tr.ListByProject("proj")
 		}()
 	}
+
 	wg.Wait()
 
 	// Concurrent removes
 	for _, ci := range tr.All() {
 		wg.Add(1)
+
 		go func(ci *ContainerInfo) {
 			defer wg.Done()
+
 			tr.Remove(ci.Project, ci.CardID)
 		}(ci)
 	}
+
 	wg.Wait()
 
 	assert.Equal(t, 0, tr.Count())
@@ -181,7 +190,7 @@ func TestWriteStdin_ErrNoStdinAttached(t *testing.T) {
 
 	err := tr.WriteStdin("proj", "PROJ-001", []byte("hello\n"))
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrNoStdinAttached),
+	assert.ErrorIs(t, err, ErrNoStdinAttached,
 		"expected errors.Is(err, ErrNoStdinAttached) to be true, got: %v", err)
 }
 
@@ -205,8 +214,10 @@ func TestWriteStdin_AfterSetStdin(t *testing.T) {
 
 	// Write in a goroutine so the pipe doesn't block.
 	done := make(chan error, 1)
+
 	go func() {
 		done <- tr.WriteStdin("proj", "PROJ-001", []byte("hello\n"))
+
 		_ = pw.Close()
 	}()
 
@@ -225,14 +236,18 @@ func TestWriteStdin_ConcurrentNoInterleave(t *testing.T) {
 	pr, pw := io.Pipe()
 	tr.SetStdin("proj", "PROJ-001", pw, nil)
 
-	const writers = 20
-	const line = "this-is-a-whole-line\n"
+	const (
+		writers = 20
+		line    = "this-is-a-whole-line\n"
+	)
 
 	var wg sync.WaitGroup
 	for range writers {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
+
 			_ = tr.WriteStdin("proj", "PROJ-001", []byte(line))
 		}()
 	}
@@ -240,6 +255,7 @@ func TestWriteStdin_ConcurrentNoInterleave(t *testing.T) {
 	// Close the write end after all goroutines finish so ReadAll terminates.
 	go func() {
 		wg.Wait()
+
 		_ = pw.Close()
 	}()
 
@@ -248,12 +264,14 @@ func TestWriteStdin_ConcurrentNoInterleave(t *testing.T) {
 
 	// Each scanned line must be exactly the expected line (no partial writes).
 	scanner := bufio.NewScanner(bytes.NewReader(got))
+
 	count := 0
 	for scanner.Scan() {
 		assert.Equal(t, "this-is-a-whole-line", scanner.Text(),
 			"line %d was interleaved or truncated", count)
 		count++
 	}
+
 	assert.Equal(t, writers, count, "expected %d lines, got %d", writers, count)
 }
 
@@ -264,12 +282,16 @@ func TestRemove_ClosesStdin(t *testing.T) {
 	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
 
 	closeCount := 0
+
 	var mu sync.Mutex
+
 	w := &countingWriteCloser{
 		closeFn: func() error {
 			mu.Lock()
 			defer mu.Unlock()
+
 			closeCount++
+
 			return nil
 		},
 	}
@@ -296,6 +318,7 @@ func (c *countingWriteCloser) Close() error {
 	if c.closeFn != nil {
 		return c.closeFn()
 	}
+
 	return nil
 }
 
@@ -306,7 +329,9 @@ func TestWriteStdin_AfterRemoveReturnsError(t *testing.T) {
 	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
 
 	pr, pw := io.Pipe()
+
 	defer func() { _ = pr.Close() }()
+
 	tr.SetStdin("proj", "PROJ-001", pw, nil)
 
 	tr.Remove("proj", "PROJ-001")
@@ -322,10 +347,12 @@ func TestRemove_InvokesOnClose(t *testing.T) {
 	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
 
 	var mu sync.Mutex
+
 	closeCount := 0
 	onClose := func() {
 		mu.Lock()
 		defer mu.Unlock()
+
 		closeCount++
 	}
 
@@ -370,4 +397,4 @@ func TestRemove_NoStdin(t *testing.T) {
 type fakeWriteCloserSimple struct{}
 
 func (f *fakeWriteCloserSimple) Write(p []byte) (int, error) { return len(p), nil }
-func (f *fakeWriteCloserSimple) Close() error                 { return nil }
+func (f *fakeWriteCloserSimple) Close() error                { return nil }

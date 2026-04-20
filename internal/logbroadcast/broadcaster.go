@@ -95,6 +95,7 @@ func (b *Broadcaster) Publish(entry LogEntry) {
 		if !sub.matches(entry) {
 			continue
 		}
+
 		select {
 		case sub.ch <- entry:
 			// Entry delivered.
@@ -114,5 +115,6 @@ func (b *Broadcaster) Publish(entry LogEntry) {
 func (b *Broadcaster) SubscriberCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+
 	return len(b.subscribers)
 }

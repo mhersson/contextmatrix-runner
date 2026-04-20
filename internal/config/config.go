@@ -122,40 +122,51 @@ func (c *Config) Validate() error {
 	if c.ContextMatrixURL == "" {
 		return fmt.Errorf("contextmatrix_url is required")
 	}
+
 	if c.APIKey == "" {
 		return fmt.Errorf("api_key is required")
 	}
+
 	if len(c.APIKey) < MinAPIKeyLength {
 		return fmt.Errorf("api_key must be at least %d characters", MinAPIKeyLength)
 	}
+
 	if c.BaseImage == "" {
 		return fmt.Errorf("base_image is required")
 	}
+
 	switch c.ImagePullPolicy {
 	case PullAlways, PullNever, PullIfNotPresent:
 	default:
 		return fmt.Errorf("image_pull_policy must be one of: always, never, if-not-present")
 	}
+
 	if c.MaxConcurrent < 1 {
 		return fmt.Errorf("max_concurrent must be at least 1")
 	}
+
 	d, err := time.ParseDuration(c.ContainerTimeout)
 	if err != nil {
 		return fmt.Errorf("container_timeout is invalid: %w", err)
 	}
+
 	c.containerTimeoutDuration = d
 	if c.ClaudeAuthDir == "" && c.ClaudeOAuthToken == "" && c.AnthropicAPIKey == "" {
 		return fmt.Errorf("at least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key is required")
 	}
+
 	if c.ClaudeAuthDir != "" {
 		if _, err := os.Stat(c.ClaudeAuthDir); err != nil {
 			return fmt.Errorf("claude_auth_dir does not exist: %w", err)
 		}
 	}
+
 	if c.ClaudeSettings != "" && !json.Valid([]byte(c.ClaudeSettings)) {
 		return fmt.Errorf("claude_settings is not valid JSON")
 	}
+
 	appConfigured := c.GitHubApp.AppID != 0 || c.GitHubApp.InstallationID != 0 || c.GitHubApp.PrivateKeyPath != ""
+
 	patConfigured := c.GitHubPAT.Token != ""
 	switch {
 	case appConfigured && patConfigured:
@@ -167,6 +178,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("github_app: %w", err)
 		}
 	}
+
 	return nil
 }
 
@@ -174,15 +186,19 @@ func (g *GitHubApp) validate() error {
 	if g.AppID == 0 {
 		return fmt.Errorf("app_id is required")
 	}
+
 	if g.InstallationID == 0 {
 		return fmt.Errorf("installation_id is required")
 	}
+
 	if g.PrivateKeyPath == "" {
 		return fmt.Errorf("private_key_path is required")
 	}
+
 	if _, err := os.Stat(g.PrivateKeyPath); err != nil {
 		return fmt.Errorf("private_key_path does not exist: %w", err)
 	}
+
 	return nil
 }
 
@@ -192,67 +208,85 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Port = n
 		}
 	}
+
 	if v := os.Getenv("CMR_CONTEXTMATRIX_URL"); v != "" {
 		cfg.ContextMatrixURL = v
 	}
+
 	if v := os.Getenv("CMR_API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
+
 	if v := os.Getenv("CMR_BASE_IMAGE"); v != "" {
 		cfg.BaseImage = v
 	}
+
 	if v := os.Getenv("CMR_IMAGE_PULL_POLICY"); v != "" {
 		cfg.ImagePullPolicy = v
 	}
+
 	if v := os.Getenv("CMR_MAX_CONCURRENT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.MaxConcurrent = n
 		}
 	}
+
 	if v := os.Getenv("CMR_CONTAINER_TIMEOUT"); v != "" {
 		cfg.ContainerTimeout = v
 	}
+
 	if v := os.Getenv("CMR_CONTAINER_MEMORY_LIMIT"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			cfg.ContainerMemoryLimit = n
 		}
 	}
+
 	if v := os.Getenv("CMR_CONTAINER_PIDS_LIMIT"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			cfg.ContainerPidsLimit = n
 		}
 	}
+
 	if v := os.Getenv("CMR_CLAUDE_AUTH_DIR"); v != "" {
 		cfg.ClaudeAuthDir = v
 	}
+
 	if v := os.Getenv("CMR_CLAUDE_OAUTH_TOKEN"); v != "" {
 		cfg.ClaudeOAuthToken = v
 	}
+
 	if v := os.Getenv("CMR_ANTHROPIC_API_KEY"); v != "" {
 		cfg.AnthropicAPIKey = v
 	}
+
 	if v := os.Getenv("CMR_CLAUDE_SETTINGS"); v != "" {
 		cfg.ClaudeSettings = v
 	}
+
 	if v := os.Getenv("CMR_GITHUB_APP_ID"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			cfg.GitHubApp.AppID = n
 		}
 	}
+
 	if v := os.Getenv("CMR_GITHUB_INSTALLATION_ID"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			cfg.GitHubApp.InstallationID = n
 		}
 	}
+
 	if v := os.Getenv("CMR_GITHUB_PRIVATE_KEY_PATH"); v != "" {
 		cfg.GitHubApp.PrivateKeyPath = v
 	}
+
 	if v := os.Getenv("CMR_GITHUB_API_BASE_URL"); v != "" {
 		cfg.GitHubApp.APIBaseURL = v
 	}
+
 	if v := os.Getenv("CMR_GITHUB_PAT_TOKEN"); v != "" {
 		cfg.GitHubPAT.Token = v
 	}
+
 	if v := os.Getenv("CMR_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
 	}

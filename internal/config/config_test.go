@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -11,15 +12,19 @@ import (
 
 func writeConfig(t *testing.T, dir, content string) string {
 	t.Helper()
+
 	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
 	return path
 }
 
 func writePEM(t *testing.T, dir string) string {
 	t.Helper()
+
 	path := filepath.Join(dir, "app.pem")
 	require.NoError(t, os.WriteFile(path, []byte("fake-key"), 0o600))
+
 	return path
 }
 
@@ -232,7 +237,7 @@ func TestValidate_AuthMethodsSatisfyRequirement(t *testing.T) {
 		},
 		{
 			name:    "none set fails validation",
-			setup:   func(cfg *Config) {},
+			setup:   func(_ *Config) {},
 			wantErr: true,
 		},
 	}
@@ -241,6 +246,7 @@ func TestValidate_AuthMethodsSatisfyRequirement(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseConfig()
 			tt.setup(cfg)
+
 			err := cfg.Validate()
 			if tt.wantErr {
 				assert.ErrorContains(t, err, "at least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key is required")
@@ -303,16 +309,16 @@ func TestValidate_GitHubAppMissingFields(t *testing.T) {
 		GitHubApp:        GitHubApp{},
 	}
 	err := cfg.Validate()
-	assert.ErrorContains(t, err, "either github_app or github_pat is required")
+	require.ErrorContains(t, err, "either github_app or github_pat is required")
 
 	// Once any App field is set the App path is taken — missing fields surface.
 	cfg.GitHubApp.AppID = 1
 	err = cfg.Validate()
-	assert.ErrorContains(t, err, "github_app: installation_id is required")
+	require.ErrorContains(t, err, "github_app: installation_id is required")
 
 	cfg.GitHubApp.InstallationID = 1
 	err = cfg.Validate()
-	assert.ErrorContains(t, err, "github_app: private_key_path is required")
+	require.ErrorContains(t, err, "github_app: private_key_path is required")
 
 	cfg.GitHubApp.PrivateKeyPath = filepath.Join(dir, "nonexistent.pem")
 	err = cfg.Validate()
@@ -338,7 +344,7 @@ func TestContainerTimeoutDuration(t *testing.T) {
 		},
 	}
 	require.NoError(t, cfg.Validate())
-	assert.Equal(t, 2*60*60*1e9, float64(cfg.ContainerTimeoutDuration()))
+	assert.Equal(t, 2*time.Hour, cfg.ContainerTimeoutDuration())
 }
 
 func TestValidate_ClaudeSettings(t *testing.T) {
@@ -393,6 +399,7 @@ func TestValidate_ClaudeSettings(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseConfig()
 			cfg.ClaudeSettings = tt.settings
+
 			err := cfg.Validate()
 			if tt.wantErr {
 				assert.ErrorContains(t, err, "claude_settings is not valid JSON")
@@ -414,7 +421,7 @@ func TestLoad_ClaudeSettingsEnvOverride(t *testing.T) {
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, validJSON, cfg.ClaudeSettings)
+	assert.JSONEq(t, validJSON, cfg.ClaudeSettings)
 }
 
 func TestLoad_ClaudeSettingsEnvOverride_InvalidJSON(t *testing.T) {
@@ -483,7 +490,7 @@ func TestLoad_GitHubApp_APIBaseURL_Default(t *testing.T) {
 	path := writeConfig(t, dir, validConfig(pemPath, dir))
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, "", cfg.GitHubApp.APIBaseURL)
+	assert.Empty(t, cfg.GitHubApp.APIBaseURL)
 }
 
 func TestLogLevelSlog(t *testing.T) {
@@ -507,6 +514,7 @@ func TestLogLevelSlog(t *testing.T) {
 // except the GitHub auth method, which the test can set.
 func baseValidConfigNoGitHub(t *testing.T) *Config {
 	t.Helper()
+
 	return &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -570,23 +578,23 @@ func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "any app field set counts as app-configured (app_id only)",
-			app:  GitHubApp{AppID: 1}, // partial — triggers validate()
-			pat:  GitHubPAT{},
+			name:        "any app field set counts as app-configured (app_id only)",
+			app:         GitHubApp{AppID: 1}, // partial — triggers validate()
+			pat:         GitHubPAT{},
 			wantErr:     true,
 			errContains: "github_app: installation_id is required",
 		},
 		{
-			name: "any app field set counts as app-configured (installation_id only)",
-			app:  GitHubApp{InstallationID: 1}, // partial — triggers validate()
-			pat:  GitHubPAT{},
+			name:        "any app field set counts as app-configured (installation_id only)",
+			app:         GitHubApp{InstallationID: 1}, // partial — triggers validate()
+			pat:         GitHubPAT{},
 			wantErr:     true,
 			errContains: "github_app: app_id is required",
 		},
 		{
-			name: "any app field set counts as app-configured (private_key_path only)",
-			app:  GitHubApp{PrivateKeyPath: "/tmp/key.pem"}, // partial — triggers validate()
-			pat:  GitHubPAT{},
+			name:        "any app field set counts as app-configured (private_key_path only)",
+			app:         GitHubApp{PrivateKeyPath: "/tmp/key.pem"}, // partial — triggers validate()
+			pat:         GitHubPAT{},
 			wantErr:     true,
 			errContains: "github_app: app_id is required",
 		},
@@ -597,6 +605,7 @@ func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
 			cfg := baseValidConfigNoGitHub(t)
 			cfg.GitHubApp = tt.app
 			cfg.GitHubPAT = tt.pat
+
 			err := cfg.Validate()
 			if tt.wantErr {
 				require.Error(t, err)

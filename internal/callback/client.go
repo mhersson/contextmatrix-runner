@@ -61,21 +61,26 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 	}
 
 	var lastErr error
+
 	for attempt := range maxRetries {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, body, ts)
+
 		lastErr = c.doRequest(ctx, body, signature, ts)
 		if lastErr == nil {
 			return nil
 		}
+
 		if isClientError(lastErr) {
 			return lastErr
 		}
+
 		c.logger.Warn("callback failed, retrying",
 			"attempt", attempt+1,
 			"card_id", cardID,
 			"error", lastErr,
 		)
+
 		backoff := time.Duration(1<<uint(attempt)) * time.Second
 		select {
 		case <-ctx.Done():
@@ -83,6 +88,7 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 		case <-time.After(backoff):
 		}
 	}
+
 	return fmt.Errorf("callback failed after %d attempts: %w", maxRetries, lastErr)
 }
 
@@ -98,16 +104,19 @@ type cardResponse struct {
 // state-changing request back to CM (which would trigger an infinite loop).
 func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (bool, error) {
 	url := fmt.Sprintf("%s/api/projects/%s/cards/%s", c.contextMatrixURL, project, cardID)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return false, fmt.Errorf("create verify-autonomous request: %w", err)
 	}
+
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("send verify-autonomous request: %w", err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -132,10 +141,12 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 
 func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts string) error {
 	url := c.contextMatrixURL + "/api/runner/status"
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -144,6 +155,7 @@ func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts strin
 	if err != nil {
 		return fmt.Errorf("send request: %w", err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -157,6 +169,7 @@ func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts strin
 			body:       string(respBody),
 		}
 	}
+
 	return nil
 }
 
@@ -174,5 +187,6 @@ func isClientError(err error) bool {
 	if errors.As(err, &ce) {
 		return ce.statusCode >= 400 && ce.statusCode < 500
 	}
+
 	return false
 }

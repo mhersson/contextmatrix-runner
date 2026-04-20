@@ -40,6 +40,7 @@ func WithAPIBaseURL(u string) Option {
 		if u == "" {
 			return
 		}
+
 		p.apiBaseURL = strings.TrimRight(u, "/")
 	}
 }
@@ -61,10 +62,12 @@ func NewTokenProvider(appID, installationID int64, privateKeyPath string, opts .
 	if err != nil {
 		return nil, fmt.Errorf("read private key: %w", err)
 	}
+
 	key, err := jwt.ParseRSAPrivateKeyFromPEM(keyData)
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
 	}
+
 	tp := &TokenProvider{
 		appID:          appID,
 		installationID: installationID,
@@ -75,6 +78,7 @@ func NewTokenProvider(appID, installationID int64, privateKeyPath string, opts .
 	for _, opt := range opts {
 		opt(tp)
 	}
+
 	return tp, nil
 }
 
@@ -84,6 +88,7 @@ func NewTokenProviderWithKey(appID, installationID int64, key *rsa.PrivateKey, a
 	if key == nil {
 		return nil, fmt.Errorf("private key is nil")
 	}
+
 	return &TokenProvider{
 		appID:          appID,
 		installationID: installationID,
@@ -108,10 +113,12 @@ func (p *TokenProvider) GenerateToken(ctx context.Context) (string, error) {
 	}
 
 	url := fmt.Sprintf("%s/app/installations/%d/access_tokens", p.apiBaseURL, p.installationID)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
+
 	req.Header.Set("Authorization", "Bearer "+jwtToken)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -120,6 +127,7 @@ func (p *TokenProvider) GenerateToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("request token: %w", err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -135,9 +143,11 @@ func (p *TokenProvider) GenerateToken(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(body, &token); err != nil {
 		return "", fmt.Errorf("parse token response: %w", err)
 	}
+
 	if token.Token == "" {
 		return "", fmt.Errorf("empty token in response")
 	}
+
 	return token.Token, nil
 }
 
@@ -150,9 +160,11 @@ func (p *TokenProvider) createJWT() (string, error) {
 		ExpiresAt: jwt.NewNumericDate(now.Add(jwtExpiry)),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+
 	signed, err := token.SignedString(p.privateKey)
 	if err != nil {
 		return "", fmt.Errorf("sign JWT: %w", err)
 	}
+
 	return signed, nil
 }

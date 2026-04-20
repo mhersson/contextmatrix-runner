@@ -22,8 +22,11 @@ func testLogger() *slog.Logger {
 
 func TestReportStatus_Success(t *testing.T) {
 	apiKey := "test-secret-key-that-is-long-enough"
-	var received statusRequest
-	var sigHeader, tsHeader string
+
+	var (
+		received            statusRequest
+		sigHeader, tsHeader string
+	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sigHeader = r.Header.Get(cmhmac.SignatureHeader)
@@ -78,8 +81,10 @@ func TestReportStatus_ServerError_Retries(t *testing.T) {
 		if n < 3 {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"ok":false,"error":"internal"}`))
+
 			return
 		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -137,6 +142,7 @@ func TestVerifyAutonomous_True(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedMethod = r.Method
 		receivedPath = r.URL.Path
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":true}`))
 	}))
@@ -155,7 +161,7 @@ func TestVerifyAutonomous_True(t *testing.T) {
 func TestVerifyAutonomous_False(t *testing.T) {
 	// autonomous=false means the card has not been promoted yet — caller should
 	// refuse to write stdin.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"id":"PROJ-001","autonomous":false}`))
 	}))
@@ -169,7 +175,7 @@ func TestVerifyAutonomous_False(t *testing.T) {
 
 func TestVerifyAutonomous_ServerError(t *testing.T) {
 	// 5xx → (false, err); caller must not write stdin.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error":"internal error"}`))
 	}))
@@ -184,7 +190,7 @@ func TestVerifyAutonomous_ServerError(t *testing.T) {
 
 func TestVerifyAutonomous_NotFound(t *testing.T) {
 	// 404 → (false, err); caller must not write stdin.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":"not found"}`))
 	}))

@@ -24,6 +24,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to configuration file")
+
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -42,10 +43,10 @@ func main() {
 		logger.Error("failed to create Docker client", "error", err)
 		os.Exit(1)
 	}
-	defer func() { _ = docker.Close() }()
 
 	// Select GitHub auth provider based on config.
 	var tokenProvider github.TokenGenerator
+
 	switch {
 	case cfg.GitHubPAT.Token != "":
 		tp, err := github.NewPATProvider(cfg.GitHubPAT.Token)
@@ -53,7 +54,9 @@ func main() {
 			logger.Error("failed to create GitHub PAT provider", "error", err)
 			os.Exit(1)
 		}
+
 		tokenProvider = tp
+
 		logger.Info("github auth mode", "mode", "pat")
 	default:
 		tp, err := github.NewTokenProvider(
@@ -66,11 +69,15 @@ func main() {
 			logger.Error("failed to create GitHub token provider", "error", err)
 			os.Exit(1)
 		}
+
 		tokenProvider = tp
+
 		logger.Info("github auth mode", "mode", "app")
 	}
 
 	// Core components.
+	defer func() { _ = docker.Close() }()
+
 	trk := tracker.New()
 	cb := callback.NewClient(cfg.ContextMatrixURL, cfg.APIKey, logger)
 	broadcaster := logbroadcast.NewBroadcaster()
@@ -100,6 +107,7 @@ func main() {
 	// Start server in a goroutine.
 	go func() {
 		logger.Info("runner started", "addr", addr)
+
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)
 			os.Exit(1)
@@ -118,9 +126,11 @@ func main() {
 
 	for _, info := range trk.All() {
 		logger.Info("killing container on shutdown", "card_id", info.CardID, "project", info.Project)
+
 		if err := mgr.Kill(info.Project, info.CardID); err != nil {
 			logger.Warn("failed to kill container", "card_id", info.CardID, "error", err)
 		}
+
 		if err := cb.ReportStatus(shutdownCtx, info.CardID, info.Project, "failed", "runner shutting down"); err != nil {
 			logger.Warn("failed to report shutdown status", "card_id", info.CardID, "error", err)
 		}
@@ -132,6 +142,7 @@ func main() {
 	// Graceful HTTP shutdown.
 	httpCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer httpCancel()
+
 	if err := srv.Shutdown(httpCtx); err != nil {
 		logger.Error("server shutdown error", "error", err)
 	}

@@ -21,6 +21,7 @@ import (
 
 func generateTestKey(t *testing.T) (*rsa.PrivateKey, string) {
 	t.Helper()
+
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 
@@ -69,13 +70,13 @@ func TestGenerateToken_Success(t *testing.T) {
 
 		// Verify JWT
 		auth := r.Header.Get("Authorization")
-		require.True(t, strings.HasPrefix(auth, "Bearer "))
+		assert.True(t, strings.HasPrefix(auth, "Bearer "))
 		jwtStr := strings.TrimPrefix(auth, "Bearer ")
 
-		token, err := jwt.Parse(jwtStr, func(t *jwt.Token) (any, error) {
+		token, err := jwt.Parse(jwtStr, func(_ *jwt.Token) (any, error) {
 			return &key.PublicKey, nil
 		})
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		assert.True(t, token.Valid)
 
 		issuer, _ := token.Claims.GetIssuer()
@@ -91,6 +92,7 @@ func TestGenerateToken_Success(t *testing.T) {
 
 	tp, err := NewTokenProvider(12345, 67890, pemPath)
 	require.NoError(t, err)
+
 	tp.apiBaseURL = srv.URL
 
 	token, err := tp.GenerateToken(context.Background())
@@ -109,6 +111,7 @@ func TestGenerateToken_GitHubError(t *testing.T) {
 
 	tp, err := NewTokenProvider(12345, 67890, pemPath)
 	require.NoError(t, err)
+
 	tp.apiBaseURL = srv.URL
 
 	_, err = tp.GenerateToken(context.Background())
@@ -127,6 +130,7 @@ func TestGenerateToken_EmptyToken(t *testing.T) {
 
 	tp, err := NewTokenProvider(12345, 67890, pemPath)
 	require.NoError(t, err)
+
 	tp.apiBaseURL = srv.URL
 
 	_, err = tp.GenerateToken(context.Background())
@@ -139,6 +143,7 @@ func TestGenerateToken_ContextCanceled(t *testing.T) {
 
 	tp, err := NewTokenProvider(12345, 67890, pemPath)
 	require.NoError(t, err)
+
 	tp.apiBaseURL = "http://localhost:1" // unreachable
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -165,12 +170,12 @@ func TestNewTokenProvider_WithAPIBaseURL(t *testing.T) {
 
 		// Verify JWT issuer
 		auth := r.Header.Get("Authorization")
-		require.True(t, strings.HasPrefix(auth, "Bearer "))
+		assert.True(t, strings.HasPrefix(auth, "Bearer "))
 		jwtStr := strings.TrimPrefix(auth, "Bearer ")
-		token, err := jwt.Parse(jwtStr, func(t *jwt.Token) (any, error) {
+		token, err := jwt.Parse(jwtStr, func(_ *jwt.Token) (any, error) {
 			return &key.PublicKey, nil
 		})
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		assert.True(t, token.Valid)
 
 		w.WriteHeader(http.StatusCreated)

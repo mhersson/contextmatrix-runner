@@ -64,6 +64,7 @@ func NewRealDockerClient() (*RealDockerClient, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return &RealDockerClient{cli: cli}, nil
 }
 
@@ -104,10 +105,12 @@ func (c *RealDockerClient) ContainerList(ctx context.Context, options container.
 	if err != nil {
 		return nil, err
 	}
+
 	result := make([]DockerContainer, len(containers))
 	for i, ctr := range containers {
 		result[i] = DockerContainer{ID: ctr.ID, Labels: ctr.Labels}
 	}
+
 	return result, nil
 }
 
@@ -116,6 +119,7 @@ func (c *RealDockerClient) ContainerAttach(ctx context.Context, containerID stri
 	if err != nil {
 		return nil, err
 	}
+
 	return &HijackedResponse{
 		Conn:  resp.Conn,
 		close: resp.Close,
