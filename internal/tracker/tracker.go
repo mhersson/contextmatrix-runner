@@ -14,8 +14,19 @@ import (
 // but has no interactive stdin handle attached (i.e. non-interactive mode).
 var ErrNoStdinAttached = errors.New("no stdin attached")
 
+// ErrNotTracked is returned by CloseStdin when the lookup key is unknown.
+// Lets callers distinguish the "never tracked / already Removed" case from
+// "no stdin attached", since the HTTP mapping differs (404 vs 409).
+var ErrNotTracked = errors.New("no container tracked")
+
 // stdinState holds the stdin writer and its mutex as a shared pointer,
 // so that copies of ContainerInfo still reference the live state.
+//
+// Invariant: once SetStdin allocates a stdinState for a ContainerInfo, the
+// pointer is never reset to nil for that entry's lifetime. Only the writer
+// field (stdin.stdin) is nil'd on close. Callers can therefore nil-check
+// info.stdin outside of stdin.mu as an early-out, and still re-check the
+// writer under the lock.
 type stdinState struct {
 	mu      sync.Mutex
 	stdin   io.WriteCloser
@@ -156,6 +167,44 @@ func (t *Tracker) WriteStdin(project, cardID string, b []byte) error {
 	_, err := info.stdin.stdin.Write(b)
 
 	return err
+}
+
+// CloseStdin closes the attached stdin writer without removing the tracker
+// entry. Used to signal EOF to a containerized claude process so it exits
+// cleanly; the normal waitAndCleanup path will later call Remove.
+//
+// Returns ErrNotTracked if the key is unknown (including a TOCTOU where the
+// entry was removed between the caller's Get and this call) and
+// ErrNoStdinAttached if no stdin has been set or it has already been closed.
+// Idempotent: a second call returns ErrNoStdinAttached.
+func (t *Tracker) CloseStdin(project, cardID string) error {
+	t.mu.RLock()
+	info, ok := t.containers[key(project, cardID)]
+	t.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("%s/%s: %w", project, cardID, ErrNotTracked)
+	}
+
+	if info.stdin == nil {
+		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
+	}
+
+	info.stdin.mu.Lock()
+	defer info.stdin.mu.Unlock()
+
+	if info.stdin.stdin == nil {
+		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
+	}
+
+	err := info.stdin.stdin.Close()
+	info.stdin.stdin = nil
+
+	if err != nil {
+		return fmt.Errorf("close stdin for %s/%s: %w", project, cardID, err)
+	}
+
+	return nil
 }
 
 // Remove deletes a container from the tracker and closes any attached stdin.

@@ -1125,3 +1125,206 @@ func TestHandleMessage_Escaping(t *testing.T) {
 	require.Len(t, got.Message.Content, 1)
 	assert.Equal(t, content, got.Message.Content[0].Text, "text must round-trip byte-for-byte")
 }
+
+// --- /end-session handler tests ---
+
+// setupEndSessionHandler builds a Handler with a tracker that has a container
+// registered (optionally with stdin attached) and a broadcaster.
+func setupEndSessionHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.Broadcaster, *fakeWriteCloser) {
+	t.Helper()
+
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster()
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	var fw *fakeWriteCloser
+	if withStdin {
+		fw = &fakeWriteCloser{}
+		tr.SetStdin("my-project", "PROJ-001", fw, nil)
+	}
+
+	return h, b, fw
+}
+
+func TestHandleEndSession_HappyPath(t *testing.T) {
+	h, b, fw := setupEndSessionHandler(t, true)
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	payload := EndSessionPayload{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/end-session", payload)
+	h.hmacAuth(h.handleEndSession)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var resp Response
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+
+	require.NotNil(t, fw)
+	assert.True(t, fw.closed, "stdin writer should be closed")
+
+	select {
+	case entry := <-ch:
+		assert.Equal(t, "system", entry.Type)
+		assert.Equal(t, "PROJ-001", entry.CardID)
+		assert.Equal(t, "my-project", entry.Project)
+		assert.Equal(t, "session ended (stdin closed)", entry.Content)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for broadcaster entry")
+	}
+}
+
+func TestHandleEndSession_400_MissingFields(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload any
+	}{
+		{"invalid JSON", "not-json"},
+		{"missing card_id", EndSessionPayload{Project: "p"}},
+		{"missing project", EndSessionPayload{CardID: "C-1"}},
+	}
+
+	h, _, _ := setupEndSessionHandler(t, false)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+
+			var req *http.Request
+
+			if s, ok := tc.payload.(string); ok {
+				body := []byte(s)
+				ts := strconv.FormatInt(time.Now().Unix(), 10)
+				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+				req = httptest.NewRequestWithContext(context.Background(), "POST", "/end-session", strings.NewReader(s))
+				req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
+				req.Header.Set(cmhmac.TimestampHeader, ts)
+			} else {
+				req = signedRequest(t, "/end-session", tc.payload)
+			}
+
+			h.hmacAuth(h.handleEndSession)(w, req)
+			assert.Equal(t, http.StatusBadRequest, w.Code, tc.name)
+		})
+	}
+}
+
+func TestHandleEndSession_404_NotTracked(t *testing.T) {
+	h, _, _ := setupEndSessionHandler(t, false)
+
+	payload := EndSessionPayload{
+		CardID:  "NONEXISTENT",
+		Project: "my-project",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/end-session", payload)
+	h.hmacAuth(h.handleEndSession)(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestHandleEndSession_409_NoStdin(t *testing.T) {
+	h, b, _ := setupEndSessionHandler(t, false)
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	payload := EndSessionPayload{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/end-session", payload)
+	h.hmacAuth(h.handleEndSession)(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+
+	var resp Response
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+
+	// No broadcast on 409.
+	select {
+	case entry := <-ch:
+		t.Fatalf("expected no broadcast on 409, got entry: %+v", entry)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestHandleEndSession_Idempotent(t *testing.T) {
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster()
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	closeCount := 0
+	w := &countingWriteCloser{
+		closeFn: func() error {
+			closeCount++
+
+			return nil
+		},
+	}
+	tr.SetStdin("my-project", "PROJ-001", w, nil)
+
+	payload := EndSessionPayload{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}
+
+	// First call closes stdin.
+	w1 := httptest.NewRecorder()
+	h.hmacAuth(h.handleEndSession)(w1, signedRequest(t, "/end-session", payload))
+	require.Equal(t, http.StatusAccepted, w1.Code)
+
+	// Second call finds no stdin attached and returns 409.
+	w2 := httptest.NewRecorder()
+	h.hmacAuth(h.handleEndSession)(w2, signedRequest(t, "/end-session", payload))
+	assert.Equal(t, http.StatusConflict, w2.Code)
+
+	assert.Equal(t, 1, closeCount, "writer must be closed exactly once across two /end-session calls")
+}
+
+// countingWriteCloser counts Close calls. Defined in tracker_test.go of the
+// tracker package — redeclare a minimal copy here to keep packages isolated.
+type countingWriteCloser struct {
+	closeFn func() error
+}
+
+func (c *countingWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (c *countingWriteCloser) Close() error {
+	if c.closeFn != nil {
+		return c.closeFn()
+	}
+
+	return nil
+}
+
+func TestHandleEndSession_403_InvalidHMAC(t *testing.T) {
+	h, _, _ := setupEndSessionHandler(t, true)
+
+	body, _ := json.Marshal(EndSessionPayload{CardID: "PROJ-001", Project: "my-project"})
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/end-session", strings.NewReader(string(body)))
+	req.Header.Set(cmhmac.SignatureHeader, "sha256=badhash")
+	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
+
+	w := httptest.NewRecorder()
+	h.hmacAuth(h.handleEndSession)(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}

@@ -87,6 +87,7 @@ sides sign as `HMAC-SHA256(key, timestamp + "." + body)`, hex-encoded. Headers:
 | POST   | `/stop-all` | HMAC | Stop all containers (optionally filtered by project).                                        |
 | POST   | `/message`  | HMAC | Send a user message to an interactive session. Payload: `{card_id, project, content, message_id}`. `content` must be ≤8192 bytes (413 on overflow). Returns 404 if no container, 409 if not interactive, 202 `{ok:true, message_id}` on success. |
 | POST   | `/promote`  | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Returns 404/409 on error, 202 `{ok:true}` on success. |
+| POST   | `/end-session` | HMAC | Close the stdin of an interactive container so claude exits on EOF. Payload: `{card_id, project}`. Returns 404 if no container, 409 if not interactive (or stdin already closed), 202 `{ok:true}` on success. Safe to call more than once (second call returns 409). |
 | GET    | `/logs`     | none | SSE stream of `LogEntry` events for all active containers.                                   |
 | GET    | `/health`   | none | Health probe; returns 200.                                                                   |
 
@@ -100,7 +101,8 @@ When `interactive: true` is set in the `/trigger` payload:
 - Operators interact with the running session via:
   - `POST /message` — writes a stream-json user message to the container stdin and echoes it as a `user`-typed `LogEntry`.
   - `POST /promote` — writes a canned autonomous-mode instruction to stdin and emits a `system` LogEntry `"promoted to autonomous mode"`.
-- `tracker.Remove` closes the stdin writer when the container exits.
+  - `POST /end-session` — closes the container's stdin via `tracker.CloseStdin`. claude receives EOF on stdin, exits the stream-json loop, and the container terminates through the normal `waitAndCleanup` path. Emits a `system` LogEntry `"session ended (stdin closed)"`. Used by ContextMatrix when a released card reaches a terminal state.
+- `tracker.Remove` closes the stdin writer when the container exits (no-op if `/end-session` already closed it).
 
 ## LogEntry types
 

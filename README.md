@@ -387,6 +387,7 @@ All webhooks are signed with HMAC-SHA256 using a shared secret.
 | CM → Runner | `POST /stop-all`          | Stop all tasks (or per-project) |
 | CM → Runner | `POST /message`           | Send a user message to an interactive session |
 | CM → Runner | `POST /promote`           | Promote interactive session to autonomous     |
+| CM → Runner | `POST /end-session`       | Close container stdin so claude exits on EOF  |
 | Runner → CM | `POST /api/runner/status` | Report container status         |
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
@@ -417,6 +418,7 @@ non-zero exit), `completed` (clean exit).
 | POST   | `/stop-all` | HMAC | Kill all containers                                       |
 | POST   | `/message`  | HMAC | Send a user message to an interactive (HITL) session      |
 | POST   | `/promote`  | HMAC | Promote an interactive session to autonomous mode         |
+| POST   | `/end-session` | HMAC | Close stdin of an interactive container; claude exits on EOF |
 | GET    | `/logs`     | none | SSE log stream for all active containers                  |
 | GET    | `/health`   | none | Health check                                              |
 

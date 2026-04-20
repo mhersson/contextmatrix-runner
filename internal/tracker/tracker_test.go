@@ -392,6 +392,214 @@ func TestRemove_NoStdin(t *testing.T) {
 	})
 }
 
+// TestCloseStdin_ClosesWriter verifies CloseStdin closes the writer exactly
+// once and leaves the tracker entry in place.
+func TestCloseStdin_ClosesWriter(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	var mu sync.Mutex
+
+	closeCount := 0
+	w := &countingWriteCloser{
+		closeFn: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+
+			closeCount++
+
+			return nil
+		},
+	}
+	tr.SetStdin("proj", "PROJ-001", w, nil)
+
+	require.NoError(t, tr.CloseStdin("proj", "PROJ-001"))
+
+	mu.Lock()
+	assert.Equal(t, 1, closeCount, "stdin should be closed exactly once")
+	mu.Unlock()
+
+	// Tracker entry must still be present.
+	_, ok := tr.Get("proj", "PROJ-001")
+	assert.True(t, ok, "tracker entry should remain after CloseStdin")
+
+	// Subsequent WriteStdin should fail with ErrNoStdinAttached because the
+	// writer was nil'd on close.
+	err := tr.WriteStdin("proj", "PROJ-001", []byte("hi"))
+	assert.ErrorIs(t, err, ErrNoStdinAttached)
+}
+
+// TestCloseStdin_Idempotent verifies the second call returns ErrNoStdinAttached
+// and does not close the writer again.
+func TestCloseStdin_Idempotent(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	var mu sync.Mutex
+
+	closeCount := 0
+	w := &countingWriteCloser{
+		closeFn: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+
+			closeCount++
+
+			return nil
+		},
+	}
+	tr.SetStdin("proj", "PROJ-001", w, nil)
+
+	require.NoError(t, tr.CloseStdin("proj", "PROJ-001"))
+
+	err := tr.CloseStdin("proj", "PROJ-001")
+	require.ErrorIs(t, err, ErrNoStdinAttached)
+
+	mu.Lock()
+	assert.Equal(t, 1, closeCount, "second CloseStdin must not re-close the writer")
+	mu.Unlock()
+}
+
+// TestCloseStdin_NoStdin verifies CloseStdin returns ErrNoStdinAttached when
+// no stdin was set.
+func TestCloseStdin_NoStdin(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	err := tr.CloseStdin("proj", "PROJ-001")
+	assert.ErrorIs(t, err, ErrNoStdinAttached)
+}
+
+// TestCloseStdin_NotTracked verifies CloseStdin returns ErrNotTracked when
+// the container is not tracked.
+func TestCloseStdin_NotTracked(t *testing.T) {
+	tr := New()
+
+	err := tr.CloseStdin("proj", "PROJ-999")
+	assert.ErrorIs(t, err, ErrNotTracked)
+}
+
+// TestCloseStdin_ConcurrentWithRemove exercises the race between a CloseStdin
+// call and a concurrent Remove. Under -race, this verifies the stdin writer is
+// closed at most once across both calls and neither path panics or deadlocks.
+func TestCloseStdin_ConcurrentWithRemove(t *testing.T) {
+	for range 50 {
+		tr := New()
+		require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+		var mu sync.Mutex
+
+		closeCount := 0
+		w := &countingWriteCloser{
+			closeFn: func() error {
+				mu.Lock()
+				defer mu.Unlock()
+
+				closeCount++
+
+				return nil
+			},
+		}
+		tr.SetStdin("proj", "PROJ-001", w, nil)
+
+		var wg sync.WaitGroup
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+
+			_ = tr.CloseStdin("proj", "PROJ-001")
+		}()
+
+		go func() {
+			defer wg.Done()
+
+			tr.Remove("proj", "PROJ-001")
+		}()
+
+		wg.Wait()
+
+		mu.Lock()
+		assert.Equal(t, 1, closeCount, "writer must be closed exactly once across concurrent CloseStdin+Remove")
+		mu.Unlock()
+	}
+}
+
+// TestCloseStdin_ConcurrentWithWrite runs many WriteStdin calls racing with a
+// CloseStdin. Under -race, this verifies no use-after-close and no deadlock.
+func TestCloseStdin_ConcurrentWithWrite(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	fw := &fakeWriteCloserSimple{}
+	tr.SetStdin("proj", "PROJ-001", fw, nil)
+
+	var wg sync.WaitGroup
+
+	for range 50 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			_ = tr.WriteStdin("proj", "PROJ-001", []byte("x\n"))
+		}()
+	}
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		_ = tr.CloseStdin("proj", "PROJ-001")
+	}()
+
+	wg.Wait()
+
+	// Any write after the close must now return ErrNoStdinAttached.
+	err := tr.WriteStdin("proj", "PROJ-001", []byte("post\n"))
+	assert.ErrorIs(t, err, ErrNoStdinAttached)
+}
+
+// TestCloseStdin_ThenRemove verifies Remove after CloseStdin does not
+// double-close the writer but still invokes onClose.
+func TestCloseStdin_ThenRemove(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	var mu sync.Mutex
+
+	closeCount := 0
+	onCloseCount := 0
+	w := &countingWriteCloser{
+		closeFn: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+
+			closeCount++
+
+			return nil
+		},
+	}
+	tr.SetStdin("proj", "PROJ-001", w, func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		onCloseCount++
+	})
+
+	require.NoError(t, tr.CloseStdin("proj", "PROJ-001"))
+	tr.Remove("proj", "PROJ-001")
+
+	mu.Lock()
+	assert.Equal(t, 1, closeCount, "writer must be closed exactly once across CloseStdin+Remove")
+	assert.Equal(t, 1, onCloseCount, "onClose must still run from Remove")
+	mu.Unlock()
+
+	assert.Equal(t, 0, tr.Count())
+}
+
 // fakeWriteCloserSimple is a minimal WriteCloser for tests that don't need
 // to inspect what was written.
 type fakeWriteCloserSimple struct{}

@@ -68,6 +68,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /stop-all", h.hmacAuth(h.handleStopAll))
 	mux.HandleFunc("POST /message", h.hmacAuth(h.handleMessage))
 	mux.HandleFunc("POST /promote", h.hmacAuth(h.handlePromote))
+	mux.HandleFunc("POST /end-session", h.hmacAuth(h.handleEndSession))
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
 	mux.HandleFunc("GET /health", h.handleHealth)
 }
@@ -349,6 +350,59 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "stdin write failed")
 
 		return
+	}
+
+	writeJSON(w, http.StatusAccepted, Response{OK: true})
+}
+
+// handleEndSession closes the stdin of a tracked interactive container so
+// claude receives EOF and exits. The tracker entry is left in place; the
+// normal waitAndCleanup flow removes it when the container exits.
+func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
+	body := r.Context().Value(bodyKey{}).([]byte)
+
+	var payload EndSessionPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+
+		return
+	}
+
+	if payload.CardID == "" || payload.Project == "" {
+		writeError(w, http.StatusBadRequest, "card_id and project are required")
+
+		return
+	}
+
+	if _, ok := h.tracker.Get(payload.Project, payload.CardID); !ok {
+		writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+
+		return
+	}
+
+	if err := h.tracker.CloseStdin(payload.Project, payload.CardID); err != nil {
+		switch {
+		case errors.Is(err, tracker.ErrNotTracked):
+			// TOCTOU: the entry was Removed between our Get and CloseStdin.
+			// Same semantic as a 404 — nothing to close.
+			writeError(w, http.StatusNotFound, "no container tracked for "+payload.Project+"/"+payload.CardID)
+		case errors.Is(err, tracker.ErrNoStdinAttached):
+			writeError(w, http.StatusConflict, "container is not in interactive mode")
+		default:
+			writeError(w, http.StatusInternalServerError, "close stdin failed")
+		}
+
+		return
+	}
+
+	if h.broadcaster != nil {
+		h.broadcaster.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			CardID:    payload.CardID,
+			Project:   payload.Project,
+			Type:      "system",
+			Content:   "session ended (stdin closed)",
+		})
 	}
 
 	writeJSON(w, http.StatusAccepted, Response{OK: true})

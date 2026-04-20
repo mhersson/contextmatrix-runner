@@ -40,6 +40,14 @@ type PromotePayload struct {
 	Project string `json:"project"`
 }
 
+// EndSessionPayload is received from ContextMatrix to close the stdin of a
+// running interactive container so claude exits on EOF. Used when the card
+// reaches a terminal state and is released.
+type EndSessionPayload struct {
+	CardID  string `json:"card_id"`
+	Project string `json:"project"`
+}
+
 // Response is the standard webhook response format.
 type Response struct {
 	OK        bool   `json:"ok"`
