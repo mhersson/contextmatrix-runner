@@ -19,7 +19,7 @@
 # invokes them interactively inside the container. Splitting the runtime off
 # requires a separate image for lint/test workflows and is tracked for a
 # follow-up card. Do NOT remove the single-stage layout in this PR.
-FROM debian@sha256:4724b8cc51e33e398f0e2e15e18d5ec2851ff0c2280647e1310bc1642182655d
+FROM debian@sha256:3352c2e13876c8a5c5873ef20870e1939e73cb9a3c1aeba5e3e72172a85ce9ed
 # ^ debian:bookworm-slim resolved on 2026-04-21. Refresh intentionally via
 #   `docker pull debian:bookworm-slim && docker inspect --format='{{index .RepoDigests 0}}' debian:bookworm-slim`.
 
