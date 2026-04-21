@@ -320,10 +320,15 @@ echo "Starting Claude Code for card ${CM_CARD_ID}..."
 # (Task — sub-agent spawning).
 if [ "${CM_INTERACTIVE:-}" = "1" ]; then
     ALLOWED_TOOLS_HITL=("${ALLOWED_TOOLS_COMMON[@]}")
+    # `--` terminates option parsing. Without it, claude's variadic
+    # `--allowed-tools <tools...>` greedily consumes the following positional
+    # prompt as yet another allowed-tool entry and exits with
+    # "Input must be provided either through stdin or as a prompt argument".
     exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
         --input-format stream-json \
         --output-format stream-json \
         --verbose --allowed-tools "${ALLOWED_TOOLS_HITL[*]}" \
+        -- \
         "You are running inside a disposable container spawned by contextmatrix-runner for card ${CM_CARD_ID}.
 A human user may send you approval messages at interactive gates.
 
@@ -336,7 +341,9 @@ IMPORTANT:
 ${BASE_BRANCH_CONTEXT}"
 else
     ALLOWED_TOOLS_AUTO=("${ALLOWED_TOOLS_COMMON[@]}" "${ALLOWED_TOOLS_AUTO_EXTRAS[@]}")
+    # See HITL branch above for why `--` is required before the prompt.
     exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" --output-format stream-json --verbose --allowed-tools "${ALLOWED_TOOLS_AUTO[*]}" \
+        -- \
         "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
 

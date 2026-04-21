@@ -131,4 +131,32 @@ func TestEntrypointAllowlistInBothBranches(t *testing.T) {
 		"autonomous branch must expand the autonomous allowlist")
 	assert.Contains(t, autonomous, `ALLOWED_TOOLS_AUTO=("${ALLOWED_TOOLS_COMMON[@]}" "${ALLOWED_TOOLS_AUTO_EXTRAS[@]}")`,
 		"autonomous branch must append ALLOWED_TOOLS_AUTO_EXTRAS (Task)")
+
+	// Both branches must terminate option parsing with `--` before the
+	// positional prompt. Without it, claude's variadic
+	// `--allowed-tools <tools...>` greedily consumes the following prompt
+	// string as yet another allowed-tool and exits with
+	// "Input must be provided either through stdin or as a prompt argument".
+	// The `--` must appear AFTER --allowed-tools and BEFORE the "You are
+	// running..." prompt in each branch.
+	for _, tc := range []struct {
+		name   string
+		branch string
+	}{
+		{"HITL", interactive},
+		{"autonomous", autonomous},
+	} {
+		toolsIdx := strings.Index(tc.branch, "--allowed-tools")
+		require.NotEqual(t, -1, toolsIdx, "%s branch must have --allowed-tools", tc.name)
+
+		promptIdx := strings.Index(tc.branch, `"You are running`)
+		require.NotEqual(t, -1, promptIdx, "%s branch must have the positional prompt", tc.name)
+		require.Greater(t, promptIdx, toolsIdx,
+			"%s branch: prompt must come after --allowed-tools", tc.name)
+
+		between := tc.branch[toolsIdx:promptIdx]
+		assert.Regexp(t, `(^|\s)--(\s|\\\s)`, between,
+			"%s branch must place `--` between --allowed-tools and the prompt "+
+				"(regression: commander.js variadic swallows the prompt otherwise)", tc.name)
+	}
 }
