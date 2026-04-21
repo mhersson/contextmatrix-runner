@@ -221,13 +221,14 @@ contextmatrix_url: "http://localhost:8080"
 # Env: CMR_API_KEY
 api_key: "your-shared-secret-here-at-least-32-chars"
 
-# Default Docker image for worker containers.
+# Default Docker image for worker containers. MUST be @sha256:... pinned
+# (enforced by Validate; mutable tags are rejected). See CTXRUN-044.
 # Env: CMR_BASE_IMAGE
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:<digest>"
 
 # Allowlist of permitted Docker images. When set, only listed images may be
 # used (including runner_image overrides from trigger payloads). When empty,
-# only base_image is permitted.
+# only base_image is permitted. Every entry MUST also be @sha256:... pinned.
 allowed_images: []
 
 # When to pull the image: always, never, if-not-present.
@@ -414,13 +415,53 @@ non-zero exit), `completed` (clean exit).
 | Method | Path        | Auth | Description                                               |
 | ------ | ----------- | ---- | --------------------------------------------------------- |
 | POST   | `/trigger`  | HMAC | Start a container for a card                              |
-| POST   | `/kill`     | HMAC | Kill a specific container                                 |
-| POST   | `/stop-all` | HMAC | Kill all containers                                       |
+| POST   | `/kill`     | HMAC | Kill a specific container (idempotent; 200 on already-stopped) |
+| POST   | `/stop-all` | HMAC | Kill all containers (207 Multi-Status on partial failure)      |
 | POST   | `/message`  | HMAC | Send a user message to an interactive (HITL) session      |
 | POST   | `/promote`  | HMAC | Promote an interactive session to autonomous mode         |
 | POST   | `/end-session` | HMAC | Close stdin of an interactive container; claude exits on EOF |
-| GET    | `/logs`     | none | SSE log stream for all active containers                  |
+| GET    | `/logs`     | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature. |
 | GET    | `/health`   | none | Health check                                              |
+| GET    | `/readyz`   | none | Readiness probe (503 during preflight or drain)           |
+
+### Response envelope
+
+Every 2xx response is a `SuccessResponse`:
+
+```json
+{ "ok": true, "message": "...", "message_id": "..." }
+```
+
+Every non-2xx response (except `/logs` SSE and the `/readyz` probe shape) is an
+`ErrorResponse`:
+
+```json
+{ "ok": false, "code": "invalid_field", "message": "invalid card_id" }
+```
+
+`code` is a stable enum — clients should branch on `code`, not on `message`
+text. `/stop-all` returns a custom `StopAllResponse` with per-card `results`.
+
+### Error codes
+
+| Code                | Status | Endpoint(s)                                 | Meaning                                                        |
+| ------------------- | ------ | ------------------------------------------- | -------------------------------------------------------------- |
+| `invalid_json`      | 400    | all mutating endpoints                      | request body was not valid JSON                                |
+| `invalid_field`     | 400    | all mutating endpoints                      | a field failed validation (`message` names the field)          |
+| `unauthorized`      | 401    | all HMAC-guarded endpoints                  | HMAC auth failed (missing header, bad sig, expired, …)         |
+| `not_found`         | 404    | `/message`, `/promote`, `/end-session`      | no container tracked for (project, card_id)                    |
+| `conflict`          | 409    | `/trigger`, `/message`, `/promote`, `/end-session` | state conflict (already tracked, non-interactive, …)    |
+| `duplicate`         | 409    | all HMAC-guarded endpoints                  | HMAC signature replay detected                                 |
+| `stdin_closed`      | 410    | `/message`, `/promote`                      | session has ended (stdin was once attached, now closed)        |
+| `too_large`         | 413    | `/message`                                  | `content` exceeds 8192 bytes                                   |
+| `limit_reached`     | 429    | `/trigger`                                  | `max_concurrent` reached                                       |
+| `internal`          | 500    | any                                         | server-side bug; details logged, never echoed                  |
+| `upstream_failure`  | 502    | `/promote`                                  | CM verify-autonomous call failed                               |
+| `draining`          | 503    | `/trigger`, `/message`, `/promote`, `/end-session` | graceful shutdown in progress                            |
+
+Raw `err.Error()` strings, HMAC-failure reasons, upstream response bodies, and
+unmarshal byte offsets are never echoed to clients — they are logged
+server-side only.
 
 ## Security Model
 

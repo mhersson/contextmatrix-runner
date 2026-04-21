@@ -52,6 +52,14 @@ Same as the main ContextMatrix repo:
 - `container.DockerClient` — abstracts Docker SDK for testability. Real impl in
   `RealDockerClient`, mock in tests via function fields.
 
+## Container tool permissions
+
+- Worker containers run `claude --allowed-tools` with an explicit allowlist
+  instead of `--dangerously-skip-permissions`. See the
+  `ALLOWED_TOOLS_COMMON` and `ALLOWED_TOOLS_AUTO_EXTRAS` arrays in
+  `docker/entrypoint.sh`. HITL mode uses `COMMON` only; autonomous mode
+  appends `Task` so sub-agents can spawn.
+
 ## Running
 
 ```bash
@@ -88,7 +96,7 @@ sides sign as `HMAC-SHA256(key, timestamp + "." + body)`, hex-encoded. Headers:
 | POST   | `/message`  | HMAC | Send a user message to an interactive session. Payload: `{card_id, project, content, message_id}`. `content` must be ≤8192 bytes (413 on overflow). Returns 404 if no container, 409 if not interactive, 202 `{ok:true, message_id}` on success. |
 | POST   | `/promote`  | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Returns 404/409 on error, 202 `{ok:true}` on success. |
 | POST   | `/end-session` | HMAC | Close the stdin of an interactive container so claude exits on EOF. Payload: `{card_id, project}`. Returns 404 if no container, 409 if not interactive (or stdin already closed), 202 `{ok:true}` on success. Safe to call more than once (second call returns 409). |
-| GET    | `/logs`     | none | SSE stream of `LogEntry` events for all active containers.                                   |
+| GET    | `/logs`     | HMAC | SSE stream of `LogEntry` events for all active containers. Browser EventSource cannot send headers, so consumers must proxy through a server that attaches the HMAC signature. |
 | GET    | `/health`   | none | Health probe; returns 200.                                                                   |
 
 ### HITL (interactive) mode
