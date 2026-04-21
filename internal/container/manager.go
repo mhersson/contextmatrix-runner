@@ -1167,10 +1167,16 @@ func (m *Manager) Kill(project, cardID string) error {
 }
 
 // CleanupOrphans removes any leftover containers from a previous runner crash.
+// A container is "orphan" iff it is labeled LabelRunner=true in Docker AND
+// has no corresponding entry in the in-memory tracker — i.e. the current
+// runner process does not know about it. Containers that are actively
+// tracked (a card is assigned, the runner is still managing them) are
+// skipped so the periodic maintenance sweep does not kill live work.
+//
 // Per-container Stop/Remove failures are logged individually and collected
 // into the returned error via errors.Join so that callers can see which
 // containers failed without aborting cleanup of the rest. A nil return means
-// every listed container was successfully stopped and removed. See CTXRUN-050.
+// every orphan was successfully stopped and removed.
 func (m *Manager) CleanupOrphans(ctx context.Context) error {
 	containers, err := m.docker.ContainerList(ctx, container.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("label", LabelRunner+"=true")),
@@ -1180,9 +1186,28 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 		return fmt.Errorf("list orphan containers: %w", err)
 	}
 
-	var errs []error
+	// Filter out containers still present in the in-memory tracker. Without
+	// this, the maintenance loop would kill every active worker container
+	// on every tick.
+	orphans := make([]DockerContainer, 0, len(containers))
+	skipped := 0
 
 	for _, ctr := range containers {
+		project := ctr.Labels[LabelProject]
+		cardID := ctr.Labels[LabelCardID]
+
+		if m.tracker != nil && project != "" && cardID != "" && m.tracker.Has(project, cardID) {
+			skipped++
+
+			continue
+		}
+
+		orphans = append(orphans, ctr)
+	}
+
+	var errs []error
+
+	for _, ctr := range orphans {
 		idShort := truncateID(ctr.ID)
 		m.logger.Info("cleaning up orphan container",
 			"container_id", idShort,
@@ -1226,10 +1251,11 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 		rmCancel()
 	}
 
-	if len(containers) > 0 {
+	if len(orphans) > 0 || skipped > 0 {
 		m.logger.Info("orphan cleanup complete",
-			"removed", len(containers)-len(errs),
-			"attempted", len(containers),
+			"removed", len(orphans)-len(errs),
+			"attempted", len(orphans),
+			"tracked_skipped", skipped,
 			"errors", len(errs),
 		)
 	}

@@ -639,6 +639,41 @@ func TestCleanupOrphans(t *testing.T) {
 	assert.Contains(t, removedIDs, "orphan-2")
 }
 
+// TestCleanupOrphans_SkipsTrackedContainers guards the regression where the
+// maintenance loop killed every active worker container on every tick because
+// CleanupOrphans did not filter the Docker list against the in-memory tracker.
+// A container labeled with (project, card_id) that is currently in the tracker
+// must be left alone; only containers present in Docker AND absent from the
+// tracker are true orphans.
+func TestCleanupOrphans_SkipsTrackedContainers(t *testing.T) {
+	var removedIDs []string
+
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return []DockerContainer{
+			{ID: "live-1", Labels: map[string]string{LabelCardID: "A-001", LabelProject: "proj"}},
+			{ID: "orphan-1", Labels: map[string]string{LabelCardID: "A-002", LabelProject: "proj"}},
+		}, nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, _ container.RemoveOptions) error {
+		removedIDs = append(removedIDs, id)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		Project: "proj", CardID: "A-001", ContainerID: "live-1",
+	}))
+
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	err := mgr.CleanupOrphans(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orphan-1"}, removedIDs,
+		"only the untracked container must be removed; tracked live-1 must survive")
+}
+
 // TestCleanupOrphans_PartialFailure verifies that a per-container Stop failure
 // does not short-circuit cleanup of the remaining orphans and that the
 // returned error wraps the failure via errors.Join so callers can still see
