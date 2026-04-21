@@ -106,21 +106,20 @@ RUN set -eux; \
     sh /tmp/golangci-lint-install.sh -b /usr/local/bin "${GOLANGCI_LINT_VERSION}"; \
     rm -f /tmp/golangci-lint-install.sh
 
-# Copy entrypoint.
-COPY entrypoint.sh /entrypoint.sh
+# Install Claude Code CLI via npm at an exact version. Replaces the prior
+# `curl … | bash` installer (REVIEW.md C15). The npm tarball integrity is
+# verified by npm against the registry's published signatures. Run as root
+# so the global install can write to /usr/lib/node_modules.
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
-# Make entrypoint executable and create non-root user at UID 1000
-# (Debian slim has no default user at this UID). Combined into one RUN
-# so hadolint DL3059 does not flag the consecutive instructions.
+# Copy entrypoint, make it executable, and create non-root user at UID
+# 1000 (Debian slim has no default user at this UID). Combined into one
+# RUN so hadolint DL3059 does not flag consecutive instructions.
+COPY entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh \
     && useradd -m -u 1000 -s /bin/bash user
 USER user
 WORKDIR /home/user
-
-# Install Claude Code CLI via npm at an exact version. Replaces the prior
-# `curl … | bash` installer (REVIEW.md C15). The npm tarball integrity is
-# verified by npm against the registry's published signatures.
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 # No long-lived endpoint lives in this container; the worker is a one-shot
 # batch process driven by the runner-side /trigger webhook. `HEALTHCHECK
