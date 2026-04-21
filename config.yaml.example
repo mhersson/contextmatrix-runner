@@ -82,6 +82,16 @@ container_memory_limit: 8589934592
 # Env: CMR_CONTAINER_PIDS_LIMIT
 container_pids_limit: 512
 
+# Host directory where per-container secret files are written. Each file is
+# bind-mounted read-only into its container at /run/cm-secrets/env so the
+# values never appear in HostConfig.Env (and therefore not in `docker
+# inspect`). Must be writable by the runner process; should be on tmpfs.
+# Systemd user services: `/var/run/cm-runner` is not auto-created and
+# `/var/run` is root-owned — either pre-create the directory (chown to the
+# runner user) or override this to a path under `%h/.cm-runner`.
+# Env: CMR_SECRETS_DIR
+secrets_dir: "/var/run/cm-runner/secrets"
+
 # ----- Claude Code Authentication -----
 # At least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key must be set.
 # Priority order (highest to lowest): claude_auth_dir > claude_oauth_token > anthropic_api_key.
