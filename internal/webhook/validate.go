@@ -129,8 +129,12 @@ func validateRepoURL(v string) error {
 
 // validateMCPURL parses the mcp_url and enforces https scheme, non-empty host,
 // absence of control bytes, and exact-host membership in the allowlist.
-// An empty allowlist is fail-closed — every mcp_url is rejected.
-func validateMCPURL(v string, allowedHosts []string) error {
+// An empty allowlist is fail-closed in production — every mcp_url is rejected.
+// In dev mode (devMode==true) an empty allowlist is relaxed to allow any host,
+// so local / ephemeral MCP endpoints can be used without configuring a fixed
+// allowlist. When allowedHosts is non-empty the strict check applies regardless
+// of devMode.
+func validateMCPURL(v string, allowedHosts []string, devMode bool) error {
 	if v == "" {
 		return &ValidationError{Field: "mcp_url", Reason: "required"}
 	}
@@ -157,7 +161,12 @@ func validateMCPURL(v string, allowedHosts []string) error {
 		return &ValidationError{Field: "mcp_url", Reason: "host contains disallowed characters"}
 	}
 
+	// Empty allowlist: fail-closed in production; relaxed in dev mode.
 	if len(allowedHosts) == 0 {
+		if devMode {
+			return nil
+		}
+
 		return &ValidationError{Field: "mcp_url", Reason: "host not in allowlist"}
 	}
 
@@ -216,20 +225,24 @@ func validateMessageID(v string) error {
 // validates every field. It returns a *ValidationError on failure so callers
 // can test with errors.As, or a nil error on success.
 //
+// devMode is forwarded to validateMCPURL: when true, an empty allowedMCPHosts
+// slice permits any well-formed https URL rather than failing closed. It has no
+// effect on non-trigger payloads.
+//
 // The caller must pass a pointer to or value of one of the supported payload
 // types. Unknown types return nil (validation cannot be performed) to avoid
 // accidentally blocking extension — this is safe because handlers only ever
 // pass the payloads they declared.
-func ValidatePayload(p any, allowedMCPHosts []string) error {
+func ValidatePayload(p any, allowedMCPHosts []string, devMode bool) error {
 	switch v := p.(type) {
 	case *TriggerPayload:
 		if v == nil {
 			return nil
 		}
 
-		return validateTrigger(v, allowedMCPHosts)
+		return validateTrigger(v, allowedMCPHosts, devMode)
 	case TriggerPayload:
-		return validateTrigger(&v, allowedMCPHosts)
+		return validateTrigger(&v, allowedMCPHosts, devMode)
 
 	case *KillPayload:
 		if v == nil {
@@ -280,7 +293,7 @@ func ValidatePayload(p any, allowedMCPHosts []string) error {
 	return nil
 }
 
-func validateTrigger(p *TriggerPayload, allowedMCPHosts []string) error {
+func validateTrigger(p *TriggerPayload, allowedMCPHosts []string, devMode bool) error {
 	if err := validateIdent("card_id", p.CardID); err != nil {
 		return err
 	}
@@ -293,7 +306,7 @@ func validateTrigger(p *TriggerPayload, allowedMCPHosts []string) error {
 		return err
 	}
 
-	if err := validateMCPURL(p.MCPURL, allowedMCPHosts); err != nil {
+	if err := validateMCPURL(p.MCPURL, allowedMCPHosts, devMode); err != nil {
 		return err
 	}
 

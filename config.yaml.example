@@ -3,6 +3,22 @@
 # All fields can be overridden with environment variables using the CMR_ prefix.
 # Example: CMR_PORT=7070, CMR_API_KEY=your-secret-here
 
+# ----- Deployment Profile -----
+
+# Operational mode: "production" (default) or "dev".
+#
+# production — strict defaults suitable for multi-user, internet-facing
+#              deployments. All validators are enforced at full strength.
+#
+# dev        — loosens selected validators for local single-box setups (e.g.
+#              a developer laptop running a private ContextMatrix instance).
+#              See "Deployment profiles" in README.md for the full list of
+#              relaxed checks and the startup log lines each one emits.
+#              Do NOT use in production.
+#
+# Env: CMR_DEPLOYMENT_PROFILE
+# deployment_profile: production
+
 # ----- Server -----
 
 # HTTP port for receiving webhooks from ContextMatrix.

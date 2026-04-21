@@ -155,7 +155,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 			tr := tracker.New()
 			b := logbroadcast.NewBroadcaster(nil, nil)
 			h := NewHandler(&noopRunner{}, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts,
-				slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+				slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 			require.NoError(t, tr.Add(&tracker.ContainerInfo{
 				CardID:  card,
 				Project: project,
@@ -180,7 +180,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 		tr := tracker.New()
 		h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
 			testAPIKey, 3, testAllowedMCPHosts,
-			slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 		return h, nil, ""
 	}
@@ -222,7 +222,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 				tr := tracker.New()
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
 					testAPIKey, 3, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 				require.NoError(t, tr.Add(&tracker.ContainerInfo{
 					CardID: "DUPE-1", Project: "proj",
 				}))
@@ -243,7 +243,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 				tr := tracker.New()
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
 					testAPIKey, 1, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 				require.NoError(t, tr.Add(&tracker.ContainerInfo{
 					CardID: "BUSY-1", Project: "proj",
 				}))
@@ -266,7 +266,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 				hs.Draining.Store(true)
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
 					testAPIKey, 3, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), hs)
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, hs, false)
 
 				return h, nil, ""
 			},
@@ -362,7 +362,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 				hs.Draining.Store(true)
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
 					testAPIKey, 3, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), hs)
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, hs, false)
 
 				return h, nil, ""
 			},
@@ -493,7 +493,7 @@ func TestNoRawErrLeakIntoResponseBody(t *testing.T) {
 	tr := tracker.New()
 	h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
 		testAPIKey, 3, testAllowedMCPHosts,
-		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 	// An unmarshal on this produces an error with byte offset; the old code
 	// echoed err.Error() which surfaced internal implementation details

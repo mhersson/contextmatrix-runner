@@ -131,7 +131,7 @@ func TestShutdown_WedgedContainer(t *testing.T) {
 	// before the nil manager is touched.
 	apiKey := strings.Repeat("k", 40)
 
-	wh := webhook.NewHandler(nil, trk, nil, nil, apiKey, 1, nil, nil, health)
+	wh := webhook.NewHandler(nil, trk, nil, nil, apiKey, 1, nil, nil, 0, health, false)
 
 	mux := http.NewServeMux()
 	wh.Register(mux)

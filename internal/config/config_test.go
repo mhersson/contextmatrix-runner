@@ -842,6 +842,211 @@ func TestValidate_BaseImageDigestPin(t *testing.T) {
 	}
 }
 
+// TestDeploymentProfile covers the deployment_profile field: defaults, accepted
+// values, rejection of unknown values, env override, and the IsDev() helper.
+func TestDeploymentProfile(t *testing.T) {
+	t.Run("default is production when unset in YAML", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		path := writeConfig(t, dir, validConfig(pemPath, dir))
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileProduction, cfg.DeploymentProfile)
+	})
+
+	t.Run("explicit production is accepted", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: production\n"
+		path := writeConfig(t, dir, content)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileProduction, cfg.DeploymentProfile)
+		assert.False(t, cfg.IsDev())
+	})
+
+	t.Run("explicit dev is accepted and IsDev returns true", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: dev\n"
+		path := writeConfig(t, dir, content)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileDev, cfg.DeploymentProfile)
+		assert.True(t, cfg.IsDev())
+	})
+
+	t.Run("unknown value staging is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: staging\n"
+		path := writeConfig(t, dir, content)
+		_, err := Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "deployment_profile must be one of: production, dev")
+	})
+
+	t.Run("env override CMR_DEPLOYMENT_PROFILE=dev takes precedence over YAML production", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: production\n"
+		path := writeConfig(t, dir, content)
+
+		t.Setenv("CMR_DEPLOYMENT_PROFILE", "dev")
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileDev, cfg.DeploymentProfile)
+		assert.True(t, cfg.IsDev())
+	})
+}
+
+// TestIsDev verifies that IsDev returns true only for the "dev" profile.
+func TestIsDev(t *testing.T) {
+	tests := []struct {
+		profile string
+		want    bool
+	}{
+		{profile: "", want: false},
+		{profile: ProfileProduction, want: false},
+		{profile: ProfileDev, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run("profile="+tt.profile, func(t *testing.T) {
+			cfg := &Config{DeploymentProfile: tt.profile}
+			assert.Equal(t, tt.want, cfg.IsDev())
+		})
+	}
+}
+
+// baseDevConfig returns a minimal valid config in dev mode without GitHub auth.
+// Tests that exercise dev-mode digest-pin relaxation set their own GitHub auth.
+func baseDevConfig(t *testing.T, pemPath string) *Config {
+	t.Helper()
+
+	return &Config{
+		ContextMatrixURL:  "http://localhost",
+		APIKey:            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:         testDigestImage,
+		ImagePullPolicy:   PullAlways,
+		MaxConcurrent:     1,
+		ContainerTimeout:  "1h",
+		AnthropicAPIKey:   "sk-ant-test",
+		DeploymentProfile: ProfileDev,
+		GitHubApp: GitHubApp{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+}
+
+// TestValidate_DevMode_UnpinnedBaseImage verifies that in dev mode an unpinned
+// base_image does not cause Validate to return an error, and the reference is
+// collected in UnpinnedImageRefs.
+func TestValidate_DevMode_UnpinnedBaseImage(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.BaseImage = "contextmatrix/worker:latest"
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+
+	require.Len(t, cfg.UnpinnedImageRefs, 1)
+	assert.Equal(t, "base_image", cfg.UnpinnedImageRefs[0].Field)
+	assert.Equal(t, "contextmatrix/worker:latest", cfg.UnpinnedImageRefs[0].Image)
+}
+
+// TestValidate_DevMode_MultipleUnpinnedAllowedImages verifies that all unpinned
+// allowed_images entries are collected in dev mode with their indexed field names.
+func TestValidate_DevMode_MultipleUnpinnedAllowedImages(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.AllowedImages = []string{
+		"contextmatrix/worker:v1",
+		"contextmatrix/worker:v2",
+	}
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+
+	require.Len(t, cfg.UnpinnedImageRefs, 2)
+	assert.Equal(t, "allowed_images[0]", cfg.UnpinnedImageRefs[0].Field)
+	assert.Equal(t, "contextmatrix/worker:v1", cfg.UnpinnedImageRefs[0].Image)
+	assert.Equal(t, "allowed_images[1]", cfg.UnpinnedImageRefs[1].Field)
+	assert.Equal(t, "contextmatrix/worker:v2", cfg.UnpinnedImageRefs[1].Image)
+}
+
+// TestValidate_Production_UnpinnedBaseImageFails verifies that production mode
+// keeps the existing fail-closed behaviour for unpinned base_image.
+func TestValidate_Production_UnpinnedBaseImageFails(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := baseValidConfigNoGitHub(t)
+	cfg.GitHubApp = GitHubApp{
+		AppID:          1,
+		InstallationID: 1,
+		PrivateKeyPath: pemPath,
+	}
+	cfg.BaseImage = "contextmatrix/worker:latest"
+	// DeploymentProfile is zero-value ("") which Validate normalises to production.
+
+	err := cfg.Validate()
+	require.ErrorContains(t, err, "base_image must be @sha256:... pinned")
+	assert.Nil(t, cfg.UnpinnedImageRefs)
+}
+
+// TestValidate_DevMode_FullyPinned verifies that when all images are digest-pinned
+// in dev mode, UnpinnedImageRefs is empty (no spurious WARNs on startup).
+func TestValidate_DevMode_FullyPinned(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	pinnedA := "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pinnedB := "contextmatrix/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.BaseImage = pinnedA
+	cfg.AllowedImages = []string{pinnedB}
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.UnpinnedImageRefs)
+}
+
+// TestValidate_DevMode_MixedPinning verifies that only unpinned entries appear
+// in UnpinnedImageRefs when some allowed_images are pinned and some are not.
+func TestValidate_DevMode_MixedPinning(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	pinnedB := "contextmatrix/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.AllowedImages = []string{
+		pinnedB,
+		"contextmatrix/worker:unpinned",
+	}
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+
+	require.Len(t, cfg.UnpinnedImageRefs, 1)
+	assert.Equal(t, "allowed_images[1]", cfg.UnpinnedImageRefs[0].Field)
+	assert.Equal(t, "contextmatrix/worker:unpinned", cfg.UnpinnedImageRefs[0].Image)
+}
+
 // TestValidate_AllowedImagesDigestPin ensures every entry in the
 // allowed_images allowlist is digest-pinned, not just base_image. A single
 // tag-only entry must fail validation so H2's "allowlist matches strings
@@ -871,4 +1076,95 @@ func TestValidate_AllowedImagesDigestPin(t *testing.T) {
 		cfg.AllowedImages = nil
 		assert.NoError(t, cfg.Validate())
 	})
+}
+
+// validConfigDev returns a YAML string for a dev-profile config that is
+// otherwise identical to validConfig. Tests that need the dev profile use
+// this instead of setting the env var after the fact.
+func validConfigDev(pemPath, claudeDir string) string {
+	return validConfig(pemPath, claudeDir) + "\ndeployment_profile: dev\n"
+}
+
+// TestLoad_DevDefaults_UnsetValues verifies that a dev-profile config
+// with no explicit skew or pull policy receives the dev defaults and that
+// AppliedDevDefaults records them both.
+func TestLoad_DevDefaults_UnsetValues(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfigDev(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 86400, cfg.WebhookReplaySkewSeconds, "dev mode: skew should default to 86400")
+	assert.Equal(t, PullIfNotPresent, cfg.ImagePullPolicy, "dev mode: pull policy should default to if-not-present")
+	assert.ElementsMatch(t, []string{"webhook_replay_skew_seconds=86400", "image_pull_policy=if-not-present"}, cfg.AppliedDevDefaults)
+}
+
+// TestLoad_DevDefaults_ExplicitSkew verifies that an explicitly-set
+// webhook_replay_skew_seconds is NOT overridden in dev mode and does NOT
+// appear in AppliedDevDefaults.
+func TestLoad_DevDefaults_ExplicitSkew(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfigDev(pemPath, dir) + "webhook_replay_skew_seconds: 60\n"
+	path := writeConfig(t, dir, yaml)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 60, cfg.WebhookReplaySkewSeconds, "explicit skew must not be overridden in dev mode")
+	assert.NotContains(t, cfg.AppliedDevDefaults, "webhook_replay_skew_seconds=86400")
+}
+
+// TestLoad_DevDefaults_ExplicitPullPolicy verifies that an explicitly-set
+// image_pull_policy is NOT overridden in dev mode. Covers both "always" (trivially
+// distinct from the dev default) and "never" (shares a value with the
+// production default and previously regressed — see git history).
+func TestLoad_DevDefaults_ExplicitPullPolicy(t *testing.T) {
+	cases := []struct {
+		name   string
+		policy string
+	}{
+		{name: "always", policy: PullAlways},
+		{name: "never", policy: PullNever},
+		{name: "if-not-present", policy: PullIfNotPresent},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pemPath := writePEM(t, dir)
+
+			yaml := validConfigDev(pemPath, dir) + "image_pull_policy: " + tc.policy + "\n"
+			path := writeConfig(t, dir, yaml)
+
+			cfg, err := Load(path)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.policy, cfg.ImagePullPolicy,
+				"explicit pull policy %q must not be overridden in dev mode", tc.policy)
+			assert.NotContains(t, cfg.AppliedDevDefaults, "image_pull_policy=if-not-present",
+				"explicit pull policy must not appear in AppliedDevDefaults")
+		})
+	}
+}
+
+// TestLoad_ProductionDefaults_UnsetValues verifies that the production profile
+// (the default) yields 330 for skew and "never" for pull policy, and that
+// AppliedDevDefaults is empty.
+func TestLoad_ProductionDefaults_UnsetValues(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 330, cfg.WebhookReplaySkewSeconds, "production: skew must default to 330")
+	assert.Equal(t, PullNever, cfg.ImagePullPolicy, "production: pull policy must default to never")
+	assert.Empty(t, cfg.AppliedDevDefaults, "production mode must not populate AppliedDevDefaults")
 }

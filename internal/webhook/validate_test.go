@@ -185,36 +185,45 @@ func TestValidateMCPURL(t *testing.T) {
 		name    string
 		val     string
 		allowed []string
+		devMode bool
 		wantErr bool
 	}{
 		// happy paths
-		{"https allowed exact", "https://cm.example.com/mcp", allowlist, false},
-		{"https with port allowed", "https://cm.example.com:8443/mcp", allowlist, false},
-		{"https case-insensitive match", "https://staging.contextmatrix.io/mcp", allowlist, false},
+		{"https allowed exact", "https://cm.example.com/mcp", allowlist, false, false},
+		{"https with port allowed", "https://cm.example.com:8443/mcp", allowlist, false, false},
+		{"https case-insensitive match", "https://staging.contextmatrix.io/mcp", allowlist, false, false},
 
 		// scheme rejections
-		{"http not allowed", "http://cm.example.com/mcp", allowlist, true},
-		{"ws not allowed", "ws://cm.example.com/mcp", allowlist, true},
-		{"ssh not allowed", "ssh://cm.example.com/mcp", allowlist, true},
-		{"empty string", "", allowlist, true},
+		{"http not allowed", "http://cm.example.com/mcp", allowlist, false, true},
+		{"ws not allowed", "ws://cm.example.com/mcp", allowlist, false, true},
+		{"ssh not allowed", "ssh://cm.example.com/mcp", allowlist, false, true},
+		{"empty string", "", allowlist, false, true},
 
 		// host rejections
-		{"host not in allowlist", "https://evil.example.com/mcp", allowlist, true},
-		{"empty host", "https:///mcp", allowlist, true},
-		{"host with disallowed char", "https://ev\"il.example.com/mcp", allowlist, true},
+		{"host not in allowlist", "https://evil.example.com/mcp", allowlist, false, true},
+		{"empty host", "https:///mcp", allowlist, false, true},
+		{"host with disallowed char", "https://ev\"il.example.com/mcp", allowlist, false, true},
 
-		// allowlist-empty fail-closed
-		{"empty allowlist rejects all", "https://cm.example.com/mcp", nil, true},
-		{"nil allowlist rejects all", "https://cm.example.com/mcp", []string{}, true},
+		// allowlist-empty fail-closed (production)
+		{"empty allowlist rejects all", "https://cm.example.com/mcp", nil, false, true},
+		{"nil allowlist rejects all", "https://cm.example.com/mcp", []string{}, false, true},
 
 		// control bytes
-		{"newline in raw", "https://cm.example.com\n/mcp", allowlist, true},
-		{"carriage return in raw", "https://cm.example.com\r/mcp", allowlist, true},
-		{"NUL byte in raw", "https://cm.example.com\x00/mcp", allowlist, true},
+		{"newline in raw", "https://cm.example.com\n/mcp", allowlist, false, true},
+		{"carriage return in raw", "https://cm.example.com\r/mcp", allowlist, false, true},
+		{"NUL byte in raw", "https://cm.example.com\x00/mcp", allowlist, false, true},
+
+		// dev mode: empty allowlist is relaxed
+		{"dev+empty allowlist accepts valid url", "https://example.com/mcp", nil, true, false},
+		{"dev+empty allowlist accepts valid url (slice)", "https://example.com/mcp", []string{}, true, false},
+
+		// dev mode: non-empty allowlist still enforces membership
+		{"dev+nonempty allowlist rejects unknown host", "https://evil.example.com/mcp", allowlist, true, true},
+		{"dev+nonempty allowlist accepts known host", "https://cm.example.com/mcp", allowlist, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateMCPURL(tc.val, tc.allowed)
+			err := validateMCPURL(tc.val, tc.allowed, tc.devMode)
 			if tc.wantErr {
 				require.Error(t, err, "expected error for %q", tc.val)
 
@@ -317,7 +326,7 @@ func TestValidatePayload_TriggerHappy(t *testing.T) {
 		MCPURL:     "https://cm.example.com/mcp",
 		BaseBranch: "main",
 	}
-	require.NoError(t, ValidatePayload(p, validateTestAllowed))
+	require.NoError(t, ValidatePayload(p, validateTestAllowed, false))
 }
 
 func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
@@ -347,7 +356,7 @@ func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
 			p := mk()
 			tc.mutate(p)
 
-			err := ValidatePayload(p, validateTestAllowed)
+			err := ValidatePayload(p, validateTestAllowed, false)
 			require.Error(t, err)
 
 			var ve *ValidationError
@@ -359,9 +368,9 @@ func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
 }
 
 func TestValidatePayload_Kill(t *testing.T) {
-	require.NoError(t, ValidatePayload(&KillPayload{CardID: "C-1", Project: "p"}, nil))
+	require.NoError(t, ValidatePayload(&KillPayload{CardID: "C-1", Project: "p"}, nil, false))
 
-	err := ValidatePayload(&KillPayload{CardID: "-evil", Project: "p"}, nil)
+	err := ValidatePayload(&KillPayload{CardID: "-evil", Project: "p"}, nil, false)
 	require.Error(t, err)
 
 	var ve *ValidationError
@@ -372,13 +381,13 @@ func TestValidatePayload_Kill(t *testing.T) {
 
 func TestValidatePayload_StopAll(t *testing.T) {
 	// Empty project allowed
-	require.NoError(t, ValidatePayload(&StopAllPayload{}, nil))
+	require.NoError(t, ValidatePayload(&StopAllPayload{}, nil, false))
 
 	// Valid project allowed
-	require.NoError(t, ValidatePayload(&StopAllPayload{Project: "proj"}, nil))
+	require.NoError(t, ValidatePayload(&StopAllPayload{Project: "proj"}, nil, false))
 
 	// Bad project rejected
-	err := ValidatePayload(&StopAllPayload{Project: "a b"}, nil)
+	err := ValidatePayload(&StopAllPayload{Project: "a b"}, nil, false)
 	require.Error(t, err)
 }
 
@@ -389,12 +398,12 @@ func TestValidatePayload_Message(t *testing.T) {
 		Content:   "hello",
 		MessageID: "msg-1",
 	}
-	require.NoError(t, ValidatePayload(p, nil))
+	require.NoError(t, ValidatePayload(p, nil, false))
 
 	// Empty content
 	p2 := *p
 	p2.Content = ""
-	err := ValidatePayload(&p2, nil)
+	err := ValidatePayload(&p2, nil, false)
 	require.Error(t, err)
 
 	var ve *ValidationError
@@ -405,37 +414,37 @@ func TestValidatePayload_Message(t *testing.T) {
 	// Bad message_id
 	p3 := *p
 	p3.MessageID = "msg id with space"
-	err = ValidatePayload(&p3, nil)
+	err = ValidatePayload(&p3, nil, false)
 	require.Error(t, err)
 	require.ErrorAs(t, err, &ve)
 	assert.Equal(t, "message_id", ve.Field)
 }
 
 func TestValidatePayload_Promote(t *testing.T) {
-	require.NoError(t, ValidatePayload(&PromotePayload{CardID: "C-1", Project: "p"}, nil))
-	require.Error(t, ValidatePayload(&PromotePayload{CardID: "", Project: "p"}, nil))
+	require.NoError(t, ValidatePayload(&PromotePayload{CardID: "C-1", Project: "p"}, nil, false))
+	require.Error(t, ValidatePayload(&PromotePayload{CardID: "", Project: "p"}, nil, false))
 }
 
 func TestValidatePayload_EndSession(t *testing.T) {
-	require.NoError(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "p"}, nil))
-	require.Error(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "-bad"}, nil))
+	require.NoError(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "p"}, nil, false))
+	require.Error(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "-bad"}, nil, false))
 }
 
 func TestValidatePayload_ByValue(t *testing.T) {
 	// Pass-by-value should work as well as pass-by-pointer.
-	require.NoError(t, ValidatePayload(KillPayload{CardID: "C-1", Project: "p"}, nil))
-	require.NoError(t, ValidatePayload(StopAllPayload{}, nil))
-	require.NoError(t, ValidatePayload(PromotePayload{CardID: "C-1", Project: "p"}, nil))
-	require.NoError(t, ValidatePayload(EndSessionPayload{CardID: "C-1", Project: "p"}, nil))
+	require.NoError(t, ValidatePayload(KillPayload{CardID: "C-1", Project: "p"}, nil, false))
+	require.NoError(t, ValidatePayload(StopAllPayload{}, nil, false))
+	require.NoError(t, ValidatePayload(PromotePayload{CardID: "C-1", Project: "p"}, nil, false))
+	require.NoError(t, ValidatePayload(EndSessionPayload{CardID: "C-1", Project: "p"}, nil, false))
 	require.NoError(t, ValidatePayload(
-		MessagePayload{CardID: "C-1", Project: "p", Content: "hi"}, nil,
+		MessagePayload{CardID: "C-1", Project: "p", Content: "hi"}, nil, false,
 	))
 }
 
 func TestValidatePayload_UnknownTypeNoop(t *testing.T) {
 	// Unknown payload type returns nil (handlers only pass known types).
-	require.NoError(t, ValidatePayload(struct{ X int }{X: 1}, nil))
-	require.NoError(t, ValidatePayload(nil, nil))
+	require.NoError(t, ValidatePayload(struct{ X int }{X: 1}, nil, false))
+	require.NoError(t, ValidatePayload(nil, nil, false))
 }
 
 func TestValidationError_Message(t *testing.T) {
@@ -465,7 +474,7 @@ func (r *strictRunner) Kill(_, _ string) error {
 func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	tr := tracker.New()
 	// maxConcurrent=3 so concurrency limit never fires; tracker must remain empty.
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, nil)
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, 0, nil, false)
 
 	badPayload := TriggerPayload{
 		CardID:  "-rm -rf",
@@ -504,7 +513,7 @@ func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 
 func TestHandleTrigger_InvalidMCPHost_NoTrackerOrRun(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, nil)
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, 0, nil, false)
 
 	bad := TriggerPayload{
 		CardID:  "CARD-1",
@@ -535,7 +544,7 @@ func TestHandleTrigger_InvalidMCPHost_NoTrackerOrRun(t *testing.T) {
 func TestHandleTrigger_MCPHostsEmpty_RejectsAll(t *testing.T) {
 	// With an empty allowlist the handler must fail-closed on every mcp_url.
 	tr := tracker.New()
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, nil, nil, nil)
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, nil, nil, 0, nil, false)
 
 	p := TriggerPayload{
 		CardID:  "CARD-1",

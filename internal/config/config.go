@@ -24,6 +24,20 @@ const (
 	PullIfNotPresent = "if-not-present"
 )
 
+// DeploymentProfile constants define the two supported operational modes.
+const (
+	ProfileProduction = "production"
+	ProfileDev        = "dev"
+)
+
+// UnpinnedImageRef records an image reference that failed the digest-pin check
+// but was accepted because the runner is in dev mode. Populated during
+// Validate(); never serialised to YAML.
+type UnpinnedImageRef struct {
+	Field string
+	Image string
+}
+
 // Config holds all runner configuration.
 type Config struct {
 	Port                 int       `yaml:"port"`
@@ -76,6 +90,22 @@ type Config struct {
 	// server is being upgraded to accept HMAC on that GET endpoint.
 	UseHMACForVerifyAutonomous bool `yaml:"use_hmac_for_verify_autonomous"`
 
+	// DeploymentProfile selects the operational mode: "production" (default,
+	// strict) or "dev" (loosens validators for local single-box setups).
+	// Follow-up subtasks document which specific validators are relaxed in
+	// dev mode. Env: CMR_DEPLOYMENT_PROFILE.
+	DeploymentProfile string `yaml:"deployment_profile"`
+
+	// UnpinnedImageRefs is populated during Validate() when IsDev() is true
+	// and one or more image references are not digest-pinned. Callers (main.go)
+	// log a WARN per entry. Never serialised to YAML.
+	UnpinnedImageRefs []UnpinnedImageRef `yaml:"-"`
+
+	// AppliedDevDefaults records which defaults were automatically applied
+	// because DeploymentProfile == ProfileDev and the value was unset.
+	// Read-only after Load returns. Empty in production mode.
+	AppliedDevDefaults []string `yaml:"-"`
+
 	containerTimeoutDuration time.Duration
 }
 
@@ -113,7 +143,6 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		Port:                       9090,
 		AdminPort:                  9091,
-		ImagePullPolicy:            PullNever,
 		MaxConcurrent:              3,
 		ContainerTimeout:           "2h",
 		ContainerMemoryLimit:       8 * 1024 * 1024 * 1024, // 8 GiB
@@ -121,19 +150,43 @@ func Load(path string) (*Config, error) {
 		LogLevel:                   "info",
 		LogFormat:                  LogFormatText,
 		WebhookReplayCacheSize:     10000,
-		WebhookReplaySkewSeconds:   330,
 		MessageDedupCacheSize:      1000,
 		MessageDedupTTLSeconds:     600,
 		SecretsDir:                 defaultSecretsDir,
 		IdleOutputTimeout:          30 * time.Minute,
 		MaintenanceInterval:        10 * time.Minute,
 		UseHMACForVerifyAutonomous: true,
+		DeploymentProfile:          ProfileProduction,
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
 	applyEnvOverrides(cfg)
+
+	// Capture whether the user explicitly set ImagePullPolicy before we fill
+	// in a default. "never" is a legitimate explicit choice, so after the
+	// default-assignment below we can no longer tell the two apart — the
+	// dev-profile override must gate on this sentinel, not on the final value.
+	explicitPullPolicy := cfg.ImagePullPolicy != ""
+	if !explicitPullPolicy {
+		cfg.ImagePullPolicy = PullNever
+	}
+
+	// Dev-profile defaults: loosen a handful of tunables for local
+	// single-box setups. Only applied when the user did NOT explicitly set
+	// the value in YAML or via env (zero / empty sentinel check).
+	if cfg.DeploymentProfile == ProfileDev {
+		if cfg.WebhookReplaySkewSeconds == 0 {
+			cfg.WebhookReplaySkewSeconds = 86400 // 24 h
+			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "webhook_replay_skew_seconds=86400")
+		}
+
+		if !explicitPullPolicy {
+			cfg.ImagePullPolicy = PullIfNotPresent
+			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "image_pull_policy=if-not-present")
+		}
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
@@ -168,6 +221,10 @@ func (c *Config) LogLevelSlog() slog.Level {
 	return lvl
 }
 
+// IsDev returns true when the runner is configured in dev mode.
+// Dev mode loosens certain validators for local single-box setups.
+func (c *Config) IsDev() bool { return c.DeploymentProfile == ProfileDev }
+
 // Validate checks that all required fields are present and valid.
 func (c *Config) Validate() error {
 	if c.ContextMatrixURL == "" {
@@ -190,13 +247,28 @@ func (c *Config) Validate() error {
 	// A mutable tag like `:latest` would let a rebuilt upstream image
 	// silently ship into production; require `@sha256:...` so operators
 	// roll base images intentionally.
+	//
+	// In dev mode we collect unpinned references instead of failing hard, so
+	// local development setups can use mutable tags. The caller (main.go) logs
+	// a WARN per entry. Production mode keeps the fail-closed behaviour.
+	c.UnpinnedImageRefs = nil
+
 	if err := requireDigestPin("base_image", c.BaseImage); err != nil {
-		return err
+		if !c.IsDev() {
+			return err
+		}
+
+		c.UnpinnedImageRefs = append(c.UnpinnedImageRefs, UnpinnedImageRef{Field: "base_image", Image: c.BaseImage})
 	}
 
 	for i, img := range c.AllowedImages {
-		if err := requireDigestPin(fmt.Sprintf("allowed_images[%d]", i), img); err != nil {
-			return err
+		field := fmt.Sprintf("allowed_images[%d]", i)
+		if err := requireDigestPin(field, img); err != nil {
+			if !c.IsDev() {
+				return err
+			}
+
+			c.UnpinnedImageRefs = append(c.UnpinnedImageRefs, UnpinnedImageRef{Field: field, Image: img})
 		}
 	}
 
@@ -255,6 +327,16 @@ func (c *Config) Validate() error {
 		// ok
 	default:
 		return fmt.Errorf("log_format must be one of: text, json")
+	}
+
+	switch c.DeploymentProfile {
+	case "", ProfileProduction, ProfileDev:
+		// Normalise empty to production.
+		if c.DeploymentProfile == "" {
+			c.DeploymentProfile = ProfileProduction
+		}
+	default:
+		return fmt.Errorf("deployment_profile must be one of: production, dev")
 	}
 
 	d, err := time.ParseDuration(c.ContainerTimeout)
@@ -462,5 +544,9 @@ func applyEnvOverrides(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.AdminPort = n
 		}
+	}
+
+	if v := os.Getenv("CMR_DEPLOYMENT_PROFILE"); v != "" {
+		cfg.DeploymentProfile = v
 	}
 }

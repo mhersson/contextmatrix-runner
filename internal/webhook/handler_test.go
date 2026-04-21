@@ -126,9 +126,66 @@ func TestHmacAuth_ValidSignature(t *testing.T) {
 	assert.True(t, called)
 }
 
+// TestHmacAuth_SkewWindow_Accepts verifies that a signed request whose
+// timestamp is within the configured skew window is accepted (200 OK).
+func TestHmacAuth_SkewWindow_Accepts(t *testing.T) {
+	// 8-minute-old request; skew window is 10 minutes → should pass.
+	skew := 10 * time.Minute
+	h := &Handler{apiKey: testAPIKey, webhookReplaySkew: skew}
+
+	var called bool
+
+	handler := h.hmacAuth(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+
+		w.WriteHeader(http.StatusOK)
+	})
+
+	body := []byte(`{"test":true}`)
+	// Timestamp 8 minutes in the past.
+	oldTS := time.Now().Add(-8 * time.Minute).Unix()
+	ts := strconv.FormatInt(oldTS, 10)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader(string(body)))
+	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
+	req.Header.Set(cmhmac.TimestampHeader, ts)
+	handler(w, req)
+
+	assert.True(t, called, "handler should have been called: 8-min-old request within 10-min skew window")
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// TestHmacAuth_SkewWindow_Rejects verifies that a signed request whose
+// timestamp exceeds the configured skew window is rejected with 401.
+func TestHmacAuth_SkewWindow_Rejects(t *testing.T) {
+	// Same 8-minute-old request; skew window is 1 minute → should fail.
+	skew := 1 * time.Minute
+	h := &Handler{apiKey: testAPIKey, webhookReplaySkew: skew}
+
+	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("handler should not be called: timestamp outside skew window")
+	})
+
+	body := []byte(`{"test":true}`)
+	// Timestamp 8 minutes in the past.
+	oldTS := time.Now().Add(-8 * time.Minute).Unix()
+	ts := strconv.FormatInt(oldTS, 10)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader(string(body)))
+	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
+	req.Header.Set(cmhmac.TimestampHeader, ts)
+	handler(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
 func TestHandleTrigger_MissingFields(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", map[string]string{"card_id": "A-001"})
@@ -151,7 +208,7 @@ func TestHandleTrigger_ConcurrencyLimit(t *testing.T) {
 		})
 	}
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", TriggerPayload{
@@ -172,7 +229,7 @@ func TestHandleTrigger_Duplicate(t *testing.T) {
 		Project: "my-project",
 	})
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", TriggerPayload{
@@ -200,7 +257,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 		Project: "my-project",
 	})
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", TriggerPayload{
@@ -228,7 +285,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 // not-yet-started tracker miss was indistinguishable from a hard failure).
 func TestHandleKill_IdempotentWhenAlreadyStopped(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/kill", KillPayload{
@@ -250,7 +307,7 @@ func TestHandleHealth(t *testing.T) {
 	tr := tracker.New()
 	_ = tr.Add(&tracker.ContainerInfo{CardID: "A-001", Project: "proj"})
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), "GET", "/health", nil)
@@ -335,7 +392,7 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := tracker.New()
 			fake := newFakeRunner()
-			h := NewHandler(fake, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+			h := NewHandler(fake, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 			payload := TriggerPayload{
 				CardID:      "PROJ-100",
@@ -362,7 +419,7 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 
 func TestHandleLogs_SSEHeaders(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	// Cancel the context immediately so handleLogs exits after setup.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -381,7 +438,7 @@ func TestHandleLogs_SSEHeaders(t *testing.T) {
 
 func TestHandleLogs_InitialConnectedKeepalive(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -398,7 +455,7 @@ func TestHandleLogs_InitialConnectedKeepalive(t *testing.T) {
 
 func TestHandleLogs_EventStreamed(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	// Use an httptest.Server so we have a real connection with proper flushing.
 	mux := http.NewServeMux()
@@ -474,7 +531,7 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 
 func TestHandleLogs_ProjectFilter(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
@@ -538,7 +595,7 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 
 func TestHandleLogs_ClientDisconnect(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
@@ -605,7 +662,7 @@ func setupMessageHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.
 
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -792,7 +849,7 @@ func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.
 
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -946,7 +1003,7 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 	stdinWritten := make(chan struct{}, 1)
 	controlled := &controlledWriteCloser{writeCh: stdinWritten}
 
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1005,7 +1062,7 @@ func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
 	cmClient := callback.NewClient(cmServer.URL, "key", nil)
 
-	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1039,7 +1096,7 @@ func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
 	cmClient := callback.NewClient(cmServer.URL, "key", nil)
 
-	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1080,7 +1137,7 @@ func TestHandlePromote_APIFailure_GenericErrorBody(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
 	cmClient := callback.NewClient(cmServer.URL, "key", nil)
 
-	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1125,7 +1182,7 @@ func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
 	cmClient := callback.NewClient(cmServer.URL, "key", nil)
 
-	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1189,7 +1246,7 @@ func TestHandlePromote_EndSessionIdempotentAfterPromote(t *testing.T) {
 	// the idempotent 409 (stdin already closed) without panicking.
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1219,7 +1276,7 @@ func TestHandlePromote_WriteFailure_StdinNotClosed(t *testing.T) {
 	// close stdin and must return the existing error response.
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1303,7 +1360,7 @@ func setupEndSessionHandler(t *testing.T, withStdin bool) (*Handler, *logbroadca
 
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1433,7 +1490,7 @@ func TestHandleEndSession_409_NoStdin(t *testing.T) {
 func TestHandleEndSession_Idempotent(t *testing.T) {
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1533,7 +1590,7 @@ func TestHandleStopAll_Success(t *testing.T) {
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "B-001", Project: "beta"}))
 
 	fake := &stopAllFakeRunner{}
-	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/stop-all", StopAllPayload{})
@@ -1560,7 +1617,7 @@ func TestHandleStopAll_ProjectFilter(t *testing.T) {
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "B-001", Project: "beta"}))
 
 	fake := &stopAllFakeRunner{}
-	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/stop-all", StopAllPayload{Project: "alpha"})
@@ -1580,7 +1637,7 @@ func TestHandleStopAll_ProjectFilter(t *testing.T) {
 func TestHandleStopAll_NoContainers(t *testing.T) {
 	tr := tracker.New()
 	fake := &stopAllFakeRunner{}
-	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/stop-all", StopAllPayload{})
@@ -1608,7 +1665,7 @@ func TestHandleStopAll_KillFailureOnOneCard(t *testing.T) {
 		failFor: map[string]bool{"alpha/A-002": true},
 		killErr: fmt.Errorf("simulated kill failure"),
 	}
-	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/stop-all", StopAllPayload{})
@@ -1643,7 +1700,7 @@ func TestHandleStopAll_KillFailureOnOneCard(t *testing.T) {
 
 func TestHandleStopAll_InvalidJSON(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(&stopAllFakeRunner{}, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(&stopAllFakeRunner{}, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 	body := []byte("not-json")
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
@@ -1665,7 +1722,7 @@ func TestHandleStopAll_InvalidJSON(t *testing.T) {
 // it, the race detector would catch it here.
 func TestHandleMessage_ConcurrentNoWriteInterleave(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1816,7 +1873,7 @@ func TestHandleTrigger_503WhenDraining(t *testing.T) {
 	health := NewHealthState()
 	health.Draining.Store(true)
 
-	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, health, false)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", TriggerPayload{
@@ -1852,7 +1909,7 @@ func TestHandleMessage_503WhenDraining(t *testing.T) {
 	health := NewHealthState()
 	health.Draining.Store(true)
 
-	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, health, false)
 
 	payload := MessagePayload{
 		CardID:    "PROJ-001",
@@ -1882,7 +1939,7 @@ func TestHandlePromote_503WhenDraining(t *testing.T) {
 	health := NewHealthState()
 	health.Draining.Store(true)
 
-	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, health, false)
 
 	payload := PromotePayload{
 		CardID:  "PROJ-001",
@@ -1909,7 +1966,7 @@ func TestHandleEndSession_503WhenDraining(t *testing.T) {
 	health := NewHealthState()
 	health.Draining.Store(true)
 
-	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, health, false)
 
 	payload := EndSessionPayload{
 		CardID:  "PROJ-001",
@@ -1921,4 +1978,149 @@ func TestHandleEndSession_503WhenDraining(t *testing.T) {
 
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.False(t, fw.closed, "draining branch must short-circuit before any stdin close")
+}
+
+// captureHandler is a minimal slog.Handler that records every INFO record's
+// "host" attribute. It is used by the dev-mode host-logging tests so they can
+// assert that INFO fires exactly once per new host, without relying on the
+// global slog logger (which is not test-safe to mutate).
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (c *captureHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelInfo
+}
+
+func (c *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.records = append(c.records, r)
+
+	return nil
+}
+
+func (c *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler { return c }
+func (c *captureHandler) WithGroup(_ string) slog.Handler      { return c }
+
+// countDevMCPHostSeen returns the number of "dev profile: mcp host seen" INFO
+// records that carry the given host value.
+func (c *captureHandler) countDevMCPHostSeen(host string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	n := 0
+
+	for _, r := range c.records {
+		if r.Level != slog.LevelInfo || r.Message != "dev profile: mcp host seen" {
+			continue
+		}
+
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "host" && a.Value.String() == host {
+				n++
+			}
+
+			return true
+		})
+	}
+
+	return n
+}
+
+// TestHandleTrigger_DevMode_MCPHostLogging verifies per-new-host INFO logging
+// in dev mode. The handler must:
+// - emit INFO for a host the first time it is seen
+// - NOT emit INFO for the same host on subsequent requests
+// - emit INFO again when a different host appears for the first time.
+func TestHandleTrigger_DevMode_MCPHostLogging(t *testing.T) {
+	ch := &captureHandler{}
+	logger := slog.New(ch)
+
+	// Use an empty allowlist and devMode=true so any https host is accepted.
+	tr := tracker.New()
+	fake := newFakeRunner()
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, nil, logger, 0, nil, true)
+
+	sendTrigger := func(t *testing.T, cardID, mcpURL string) {
+		t.Helper()
+
+		payload := TriggerPayload{
+			CardID:  cardID,
+			Project: "proj",
+			RepoURL: "https://github.com/org/repo.git",
+			MCPURL:  mcpURL,
+		}
+		w := httptest.NewRecorder()
+		req := signedRequest(t, "/trigger", payload)
+		h.hmacAuth(h.handleTrigger)(w, req)
+
+		// Drain the run channel so the goroutine doesn't block.
+		select {
+		case <-fake.runCh:
+		default:
+		}
+	}
+
+	// First request for example.com — should log.
+	sendTrigger(t, "CARD-1", "https://example.com/mcp")
+	assert.Equal(t, 1, ch.countDevMCPHostSeen("example.com"),
+		"first trigger for example.com must emit one INFO log")
+
+	// Second request for the same host — must NOT log again.
+	sendTrigger(t, "CARD-2", "https://example.com/mcp")
+	assert.Equal(t, 1, ch.countDevMCPHostSeen("example.com"),
+		"second trigger for same host must not emit duplicate INFO log")
+
+	// Third request for a different host — should log once.
+	sendTrigger(t, "CARD-3", "https://other.example.com/mcp")
+	assert.Equal(t, 1, ch.countDevMCPHostSeen("other.example.com"),
+		"first trigger for other.example.com must emit one INFO log")
+
+	// example.com count is still 1 (not bumped by other host).
+	assert.Equal(t, 1, ch.countDevMCPHostSeen("example.com"),
+		"example.com count must remain 1 after other.example.com trigger")
+}
+
+// TestHandleTrigger_DevMode_EmptyAllowlist verifies that in dev mode with an
+// empty allowed_mcp_hosts the /trigger handler accepts any valid https URL.
+func TestHandleTrigger_DevMode_EmptyAllowlist(t *testing.T) {
+	tr := tracker.New()
+	fake := newFakeRunner()
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, nil, nil, 0, nil, true)
+
+	payload := TriggerPayload{
+		CardID:  "CARD-1",
+		Project: "proj",
+		RepoURL: "https://github.com/org/repo.git",
+		MCPURL:  "https://example.com/mcp",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/trigger", payload)
+	h.hmacAuth(h.handleTrigger)(w, req)
+
+	assert.Equal(t, http.StatusAccepted, w.Code,
+		"dev mode + empty allowlist must accept a valid https mcp_url")
+}
+
+// TestHandleTrigger_ProductionMode_EmptyAllowlistRejectsAll verifies that in
+// production mode (devMode=false) an empty allowlist still rejects every URL.
+func TestHandleTrigger_ProductionMode_EmptyAllowlistRejectsAll(t *testing.T) {
+	tr := tracker.New()
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 10, nil, nil, 0, nil, false)
+
+	payload := TriggerPayload{
+		CardID:  "CARD-1",
+		Project: "proj",
+		RepoURL: "https://github.com/org/repo.git",
+		MCPURL:  "https://example.com/mcp",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/trigger", payload)
+	h.hmacAuth(h.handleTrigger)(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code,
+		"production mode + empty allowlist must reject any mcp_url")
 }
