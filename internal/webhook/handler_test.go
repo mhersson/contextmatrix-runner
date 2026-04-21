@@ -1148,6 +1148,103 @@ func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 	assert.Contains(t, resp.Message, "autonomous flag is not set")
 }
 
+// errorWriteCloser returns an error on every Write call. Used to exercise the
+// write-failure path in /promote (and /message) handlers.
+type errorWriteCloser struct {
+	closed bool
+	err    error
+}
+
+func (e *errorWriteCloser) Write(_ []byte) (int, error) { return 0, e.err }
+func (e *errorWriteCloser) Close() error {
+	e.closed = true
+
+	return nil
+}
+
+func TestHandlePromote_ClosesStdinOnSuccess(t *testing.T) {
+	// A valid /promote must close stdin after writing the canned message.
+	h, _, fw := setupPromoteHandler(t, true)
+
+	payload := PromotePayload{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var resp Response
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+
+	require.NotNil(t, fw)
+	assert.True(t, fw.closed, "stdin must be closed after successful /promote")
+}
+
+func TestHandlePromote_EndSessionIdempotentAfterPromote(t *testing.T) {
+	// After /promote closes stdin, a subsequent /end-session must return
+	// the idempotent 409 (stdin already closed) without panicking.
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	promotePayload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+
+	// /promote succeeds and closes stdin.
+	wp := httptest.NewRecorder()
+	h.hmacAuth(h.handlePromote)(wp, signedRequest(t, "/promote", promotePayload))
+	require.Equal(t, http.StatusAccepted, wp.Code)
+	require.True(t, fw.closed, "stdin must be closed by /promote before /end-session")
+
+	// /end-session on already-closed stdin returns 409 (idempotent, not a panic).
+	endPayload := EndSessionPayload{CardID: "PROJ-001", Project: "my-project"}
+	we := httptest.NewRecorder()
+	h.hmacAuth(h.handleEndSession)(we, signedRequest(t, "/end-session", endPayload))
+	assert.Equal(t, http.StatusConflict, we.Code, "/end-session after /promote must return 409")
+}
+
+func TestHandlePromote_WriteFailure_StdinNotClosed(t *testing.T) {
+	// When the canned-message stdin write returns an error, /promote must NOT
+	// close stdin and must return the existing error response.
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	ewc := &errorWriteCloser{err: fmt.Errorf("disk full")}
+	tr.SetStdin("my-project", "PROJ-001", ewc, nil)
+
+	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	// The write failure should produce an error response (500 internal error).
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+
+	var resp Response
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+
+	// stdin must NOT have been closed.
+	assert.False(t, ewc.closed, "stdin must NOT be closed when the canned-message write fails")
+}
+
 // controlledWriteCloser records writes and signals via writeCh.
 type controlledWriteCloser struct {
 	buf     []byte

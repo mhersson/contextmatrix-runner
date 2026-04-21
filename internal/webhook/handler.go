@@ -617,6 +617,14 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Close stdin so the container's claude process receives EOF and exits
+	// cleanly. An already-closed stdin (e.g. a racing /end-session) is not a
+	// failure of /promote — log a warning and still return 200.
+	if err := h.tracker.CloseStdin(payload.Project, payload.CardID); err != nil {
+		h.logWarn("promote: close stdin after write failed (non-fatal)",
+			"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
+	}
+
 	writeSuccess(w, http.StatusAccepted, "")
 }
 
