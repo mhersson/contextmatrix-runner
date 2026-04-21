@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -105,6 +106,27 @@ const imagePruneMaxAge = "24h"
 // normal host-gateway route if DNS inside the container itself works.
 const dnsLookupTimeout = 2 * time.Second
 
+// secretMode describes how secrets are delivered to a container.
+type secretMode int
+
+const (
+	// secretModeFile delivers secrets via a host-side tmpfs file that is
+	// bind-mounted read-only into the container at /run/cm-secrets/env.
+	secretModeFile secretMode = iota
+	// secretModeEnvVar delivers secrets directly via HostConfig.Env. Used as a
+	// dev-mode fallback when secrets_dir is not writable.
+	secretModeEnvVar
+)
+
+// secretDelivery describes the result of prepareSecrets: either a host-side
+// file path (Mode == secretModeFile) or a slice of KEY=VALUE strings ready to
+// be appended to the container env (Mode == secretModeEnvVar).
+type secretDelivery struct {
+	Mode     secretMode
+	FilePath string   // set when Mode == secretModeFile
+	EnvVars  []string // set when Mode == secretModeEnvVar
+}
+
 // Manager handles the lifecycle of Docker containers for task execution.
 type Manager struct {
 	docker      DockerClient
@@ -123,6 +145,13 @@ type Manager struct {
 	// tests; nil is treated as net.DefaultResolver.
 	resolver hostResolver
 	wg       sync.WaitGroup
+
+	// mkdirAll is os.MkdirAll by default; swappable in tests to inject
+	// filesystem errors without touching the real filesystem.
+	mkdirAll func(path string, perm os.FileMode) error
+	// createFile is os.OpenFile(path, O_CREATE|O_WRONLY|O_EXCL|O_TRUNC, 0o600)
+	// by default; swappable in tests to inject file-creation errors.
+	createFile func(path string) (*os.File, error)
 }
 
 // WithMetrics attaches a metrics bundle to the manager. A nil bundle disables
@@ -153,6 +182,10 @@ func NewManager(
 		logger:      logger,
 		dnsCache:    newDNSCache(dnsCacheTTL, dnsCacheCapacity),
 		resolver:    net.DefaultResolver,
+		mkdirAll:    os.MkdirAll,
+		createFile: func(path string) (*os.File, error) {
+			return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
+		},
 	}
 }
 
@@ -239,10 +272,10 @@ func (m *Manager) Wait() {
 func (m *Manager) run(ctx context.Context, payload RunConfig) string {
 	log := m.logger.With("card_id", payload.CardID, "project", payload.Project)
 
-	containerID, secretsPath, secretValues, err := m.startContainer(ctx, payload)
+	containerID, delivery, secretValues, err := m.startContainer(ctx, payload)
 	if err != nil {
 		log.Error("failed to start container", "error", err)
-		m.removeSecretsFile(secretsPath, log)
+		m.removeSecretsFile(delivery, log)
 
 		// Use a detached context for the callback: if start raced with a Kill
 		// (or the runner is shutting down), ctx is already cancelled and the
@@ -280,7 +313,7 @@ func (m *Manager) run(ctx context.Context, payload RunConfig) string {
 
 	// Wait for container to finish and return its outcome so the caller's
 	// duration histogram carries the right label.
-	return m.waitAndCleanup(ctx, containerID, secretsPath, payload, secretValues, log)
+	return m.waitAndCleanup(ctx, containerID, delivery, payload, secretValues, log)
 }
 
 // runningCallbackAsync fires ReportStatus("running") on a background
@@ -322,7 +355,7 @@ func (m *Manager) runningCallbackAsync(payload RunConfig, log *slog.Logger) {
 // the gosec G101 flag is a false positive.
 const secretsMountTarget = "/run/cm-secrets/env" //nolint:gosec // path, not a credential
 
-func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string, string, []string, error) {
+func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string, secretDelivery, []string, error) {
 	img := payload.RunnerImage
 	if img == "" {
 		img = m.cfg.BaseImage
@@ -331,21 +364,21 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	// Validate image against allowlist.
 	if len(m.cfg.AllowedImages) > 0 {
 		if !slices.Contains(m.cfg.AllowedImages, img) {
-			return "", "", nil, fmt.Errorf("image %q not in allowed_images list", img)
+			return "", secretDelivery{}, nil, fmt.Errorf("image %q not in allowed_images list", img)
 		}
 	} else if img != m.cfg.BaseImage {
-		return "", "", nil, fmt.Errorf("image %q not allowed (only base_image %q permitted when allowed_images is empty)", img, m.cfg.BaseImage)
+		return "", secretDelivery{}, nil, fmt.Errorf("image %q not allowed (only base_image %q permitted when allowed_images is empty)", img, m.cfg.BaseImage)
 	}
 
 	// Pull image according to policy.
 	if err := m.pullImage(ctx, img); err != nil {
-		return "", "", nil, err
+		return "", secretDelivery{}, nil, err
 	}
 
 	// Generate GitHub App token.
 	gitToken, err := m.token.GenerateToken(ctx)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("generate git token: %w", err)
+		return "", secretDelivery{}, nil, fmt.Errorf("generate git token: %w", err)
 	}
 
 	// Secrets (CM_GIT_TOKEN, CM_MCP_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
@@ -426,20 +459,26 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		secretValues = append(secretValues, secrets[k])
 	}
 
-	// Write the per-container secrets file and add the bind mount. If
-	// the directory cannot be prepared we fail closed — leaking secrets
-	// into env would defeat the whole point of this card.
-	secretsPath, err := m.writeSecretsFile(payload, secrets)
+	// Prepare secret delivery: try writing to a tmpfs file first. In dev mode,
+	// fall back to env-var delivery if the secrets dir is not writable.
+	delivery, err := m.prepareSecrets(payload, secrets)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("write secrets file: %w", err)
+		return "", secretDelivery{}, nil, fmt.Errorf("prepare secrets: %w", err)
 	}
 
-	mounts = append(mounts, mount.Mount{
-		Type:     mount.TypeBind,
-		Source:   secretsPath,
-		Target:   secretsMountTarget,
-		ReadOnly: true,
-	})
+	// Wire the delivery into the container configuration.
+	switch delivery.Mode {
+	case secretModeFile:
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   delivery.FilePath,
+			Target:   secretsMountTarget,
+			ReadOnly: true,
+		})
+	case secretModeEnvVar:
+		// Secrets land directly in env; no bind-mount added.
+		env = append(env, delivery.EnvVars...)
+	}
 
 	name := sanitizeContainerName(payload.Project, payload.CardID)
 
@@ -473,7 +512,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		nil, nil, name,
 	)
 	if err != nil {
-		return "", secretsPath, nil, fmt.Errorf("create container: %w", err)
+		return "", delivery, nil, fmt.Errorf("create container: %w", err)
 	}
 
 	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
@@ -482,7 +521,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			m.logger.Warn("failed to remove container after start failure", "container_id", resp.ID, "error", rmErr)
 		}
 
-		return "", secretsPath, nil, fmt.Errorf("start container: %w", err)
+		return "", delivery, nil, fmt.Errorf("start container: %w", err)
 	}
 
 	if payload.Interactive {
@@ -527,40 +566,61 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		}
 	}
 
-	return resp.ID, secretsPath, secretValues, nil
+	return resp.ID, delivery, secretValues, nil
 }
 
-// writeSecretsFile writes a per-container env-style secrets file to
-// cfg.SecretsDir with mode 0600. The file is later bind-mounted read-only
-// into the container at /run/cm-secrets/env. Returns the host-side path so
-// the caller can unlink it once the container has exited.
+// isPermissionDenied returns true when err is (or wraps) os.ErrPermission or
+// syscall.EROFS — the two error values that indicate a read-only or
+// unwritable filesystem rather than a transient I/O problem.
+func isPermissionDenied(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS)
+}
+
+// prepareSecrets decides how secrets are delivered to the container.
 //
-// Format: one `export KEY='VALUE'` per line. Values are single-quoted with
-// internal `'` escaped as `'\”` so any byte — including a newline — cannot
-// break out of the quote and inject another shell statement.
-func (m *Manager) writeSecretsFile(payload RunConfig, secrets map[string]string) (string, error) {
+//   - Tries to write a mode-0600 file under cfg.SecretsDir (file mode).
+//   - If the directory cannot be created or the file cannot be opened due to
+//     os.ErrPermission / syscall.EROFS AND the runner is in dev mode, falls
+//     back to env-var delivery with a WARN log.
+//   - Any other error, or the same permission error in production mode, is
+//     returned unchanged so the caller fails closed.
+func (m *Manager) prepareSecrets(payload RunConfig, secrets map[string]string) (secretDelivery, error) {
 	dir := m.cfg.SecretsDir
 	if dir == "" {
-		dir = "/var/run/cm-runner/secrets"
+		dir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
 	}
 
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create secrets dir: %w", err)
+	if err := m.mkdirAll(dir, 0o700); err != nil {
+		if isPermissionDenied(err) && m.cfg.IsDev() {
+			m.logger.Warn("dev profile: secrets_dir not writable, falling back to env-var delivery",
+				"dir", dir, "error", err)
+
+			return secretDelivery{Mode: secretModeEnvVar, EnvVars: secretsToEnvVars(secrets)}, nil
+		}
+
+		return secretDelivery{}, fmt.Errorf("create secrets dir: %w", err)
 	}
 
 	// A 16-byte random nonce avoids collisions if the same card_id is
 	// re-triggered while a previous file is still being unlinked.
 	var nonce [8]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return "", fmt.Errorf("generate secrets nonce: %w", err)
+		return secretDelivery{}, fmt.Errorf("generate secrets nonce: %w", err)
 	}
 
 	base := sanitizeContainerName(payload.Project, payload.CardID) + "-" + hex.EncodeToString(nonce[:]) + ".env"
 	path := filepath.Join(dir, base)
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
+	f, err := m.createFile(path)
 	if err != nil {
-		return "", fmt.Errorf("open secrets file: %w", err)
+		if isPermissionDenied(err) && m.cfg.IsDev() {
+			m.logger.Warn("dev profile: secrets_dir not writable, falling back to env-var delivery",
+				"dir", dir, "error", err)
+
+			return secretDelivery{Mode: secretModeEnvVar, EnvVars: secretsToEnvVars(secrets)}, nil
+		}
+
+		return secretDelivery{}, fmt.Errorf("open secrets file: %w", err)
 	}
 
 	// Deterministic iteration for stable tests and reviewable diffs.
@@ -576,34 +636,53 @@ func (m *Manager) writeSecretsFile(payload RunConfig, secrets map[string]string)
 			_ = f.Close()
 			_ = os.Remove(path)
 
-			return "", fmt.Errorf("write secret %s: %w", k, werr)
+			return secretDelivery{}, fmt.Errorf("write secret %s: %w", k, werr)
 		}
 	}
 
 	if err := f.Close(); err != nil {
 		_ = os.Remove(path)
 
-		return "", fmt.Errorf("close secrets file: %w", err)
+		return secretDelivery{}, fmt.Errorf("close secrets file: %w", err)
 	}
 
-	return path, nil
+	return secretDelivery{Mode: secretModeFile, FilePath: path}, nil
 }
 
-// shellSingleQuoteEscape returns s with every `'` replaced by `'\”` so the
+// secretsToEnvVars converts a secrets map to a sorted slice of KEY=VALUE
+// strings suitable for appending to container.Config.Env.
+func secretsToEnvVars(secrets map[string]string) []string {
+	keys := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	vars := make([]string, 0, len(secrets))
+	for _, k := range keys {
+		vars = append(vars, k+"="+secrets[k])
+	}
+
+	return vars
+}
+
+// shellSingleQuoteEscape returns s with every `'` replaced by `'\"` so the
 // result can be safely embedded inside a single-quoted shell string.
 func shellSingleQuoteEscape(s string) string {
 	return strings.ReplaceAll(s, `'`, `'\''`)
 }
 
 // removeSecretsFile best-effort unlinks the per-container secrets file from
-// the host. No-op if path is empty.
-func (m *Manager) removeSecretsFile(path string, log *slog.Logger) {
-	if path == "" {
+// the host. No-op for env-var delivery (nothing to unlink) or if the file
+// path is empty.
+func (m *Manager) removeSecretsFile(d secretDelivery, log *slog.Logger) {
+	if d.Mode == secretModeEnvVar || d.FilePath == "" {
 		return
 	}
 
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		log.Warn("failed to remove secrets file", "path", path, "error", err)
+	if err := os.Remove(d.FilePath); err != nil && !os.IsNotExist(err) {
+		log.Warn("failed to remove secrets file", "path", d.FilePath, "error", err)
 	}
 }
 
@@ -630,7 +709,7 @@ func buildPrimingContent(payload RunConfig) string {
 	return content
 }
 
-func (m *Manager) waitAndCleanup(ctx context.Context, containerID, secretsPath string, payload RunConfig, secrets []string, log *slog.Logger) string {
+func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, delivery secretDelivery, payload RunConfig, secrets []string, log *slog.Logger) string {
 	// Defers run LIFO, so the declared order here is the REVERSE of the
 	// execution order. We want the tracker entry to disappear first so
 	// `/message`, `/promote`, and `/end-session` requests that race with
@@ -648,7 +727,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID, secretsPath s
 
 		m.removeContainer(rmCtx, containerID, log)
 	}()
-	defer m.removeSecretsFile(secretsPath, log)
+	defer m.removeSecretsFile(delivery, log)
 	defer m.tracker.Remove(payload.Project, payload.CardID)
 
 	// Stream container logs in real time.
