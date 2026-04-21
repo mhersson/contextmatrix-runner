@@ -11,8 +11,6 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	dockertypes "github.com/docker/docker/api/types"
 )
 
 // HijackedResponse wraps the Docker SDK's hijacked connection and exposes only
@@ -43,7 +41,11 @@ type DockerClient interface {
 	// the escape hatch for cases where the SDK does not recover on its own.
 	Ping(ctx context.Context) error
 	ImagePull(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error)
-	ImageInspectWithRaw(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error)
+	// ImageInspect returns image metadata. The manager only uses this to
+	// confirm presence (nil error = image exists locally); the full
+	// response is not consumed today but is threaded through the interface
+	// so tests can assert inspection calls happened.
+	ImageInspect(ctx context.Context, imageID string) (image.InspectResponse, error)
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error)
 	ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error
 	ContainerWait(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
@@ -100,8 +102,8 @@ func (c *RealDockerClient) ImagePull(ctx context.Context, ref string, options im
 	return c.cli.ImagePull(ctx, ref, options)
 }
 
-func (c *RealDockerClient) ImageInspectWithRaw(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error) {
-	return c.cli.ImageInspectWithRaw(ctx, imageID)
+func (c *RealDockerClient) ImageInspect(ctx context.Context, imageID string) (image.InspectResponse, error) {
+	return c.cli.ImageInspect(ctx, imageID)
 }
 
 func (c *RealDockerClient) ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error) {

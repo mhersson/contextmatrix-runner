@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"testing"
 
-	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -41,12 +40,12 @@ type fakeDocker struct {
 
 func (f *fakeDocker) Ping(_ context.Context) error { return f.pingErr }
 
-func (f *fakeDocker) ImageInspectWithRaw(_ context.Context, imageID string) (dockertypes.ImageInspect, []byte, error) {
+func (f *fakeDocker) ImageInspect(_ context.Context, imageID string) (image.InspectResponse, error) {
 	if f.inspected != nil {
 		*f.inspected = imageID
 	}
 
-	return dockertypes.ImageInspect{}, nil, f.inspectErr
+	return image.InspectResponse{}, f.inspectErr
 }
 
 func (f *fakeDocker) ImagePull(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {

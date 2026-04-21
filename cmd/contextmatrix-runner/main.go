@@ -540,7 +540,7 @@ func buildProbes(cfg *config.Config, docker container.DockerClient, tokenProvide
 	// images at /trigger time, so there is nothing to verify up front.
 	if cfg.ImagePullPolicy == config.PullNever {
 		probes.ImageInspect = func(ctx context.Context) error {
-			_, _, err := docker.ImageInspectWithRaw(ctx, cfg.BaseImage)
+			_, err := docker.ImageInspect(ctx, cfg.BaseImage)
 
 			return err
 		}

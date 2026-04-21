@@ -1248,7 +1248,7 @@ func (m *Manager) pullImage(ctx context.Context, img string) error {
 	}
 
 	if policy == config.PullIfNotPresent {
-		if _, _, err := m.docker.ImageInspectWithRaw(ctx, img); err == nil {
+		if _, err := m.docker.ImageInspect(ctx, img); err == nil {
 			m.logger.Debug("image already present locally, skipping pull", "image", img)
 
 			return nil

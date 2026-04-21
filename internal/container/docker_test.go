@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 
-	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -22,18 +21,18 @@ import (
 // the field explicitly (see helpers like newSuccessfulMock below or configure
 // it inline).
 type MockDockerClient struct {
-	PingFn                func(ctx context.Context) error
-	ImagePullFn           func(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error)
-	ImageInspectWithRawFn func(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error)
-	ContainerCreateFn     func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error)
-	ContainerStartFn      func(ctx context.Context, containerID string, options container.StartOptions) error
-	ContainerWaitFn       func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
-	ContainerStopFn       func(ctx context.Context, containerID string, options container.StopOptions) error
-	ContainerRemoveFn     func(ctx context.Context, containerID string, options container.RemoveOptions) error
-	ContainerLogsFn       func(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
-	ContainerListFn       func(ctx context.Context, options container.ListOptions) ([]DockerContainer, error)
-	ContainerAttachFn     func(ctx context.Context, containerID string, options container.AttachOptions) (*HijackedResponse, error)
-	ImagesPruneFn         func(ctx context.Context, pruneFilter filters.Args) (image.PruneReport, error)
+	PingFn            func(ctx context.Context) error
+	ImagePullFn       func(ctx context.Context, ref string, options image.PullOptions) (io.ReadCloser, error)
+	ImageInspectFn    func(ctx context.Context, imageID string) (image.InspectResponse, error)
+	ContainerCreateFn func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error)
+	ContainerStartFn  func(ctx context.Context, containerID string, options container.StartOptions) error
+	ContainerWaitFn   func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
+	ContainerStopFn   func(ctx context.Context, containerID string, options container.StopOptions) error
+	ContainerRemoveFn func(ctx context.Context, containerID string, options container.RemoveOptions) error
+	ContainerLogsFn   func(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
+	ContainerListFn   func(ctx context.Context, options container.ListOptions) ([]DockerContainer, error)
+	ContainerAttachFn func(ctx context.Context, containerID string, options container.AttachOptions) (*HijackedResponse, error)
+	ImagesPruneFn     func(ctx context.Context, pruneFilter filters.Args) (image.PruneReport, error)
 }
 
 func (m *MockDockerClient) Ping(ctx context.Context) error {
@@ -52,12 +51,12 @@ func (m *MockDockerClient) ImagePull(ctx context.Context, ref string, options im
 	panic("MockDockerClient.ImagePull not configured")
 }
 
-func (m *MockDockerClient) ImageInspectWithRaw(ctx context.Context, imageID string) (dockertypes.ImageInspect, []byte, error) {
-	if m.ImageInspectWithRawFn != nil {
-		return m.ImageInspectWithRawFn(ctx, imageID)
+func (m *MockDockerClient) ImageInspect(ctx context.Context, imageID string) (image.InspectResponse, error) {
+	if m.ImageInspectFn != nil {
+		return m.ImageInspectFn(ctx, imageID)
 	}
 
-	panic("MockDockerClient.ImageInspectWithRaw not configured")
+	panic("MockDockerClient.ImageInspect not configured")
 }
 
 func (m *MockDockerClient) ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkConfig *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error) {
@@ -154,8 +153,8 @@ func successfulMock() *MockDockerClient {
 		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
 			return io.NopCloser(io.LimitReader(nil, 0)), nil
 		},
-		ImageInspectWithRawFn: func(_ context.Context, _ string) (dockertypes.ImageInspect, []byte, error) {
-			return dockertypes.ImageInspect{}, nil, nil
+		ImageInspectFn: func(_ context.Context, _ string) (image.InspectResponse, error) {
+			return image.InspectResponse{}, nil
 		},
 		ContainerCreateFn: func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			return container.CreateResponse{ID: "mock-container-id"}, nil
