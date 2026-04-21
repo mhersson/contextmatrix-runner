@@ -24,6 +24,12 @@ const (
 	PullIfNotPresent = "if-not-present"
 )
 
+// DeploymentProfile constants define the two supported operational modes.
+const (
+	ProfileProduction = "production"
+	ProfileDev        = "dev"
+)
+
 // Config holds all runner configuration.
 type Config struct {
 	Port                 int       `yaml:"port"`
@@ -75,6 +81,12 @@ type Config struct {
 	// mode). See CTXRUN-048. Set false ONLY while the ContextMatrix
 	// server is being upgraded to accept HMAC on that GET endpoint.
 	UseHMACForVerifyAutonomous bool `yaml:"use_hmac_for_verify_autonomous"`
+
+	// DeploymentProfile selects the operational mode: "production" (default,
+	// strict) or "dev" (loosens validators for local single-box setups).
+	// Follow-up subtasks document which specific validators are relaxed in
+	// dev mode. Env: CMR_DEPLOYMENT_PROFILE.
+	DeploymentProfile string `yaml:"deployment_profile"`
 
 	containerTimeoutDuration time.Duration
 }
@@ -128,6 +140,7 @@ func Load(path string) (*Config, error) {
 		IdleOutputTimeout:          30 * time.Minute,
 		MaintenanceInterval:        10 * time.Minute,
 		UseHMACForVerifyAutonomous: true,
+		DeploymentProfile:          ProfileProduction,
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -167,6 +180,10 @@ func (c *Config) LogLevelSlog() slog.Level {
 
 	return lvl
 }
+
+// IsDev returns true when the runner is configured in dev mode.
+// Dev mode loosens certain validators for local single-box setups.
+func (c *Config) IsDev() bool { return c.DeploymentProfile == ProfileDev }
 
 // Validate checks that all required fields are present and valid.
 func (c *Config) Validate() error {
@@ -255,6 +272,16 @@ func (c *Config) Validate() error {
 		// ok
 	default:
 		return fmt.Errorf("log_format must be one of: text, json")
+	}
+
+	switch c.DeploymentProfile {
+	case "", ProfileProduction, ProfileDev:
+		// Normalise empty to production.
+		if c.DeploymentProfile == "" {
+			c.DeploymentProfile = ProfileProduction
+		}
+	default:
+		return fmt.Errorf("deployment_profile must be one of: production, dev")
 	}
 
 	d, err := time.ParseDuration(c.ContainerTimeout)
@@ -462,5 +489,9 @@ func applyEnvOverrides(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.AdminPort = n
 		}
+	}
+
+	if v := os.Getenv("CMR_DEPLOYMENT_PROFILE"); v != "" {
+		cfg.DeploymentProfile = v
 	}
 }

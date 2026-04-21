@@ -842,6 +842,89 @@ func TestValidate_BaseImageDigestPin(t *testing.T) {
 	}
 }
 
+// TestDeploymentProfile covers the deployment_profile field: defaults, accepted
+// values, rejection of unknown values, env override, and the IsDev() helper.
+func TestDeploymentProfile(t *testing.T) {
+	t.Run("default is production when unset in YAML", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		path := writeConfig(t, dir, validConfig(pemPath, dir))
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileProduction, cfg.DeploymentProfile)
+	})
+
+	t.Run("explicit production is accepted", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: production\n"
+		path := writeConfig(t, dir, content)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileProduction, cfg.DeploymentProfile)
+		assert.False(t, cfg.IsDev())
+	})
+
+	t.Run("explicit dev is accepted and IsDev returns true", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: dev\n"
+		path := writeConfig(t, dir, content)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileDev, cfg.DeploymentProfile)
+		assert.True(t, cfg.IsDev())
+	})
+
+	t.Run("unknown value staging is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: staging\n"
+		path := writeConfig(t, dir, content)
+		_, err := Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "deployment_profile must be one of: production, dev")
+	})
+
+	t.Run("env override CMR_DEPLOYMENT_PROFILE=dev takes precedence over YAML production", func(t *testing.T) {
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+
+		content := validConfig(pemPath, dir) + "\ndeployment_profile: production\n"
+		path := writeConfig(t, dir, content)
+
+		t.Setenv("CMR_DEPLOYMENT_PROFILE", "dev")
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, ProfileDev, cfg.DeploymentProfile)
+		assert.True(t, cfg.IsDev())
+	})
+}
+
+// TestIsDev verifies that IsDev returns true only for the "dev" profile.
+func TestIsDev(t *testing.T) {
+	tests := []struct {
+		profile string
+		want    bool
+	}{
+		{profile: "", want: false},
+		{profile: ProfileProduction, want: false},
+		{profile: ProfileDev, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run("profile="+tt.profile, func(t *testing.T) {
+			cfg := &Config{DeploymentProfile: tt.profile}
+			assert.Equal(t, tt.want, cfg.IsDev())
+		})
+	}
+}
+
 // TestValidate_AllowedImagesDigestPin ensures every entry in the
 // allowed_images allowlist is digest-pinned, not just base_image. A single
 // tag-only entry must fail validation so H2's "allowlist matches strings
