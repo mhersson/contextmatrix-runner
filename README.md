@@ -295,6 +295,68 @@ github_app:
 log_level: "info"
 ```
 
+## Deployment profiles
+
+The runner operates in one of two modes, set via `deployment_profile` in
+`config.yaml` (or `CMR_DEPLOYMENT_PROFILE` env var). The default is
+`production`.
+
+| Profile | Behaviour |
+| ------- | --------- |
+| `production` | All validators enforced at full strength. No change from pre-feature behaviour. |
+| `dev` | Five validators relaxed for local single-box setups. Every relaxation logs a startup or per-request line — nothing is silent. |
+
+`deployment_profile: production` (or unset) is byte-identical to the
+pre-feature behaviour.
+
+### Dev-mode relaxations
+
+1. **Unpinned image tags accepted** — `base_image`/`allowed_images` may use
+   mutable tags (e.g. `contextmatrix/worker:latest`). Each unpinned reference
+   logs on startup:
+   `level=WARN msg="dev profile: accepting unpinned image reference" field=base_image image=...`
+
+2. **Empty `allowed_mcp_hosts` is allow-any** — instead of fail-closing every
+   `/trigger`, any well-formed `https://` MCP host is accepted. The first
+   request for each unique host logs:
+   `level=INFO msg="dev profile: mcp host seen" host=...`
+
+3. **Wider HMAC replay window** — `webhook_replay_skew_seconds` defaults to
+   86400 (24 h) instead of 330 s, so a laptop that slept still processes
+   webhooks. `image_pull_policy` defaults to `if-not-present` instead of
+   `never`. Applied defaults are listed at startup:
+   `level=INFO msg="dev profile: applied defaults" defaults=[webhook_replay_skew_seconds=86400 image_pull_policy=if-not-present]`
+
+4. **Configurable HMAC skew** — the skew from `webhook_replay_skew_seconds` is
+   now threaded into HMAC verification (previously hardcoded to 5 min), so the
+   wider dev-mode window actually takes effect.
+
+5. **`secrets_dir` env-var fallback** — if the runner cannot write to
+   `secrets_dir` (e.g. a `systemctl --user` service on a read-only `/var/run`),
+   it falls back to delivering secrets as container env vars instead of a bind
+   mount, with a WARN:
+   `level=WARN msg="dev profile: secrets_dir not writable, falling back to env-var delivery" dir=... error=...`
+   Production mode still fails closed on this error.
+
+### Minimal dev-mode config
+
+A first-time user needs only these fields:
+
+```yaml
+deployment_profile: dev
+
+contextmatrix_url: "https://your-cm-instance"
+api_key: "your-shared-secret-at-least-32-chars"
+base_image: "contextmatrix/worker:latest"
+
+anthropic_api_key: "sk-ant-..."   # or claude_auth_dir / claude_oauth_token
+
+github_app:
+  app_id: 123456
+  installation_id: 78901234
+  private_key_path: "/path/to/app.pem"
+```
+
 ## ContextMatrix Configuration
 
 On the ContextMatrix side, configure the runner connection in `config.yaml`:

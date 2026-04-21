@@ -12,8 +12,9 @@
 #
 # dev        — loosens selected validators for local single-box setups (e.g.
 #              a developer laptop running a private ContextMatrix instance).
-#              Follow-up configuration guide documents which specific checks
-#              are relaxed. Do NOT use in production.
+#              See "Deployment profiles" in README.md for the full list of
+#              relaxed checks and the startup log lines each one emits.
+#              Do NOT use in production.
 #
 # Env: CMR_DEPLOYMENT_PROFILE
 # deployment_profile: production
