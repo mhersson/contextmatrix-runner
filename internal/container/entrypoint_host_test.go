@@ -15,8 +15,23 @@ import (
 
 // hostExtractionSnippet is the shell snippet that extracts the git host from
 // CM_REPO_URL. This must match the logic in docker/entrypoint.sh exactly.
+// We use parameter expansion + a `case` allowlist rather than sed because
+// sed is line-oriented: a newline in the input would yield a multi-line
+// value that is catastrophic when interpolated into a .netrc/credential
+// helper. See CTXRUN-043.
 const hostExtractionSnippet = `
-GIT_HOST=$(printf '%s' "${CM_REPO_URL:-}" | sed -n 's#^https://\([^/]*\)/.*#\1#p')
+GIT_HOST=""
+case "${CM_REPO_URL:-}" in
+    https://*)
+        _rest="${CM_REPO_URL#https://}"
+        GIT_HOST="${_rest%%/*}"
+        ;;
+esac
+case "$GIT_HOST" in
+    -*|*[!A-Za-z0-9.-]*)
+        GIT_HOST=""
+        ;;
+esac
 [ -z "$GIT_HOST" ] && GIT_HOST="github.com"
 printf '%s' "$GIT_HOST"
 `
@@ -79,6 +94,20 @@ func TestEntrypointGitHostExtraction(t *testing.T) {
 			cmRepoURL: "git@github.com:org/repo.git",
 			wantHost:  "github.com",
 		},
+		{
+			// CTXRUN-043: a newline in the host would inject a second
+			// `machine` clause into .netrc / a second line into the
+			// credential helper. The case-based extractor must reject
+			// any such value and fall back to github.com.
+			name:      "newline in host rejects and falls back",
+			cmRepoURL: "https://evil\nhost/org/repo.git",
+			wantHost:  "github.com",
+		},
+		{
+			name:      "host with ; injection rejects and falls back",
+			cmRepoURL: "https://host;rm -rf/.git/",
+			wantHost:  "github.com",
+		},
 	}
 
 	for _, tc := range cases {
@@ -88,6 +117,90 @@ func TestEntrypointGitHostExtraction(t *testing.T) {
 				"CM_REPO_URL=%q: want GIT_HOST=%q, got %q", tc.cmRepoURL, tc.wantHost, got)
 		})
 	}
+}
+
+// branchValidatorSnippet mirrors the case-based CM_BASE_BRANCH validator in
+// docker/entrypoint.sh. It exits 0 on accept, 1 on reject.
+const branchValidatorSnippet = `
+case "${CM_BASE_BRANCH:-}" in
+    "") exit 0 ;;
+    -*|*[!A-Za-z0-9._/-]*) exit 1 ;;
+esac
+exit 0
+`
+
+// TestEntrypointBranchValidator verifies the new case-based branch validator
+// rejects injection payloads that the old grep-based one would let through.
+// Feeding a literal newline to the subshell via CM_BASE_BRANCH covers C6.
+func TestEntrypointBranchValidator(t *testing.T) {
+	cases := []struct {
+		name      string
+		branch    string
+		wantAllow bool
+	}{
+		{"plain main", "main", true},
+		{"slash feature branch", "feature/my-branch", true},
+		{"dots and underscore", "release_1.2.3", true},
+		{"empty allowed", "", true},
+		{"leading dash rejected", "-rf", false},
+		{"whitespace rejected", "foo bar", false},
+		{"newline rejected", "main\n--upload-pack=evil", false},
+		{"carriage return rejected", "main\r--upload-pack=evil", false},
+		{"NUL rejected", "main\x00", false},
+		{"semicolon rejected", "main;id", false},
+		{"dollar rejected", "$(whoami)", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.CommandContext(context.Background(), "sh", "-c", branchValidatorSnippet)
+
+			cmd.Env = append(os.Environ(), "CM_BASE_BRANCH="+tc.branch)
+
+			err := cmd.Run()
+			if tc.wantAllow {
+				assert.NoError(t, err, "branch %q should be allowed", tc.branch)
+			} else {
+				assert.Error(t, err, "branch %q should be rejected", tc.branch)
+			}
+		})
+	}
+}
+
+// TestEntrypointBranchValidatorInSource verifies the case-pattern string is
+// present verbatim in docker/entrypoint.sh so refactors cannot silently
+// regress the validator to a line-oriented grep.
+func TestEntrypointBranchValidatorInSource(t *testing.T) {
+	path := entrypointPath(t)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err, "reading entrypoint.sh")
+
+	src := string(content)
+
+	// The new whole-string case pattern.
+	assert.Contains(t, src, `-*|*[!A-Za-z0-9._/-]*`,
+		"entrypoint.sh must validate CM_BASE_BRANCH with a whole-string case pattern")
+
+	// The old grep-based validator must be gone.
+	assert.NotContains(t, src, `grep -qE '^-|[[:space:]]'`,
+		"entrypoint.sh must not use the legacy grep-based branch validator (CTXRUN-043)")
+}
+
+// TestEntrypointSecretsFileSourcing verifies the entrypoint reads the tmpfs
+// secrets file at /run/cm-secrets/env when present.
+func TestEntrypointSecretsFileSourcing(t *testing.T) {
+	path := entrypointPath(t)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err, "reading entrypoint.sh")
+
+	src := string(content)
+
+	assert.Contains(t, src, `CM_SECRETS_FILE="/run/cm-secrets/env"`,
+		"entrypoint.sh must define the CM_SECRETS_FILE path")
+	assert.Contains(t, src, `. "$CM_SECRETS_FILE"`,
+		"entrypoint.sh must source the secrets file")
+	assert.Contains(t, src, `unset CM_GIT_TOKEN CM_MCP_API_KEY`,
+		"entrypoint.sh must unset transient secrets before exec claude")
 }
 
 // TestEntrypointUsesDynamicGitHost verifies that docker/entrypoint.sh no
@@ -104,9 +217,17 @@ func TestEntrypointUsesDynamicGitHost(t *testing.T) {
 	assert.NotContains(t, src, "machine github.com",
 		"entrypoint.sh must not hardcode 'machine github.com'; it should use $GIT_HOST")
 
-	// Must contain the dynamic host-extraction sed snippet.
-	assert.Contains(t, src, "sed -n 's#^https://\\([^/]*\\)/.*#\\1#p'",
-		"entrypoint.sh must contain the host-extraction sed snippet")
+	// Must NOT use the legacy sed-based host extraction (CTXRUN-043:
+	// sed is line-oriented, so a newline in CM_REPO_URL could yield a
+	// multi-line value. Parameter expansion + case allowlist is required).
+	assert.NotContains(t, src, "sed -n 's#^https://",
+		"entrypoint.sh must not use sed for host extraction (CTXRUN-043)")
+
+	// Must derive GIT_HOST via parameter expansion.
+	assert.Contains(t, src, `_rest="${CM_REPO_URL#https://}"`,
+		"entrypoint.sh must extract host via parameter expansion")
+	assert.Contains(t, src, `GIT_HOST="${_rest%%/*}"`,
+		"entrypoint.sh must slice GIT_HOST from _rest via parameter expansion")
 
 	// Must export GH_HOST (required by gh CLI for non-github.com hosts).
 	assert.Contains(t, src, "export GH_HOST=",
@@ -118,127 +239,16 @@ func TestEntrypointUsesDynamicGitHost(t *testing.T) {
 		"entrypoint.sh must not hardcode github.com in url.insteadOf; use $GIT_HOST")
 }
 
-// runEntrypoint executes docker/entrypoint.sh in an isolated environment where
-// both "claude" and "git" are replaced by minimal mock scripts. The mock
-// "claude" writes its full argument list to argFile; the mock "git" handles
-// "clone" by creating /home/user/workspace and silently succeeds for everything
-// else (config, etc.). The function returns the content of argFile so callers
-// can assert on which flags claude was invoked with.
-func runEntrypoint(t *testing.T, extraEnv []string) string {
-	t.Helper()
-
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not available")
-	}
-
-	ep := entrypointPath(t)
-
-	// Temp dir for mock binaries and output.
-	tmpDir := t.TempDir()
-	argFile := filepath.Join(tmpDir, "claude-args.txt")
-	workspace := filepath.Join(tmpDir, "workspace")
-
-	// Mock claude: writes all args to argFile then exits 0.
-	claudeMock := filepath.Join(tmpDir, "claude")
-	claudeScript := "#!/bin/bash\nprintf '%s\\n' \"$@\" > " + argFile + "\nexit 0\n"
-	err := os.WriteFile(claudeMock, []byte(claudeScript), 0o755) //nolint:gosec
-	require.NoError(t, err, "writing mock claude")
-
-	// Mock git: for "clone" create the workspace dir; for everything else succeed silently.
-	gitMock := filepath.Join(tmpDir, "git")
-	gitScript := "#!/bin/bash\nif [ \"$1\" = \"clone\" ]; then\n    mkdir -p " + workspace + "\n    exit 0\nfi\nexit 0\n"
-	err = os.WriteFile(gitMock, []byte(gitScript), 0o755) //nolint:gosec
-	require.NoError(t, err, "writing mock git")
-
-	// Mock jq: needed for MCP config construction — return harmless JSON.
-	jqMock := filepath.Join(tmpDir, "jq")
-	jqScript := "#!/bin/bash\necho '{}'\nexit 0\n"
-	err = os.WriteFile(jqMock, []byte(jqScript), 0o755) //nolint:gosec
-	require.NoError(t, err, "writing mock jq")
-
-	// Base env: clear PATH to only our mocks + minimal system tools.
-	baseEnv := []string{
-		"HOME=" + tmpDir,
-		"PATH=" + tmpDir + ":/usr/bin:/bin",
-		"CM_CARD_ID=TEST-001",
-		"CM_PROJECT=test-project",
-		"CM_MCP_URL=http://localhost:9999/mcp",
-		"CM_REPO_URL=https://github.com/example/repo.git",
-	}
-
-	cmd := exec.CommandContext(context.Background(), "bash", ep)
-
-	cmd.Env = baseEnv
-	cmd.Env = append(cmd.Env, extraEnv...)
-	// entrypoint does "cd /home/user/workspace" after clone; since our mock
-	// creates tmpDir/workspace, we patch the path by intercepting at the shell
-	// level. The entrypoint hardcodes /home/user/workspace in the cd command,
-	// so we pre-create it to avoid a cd failure.
-	require.NoError(t, os.MkdirAll("/home/user/workspace", 0o755), //nolint:gosec
-		"creating /home/user/workspace for test (requires write access or run as root)")
-
-	out, err := cmd.CombinedOutput()
-	// The mock claude exits 0, so the script should succeed. If it fails for
-	// another reason (e.g. missing /home/user/workspace), surface the output.
-	if err != nil {
-		t.Logf("entrypoint output:\n%s", out)
-	}
-
-	require.NoError(t, err, "entrypoint.sh failed")
-
-	raw, err := os.ReadFile(argFile)
-	require.NoError(t, err, "reading captured claude args")
-
-	return string(raw)
-}
-
-// TestEntrypointInteractiveBranching verifies that the CM_INTERACTIVE env var
-// selects the correct claude invocation mode by executing docker/entrypoint.sh
-// with mock binaries. It is gated behind CM_ENTRYPOINT_HOST_TEST=1 because it
-// requires write access to /home/user/workspace on the host, which is not
-// available in all CI environments.
-//
-// The always-on source-inspection guard is TestEntrypointInteractiveContent,
-// which reads entrypoint.sh directly without executing it.
-//
-// To run locally:
-//
-//	CM_ENTRYPOINT_HOST_TEST=1 go test ./internal/container/ -run TestEntrypointInteractiveBranching
-func TestEntrypointInteractiveBranching(t *testing.T) {
-	if os.Getenv("CM_ENTRYPOINT_HOST_TEST") == "" {
-		t.Skip("set CM_ENTRYPOINT_HOST_TEST=1 to run entrypoint host tests (requires write access to /home/user/workspace)")
-	}
-
-	t.Run("one-shot when CM_INTERACTIVE unset", func(t *testing.T) {
-		args := runEntrypoint(t, nil)
-		assert.NotContains(t, args, "--input-format",
-			"one-shot path must not include --input-format")
-		assert.Contains(t, args, "--output-format\nstream-json",
-			"one-shot path must include --output-format stream-json")
-		assert.Contains(t, args, "run-autonomous workflow",
-			"one-shot path must include the autonomous workflow prompt")
-		assert.NotContains(t, args, "Wait for the user's first message",
-			"one-shot path must not include the interactive prompt")
-	})
-
-	t.Run("stream-json input when CM_INTERACTIVE=1", func(t *testing.T) {
-		args := runEntrypoint(t, []string{"CM_INTERACTIVE=1"})
-		assert.Contains(t, args, "--input-format\nstream-json",
-			"interactive path must include --input-format stream-json")
-		assert.Contains(t, args, "--output-format\nstream-json",
-			"interactive path must include --output-format stream-json")
-		assert.Contains(t, args, "A human user may send you approval messages",
-			"interactive path must contain the minimal context hint")
-		assert.NotContains(t, args, "Wait for the user's first message",
-			"interactive path must not tell Claude to wait for the user's first message")
-		assert.NotContains(t, args, "run-autonomous workflow",
-			"interactive path must not include the autonomous workflow prompt")
-	})
-}
-
 // TestEntrypointInteractiveContent verifies the branching structure directly in
 // the entrypoint.sh source without executing the script — no filesystem
 // dependencies required.
+//
+// The previous TestEntrypointInteractiveBranching that executed entrypoint.sh
+// via bash+mocks was removed as part of CTXRUN-057: it was gated behind
+// CM_ENTRYPOINT_HOST_TEST=1, required write access to /home/user/workspace on
+// the host, and duplicated the same assertions that this source-inspection
+// test already covers. Keeping the dead-gated runner path made the file harder
+// to reason about; this source-level check is sufficient.
 func TestEntrypointInteractiveContent(t *testing.T) {
 	path := entrypointPath(t)
 	content, err := os.ReadFile(path)

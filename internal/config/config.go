@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -26,10 +27,12 @@ const (
 // Config holds all runner configuration.
 type Config struct {
 	Port                 int       `yaml:"port"`
+	AdminPort            int       `yaml:"admin_port"`
 	ContextMatrixURL     string    `yaml:"contextmatrix_url"`
 	APIKey               string    `yaml:"api_key"`
 	BaseImage            string    `yaml:"base_image"`
 	AllowedImages        []string  `yaml:"allowed_images"`
+	AllowedMCPHosts      []string  `yaml:"allowed_mcp_hosts"`
 	ImagePullPolicy      string    `yaml:"image_pull_policy"`
 	MaxConcurrent        int       `yaml:"max_concurrent"`
 	ContainerTimeout     string    `yaml:"container_timeout"`
@@ -42,9 +45,45 @@ type Config struct {
 	GitHubApp            GitHubApp `yaml:"github_app"`
 	GitHubPAT            GitHubPAT `yaml:"github_pat"`
 	LogLevel             string    `yaml:"log_level"`
+	LogFormat            string    `yaml:"log_format"`
+	// SecretsDir is the host directory where per-container secrets files
+	// are written. Each file is bind-mounted read-only into its container
+	// at /run/cm-secrets/env so the values never appear in HostConfig.Env
+	// (and therefore not in `docker inspect`). Should be on tmpfs.
+	SecretsDir string `yaml:"secrets_dir"`
+
+	// Webhook replay-protection tunables. See CTXRUN-047.
+	WebhookReplayCacheSize   int `yaml:"webhook_replay_cache_size"`
+	WebhookReplaySkewSeconds int `yaml:"webhook_replay_skew_seconds"`
+	MessageDedupCacheSize    int `yaml:"message_dedup_cache_size"`
+	MessageDedupTTLSeconds   int `yaml:"message_dedup_ttl_seconds"`
+
+	// Idle-output watchdog (CTXRUN-058, H15). If a container's logparser
+	// has not published any event in this many seconds, the watchdog kills
+	// the container with an "idle timeout" reason. Zero or negative
+	// disables the watchdog.
+	IdleOutputTimeout time.Duration `yaml:"idle_output_timeout"`
+
+	// MaintenanceInterval is the tick interval for the background
+	// reconcile-and-prune loop (CTXRUN-058, M12). Each tick runs
+	// CleanupOrphans and PruneImages. Must be positive.
+	MaintenanceInterval time.Duration `yaml:"maintenance_interval"`
+
+	// UseHMACForVerifyAutonomous toggles whether the VerifyAutonomous
+	// callback to CM is HMAC-signed (true, default) or falls back to
+	// `Authorization: Bearer <api_key>` (false, deprecated transition
+	// mode). See CTXRUN-048. Set false ONLY while the ContextMatrix
+	// server is being upgraded to accept HMAC on that GET endpoint.
+	UseHMACForVerifyAutonomous bool `yaml:"use_hmac_for_verify_autonomous"`
 
 	containerTimeoutDuration time.Duration
 }
+
+// Log format constants.
+const (
+	LogFormatText = "text"
+	LogFormatJSON = "json"
+)
 
 // GitHubApp holds GitHub App credentials for generating installation tokens.
 type GitHubApp struct {
@@ -67,14 +106,28 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
+	// defaultSecretsDir is a filesystem PATH, not a credential. It is named
+	// via a const to avoid the gosec G101 false-positive on struct literals.
+	const defaultSecretsDir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
+
 	cfg := &Config{
-		Port:                 9090,
-		ImagePullPolicy:      PullNever,
-		MaxConcurrent:        3,
-		ContainerTimeout:     "2h",
-		ContainerMemoryLimit: 8 * 1024 * 1024 * 1024, // 8 GiB
-		ContainerPidsLimit:   512,
-		LogLevel:             "info",
+		Port:                       9090,
+		AdminPort:                  9091,
+		ImagePullPolicy:            PullNever,
+		MaxConcurrent:              3,
+		ContainerTimeout:           "2h",
+		ContainerMemoryLimit:       8 * 1024 * 1024 * 1024, // 8 GiB
+		ContainerPidsLimit:         512,
+		LogLevel:                   "info",
+		LogFormat:                  LogFormatText,
+		WebhookReplayCacheSize:     10000,
+		WebhookReplaySkewSeconds:   330,
+		MessageDedupCacheSize:      1000,
+		MessageDedupTTLSeconds:     600,
+		SecretsDir:                 defaultSecretsDir,
+		IdleOutputTimeout:          30 * time.Minute,
+		MaintenanceInterval:        10 * time.Minute,
+		UseHMACForVerifyAutonomous: true,
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -103,18 +156,16 @@ func (c *Config) ParseContainerTimeout() {
 	}
 }
 
-// LogLevelSlog returns the slog.Level for the configured log level.
+// LogLevelSlog returns the slog.Level for the configured log level. An
+// unknown value leaves lvl at its zero value (LevelInfo), matching the
+// previous switch-default behaviour; we ignore the UnmarshalText error for
+// the same reason.
 func (c *Config) LogLevelSlog() slog.Level {
-	switch c.LogLevel {
-	case "debug":
-		return slog.LevelDebug
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
+	var lvl slog.Level
+
+	_ = lvl.UnmarshalText([]byte(c.LogLevel))
+
+	return lvl
 }
 
 // Validate checks that all required fields are present and valid.
@@ -135,6 +186,20 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("base_image is required")
 	}
 
+	// Digest-pin base_image and every allowed_images entry (CTXRUN-044).
+	// A mutable tag like `:latest` would let a rebuilt upstream image
+	// silently ship into production; require `@sha256:...` so operators
+	// roll base images intentionally.
+	if err := requireDigestPin("base_image", c.BaseImage); err != nil {
+		return err
+	}
+
+	for i, img := range c.AllowedImages {
+		if err := requireDigestPin(fmt.Sprintf("allowed_images[%d]", i), img); err != nil {
+			return err
+		}
+	}
+
 	switch c.ImagePullPolicy {
 	case PullAlways, PullNever, PullIfNotPresent:
 	default:
@@ -145,12 +210,76 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_concurrent must be at least 1")
 	}
 
+	// Replay-protection tunables default silently when unset so hand-
+	// crafted configs (and tests that construct Config literals) don't
+	// have to opt in every time. Only explicit negative values are an
+	// error. Keep defaults in sync with Load().
+	if c.WebhookReplayCacheSize == 0 {
+		c.WebhookReplayCacheSize = 10000
+	}
+
+	if c.WebhookReplaySkewSeconds == 0 {
+		c.WebhookReplaySkewSeconds = 330
+	}
+
+	if c.MessageDedupCacheSize == 0 {
+		c.MessageDedupCacheSize = 1000
+	}
+
+	if c.MessageDedupTTLSeconds == 0 {
+		c.MessageDedupTTLSeconds = 600
+	}
+
+	if c.WebhookReplayCacheSize < 0 {
+		return fmt.Errorf("webhook_replay_cache_size must be positive")
+	}
+
+	if c.WebhookReplaySkewSeconds < 0 {
+		return fmt.Errorf("webhook_replay_skew_seconds must be positive")
+	}
+
+	if c.MessageDedupCacheSize < 0 {
+		return fmt.Errorf("message_dedup_cache_size must be positive")
+	}
+
+	if c.MessageDedupTTLSeconds < 0 {
+		return fmt.Errorf("message_dedup_ttl_seconds must be positive")
+	}
+
+	if c.AdminPort != 0 && (c.AdminPort < 1 || c.AdminPort > 65535) {
+		return fmt.Errorf("admin_port must be between 1 and 65535")
+	}
+
+	switch c.LogFormat {
+	case "", LogFormatText, LogFormatJSON:
+		// ok
+	default:
+		return fmt.Errorf("log_format must be one of: text, json")
+	}
+
 	d, err := time.ParseDuration(c.ContainerTimeout)
 	if err != nil {
 		return fmt.Errorf("container_timeout is invalid: %w", err)
 	}
 
 	c.containerTimeoutDuration = d
+
+	// Idle-output watchdog (CTXRUN-058). Negative values are an error.
+	// Zero is legal and disables the watchdog.
+	if c.IdleOutputTimeout < 0 {
+		return fmt.Errorf("idle_output_timeout must be zero or positive")
+	}
+
+	// Maintenance loop interval (CTXRUN-058). Default silently when zero so
+	// hand-crafted configs don't have to opt in; negatives are an error.
+	if c.MaintenanceInterval == 0 {
+		c.MaintenanceInterval = 10 * time.Minute
+	}
+
+	if c.MaintenanceInterval < 0 {
+		return fmt.Errorf("maintenance_interval must be positive")
+	}
+
 	if c.ClaudeAuthDir == "" && c.ClaudeOAuthToken == "" && c.AnthropicAPIKey == "" {
 		return fmt.Errorf("at least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key is required")
 	}
@@ -176,6 +305,36 @@ func (c *Config) Validate() error {
 	case appConfigured:
 		if err := c.GitHubApp.validate(); err != nil {
 			return fmt.Errorf("github_app: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// requireDigestPin rejects image references that are not @sha256:... pinned.
+// A valid digest reference has the form <name>@sha256:<64 hex chars>. This
+// closes REVIEW.md H2 (allowlist matches mutable strings) by forcing every
+// image reference the runner accepts to name an immutable content hash.
+func requireDigestPin(field, image string) error {
+	if image == "" {
+		return fmt.Errorf("%s must be @sha256:... pinned (got empty string)", field)
+	}
+
+	at := strings.Index(image, "@sha256:")
+	if at <= 0 {
+		return fmt.Errorf("%s must be @sha256:... pinned (got %q)", field, image)
+	}
+
+	digest := image[at+len("@sha256:"):]
+	if len(digest) != 64 {
+		return fmt.Errorf("%s has invalid sha256 digest length: %q", field, image)
+	}
+
+	for _, r := range digest {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f':
+		default:
+			return fmt.Errorf("%s has non-hex characters in sha256 digest: %q", field, image)
 		}
 	}
 
@@ -289,5 +448,19 @@ func applyEnvOverrides(cfg *Config) {
 
 	if v := os.Getenv("CMR_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
+	}
+
+	if v := os.Getenv("CMR_SECRETS_DIR"); v != "" {
+		cfg.SecretsDir = v
+	}
+
+	if v := os.Getenv("CMR_LOG_FORMAT"); v != "" {
+		cfg.LogFormat = v
+	}
+
+	if v := os.Getenv("CMR_ADMIN_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.AdminPort = n
+		}
 	}
 }

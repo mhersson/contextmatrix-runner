@@ -1,0 +1,38 @@
+# Dependabot config for contextmatrix-runner.
+# Tracks three ecosystems on a weekly cadence:
+#   - gomod            : Go module dependencies at repo root.
+#   - docker           : worker Dockerfile base images + ARG-pinned tools.
+#   - github-actions   : pinned action versions in .github/workflows/*.
+#
+# Paired with CI (.github/workflows/ci.yml). Dependabot bump PRs must pass
+# the same gates as any other PR.
+
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - go
+
+  - package-ecosystem: docker
+    directory: "/docker"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - github-actions

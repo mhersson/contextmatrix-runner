@@ -1,7 +1,12 @@
 package logbroadcast_test
 
 import (
+	"bytes"
+	"context"
+	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,6 +14,73 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type countingObs struct{ n atomic.Uint64 }
+
+func (c *countingObs) ObserveDrop()  { c.n.Add(1) }
+func (c *countingObs) Count() uint64 { return c.n.Load() }
+
+// TestDropLogIsRateLimited verifies that a flood of drops does NOT produce
+// one warn line per drop — only an aggregated line per interval.
+func TestDropLogIsRateLimited(t *testing.T) {
+	var buf safeBuf
+
+	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	logger := slog.New(h)
+
+	obs := &countingObs{}
+
+	// Tight 50ms window so the test runs quickly.
+	b := logbroadcast.NewBroadcasterWithInterval(logger, obs, 50*time.Millisecond)
+
+	defer func() { _ = b.Close(context.Background()) }()
+
+	// Slow subscriber we never drain.
+	_, unsub := b.Subscribe("")
+	defer unsub()
+
+	// Burst 300 entries (> 256 buffer) so every published entry after the
+	// buffer fills gets dropped.
+	for range 300 {
+		b.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			Project:   "p",
+			CardID:    "c",
+			Type:      "text",
+			Content:   "x",
+		})
+	}
+
+	// Give the reporter a couple of ticks to flush.
+	time.Sleep(160 * time.Millisecond)
+
+	// The observer counts every drop.
+	assert.Positive(t, obs.Count(), "drop observer should see every drop")
+
+	// The logger output should contain at most a handful of warn lines — far
+	// fewer than the drop count.
+	logLines := strings.Count(buf.String(), "dropped for slow subscribers")
+	assert.LessOrEqual(t, logLines, 5, "drop log lines should be rate-limited; got %d lines for %d drops", logLines, obs.Count())
+}
+
+type safeBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *safeBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
 
 func makeEntry(project string) logbroadcast.LogEntry {
 	return logbroadcast.LogEntry{
@@ -23,7 +95,7 @@ func makeEntry(project string) logbroadcast.LogEntry {
 // TestSubscribeUnsubscribeLifecycle verifies that a subscriber receives entries
 // before unsubscribing and that its channel is closed afterwards.
 func TestSubscribeUnsubscribeLifecycle(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	ch, unsub := b.Subscribe("")
 	require.Equal(t, 1, b.SubscriberCount())
@@ -53,7 +125,7 @@ func TestSubscribeUnsubscribeLifecycle(t *testing.T) {
 
 // TestDoubleUnsubscribe verifies that calling unsubscribe twice does not panic.
 func TestDoubleUnsubscribe(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 	_, unsub := b.Subscribe("")
 	unsub()
 	assert.NotPanics(t, unsub)
@@ -62,7 +134,7 @@ func TestDoubleUnsubscribe(t *testing.T) {
 // TestFanOutToMultipleSubscribers verifies that a published entry is delivered
 // to all active subscribers.
 func TestFanOutToMultipleSubscribers(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	ch1, unsub1 := b.Subscribe("")
 	ch2, unsub2 := b.Subscribe("")
@@ -90,7 +162,7 @@ func TestFanOutToMultipleSubscribers(t *testing.T) {
 // TestSlowSubscriberDrop verifies that a full subscriber buffer does not cause
 // Publish to block, and that other subscribers are not affected.
 func TestSlowSubscriberDrop(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	// Slow subscriber — we intentionally never read from this channel.
 	_, unsubSlow := b.Subscribe("")
@@ -147,7 +219,7 @@ drain:
 // TestProjectFiltering verifies that a subscriber with a project filter only
 // receives entries for that project, while an all-projects subscriber gets all.
 func TestProjectFiltering(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	chAll, unsubAll := b.Subscribe("")       // receives everything
 	chA, unsubA := b.Subscribe("proj-alpha") // only proj-alpha
@@ -206,7 +278,7 @@ func drainWithTimeout(t *testing.T, ch <-chan logbroadcast.LogEntry, n int, time
 // TestUserEntryFanOutVerbatim verifies that a "user"-typed LogEntry is delivered
 // to all subscribers exactly as published — no content transformation applied.
 func TestUserEntryFanOutVerbatim(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	ch1, unsub1 := b.Subscribe("")
 	ch2, unsub2 := b.Subscribe("")
@@ -242,7 +314,7 @@ func TestUserEntryFanOutVerbatim(t *testing.T) {
 // thinking blocks) and the stderr scanner in container/manager.go.
 // User-typed secrets are the user's own responsibility.
 func TestUserEntryNotRedacted(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	ch, unsub := b.Subscribe("")
 	defer unsub()
@@ -272,7 +344,7 @@ func TestUserEntryNotRedacted(t *testing.T) {
 // TestConcurrentSafety exercises concurrent subscribe/unsubscribe/publish to
 // check for data races (run with -race).
 func TestConcurrentSafety(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	const (
 		goroutines = 20
@@ -283,24 +355,16 @@ func TestConcurrentSafety(t *testing.T) {
 
 	// Publishers.
 	for range goroutines {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for range publishes {
 				b.Publish(makeEntry("proj-concurrent"))
 			}
-		}()
+		})
 	}
 
 	// Concurrent subscribe/unsubscribe.
 	for range goroutines {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			ch, unsub := b.Subscribe("")
 			// Drain to avoid blocking publishers.
 			go func() {
@@ -311,10 +375,78 @@ func TestConcurrentSafety(t *testing.T) {
 
 			time.Sleep(time.Millisecond)
 			unsub()
-		}()
+		})
 	}
 
 	wg.Wait()
 	// After all goroutines finish, subscriber count should be 0.
 	assert.Equal(t, 0, b.SubscriberCount())
+}
+
+// TestPublish_ReleasesLockBeforeSend verifies that Publish snapshots the
+// subscriber set under the lock and then sends outside of it, so a slow
+// subscriber's full channel cannot starve Subscribe / Unsubscribe callers.
+// Under the old RLock-held-during-send pattern, a subscriber that stayed
+// full for the whole test would hold the lock's readers high enough that
+// an incoming Subscribe (which acquires a write lock) would stall until
+// publishing quieted. This test asserts Subscribe returns promptly even
+// while a slow subscriber is backed up. CTXRUN-059 (H25).
+func TestPublish_ReleasesLockBeforeSend(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+
+	// A slow subscriber: we never drain its channel, so after 256 entries
+	// the select's default branch fires. The send itself must not block
+	// because the capacity-256 channel falls back to the drop path; but the
+	// Publish iteration itself should still release the lock before looping.
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	_ = ch // intentionally undrained
+
+	// Start a burst of publishers running for the duration of the test.
+	done := make(chan struct{})
+
+	var pubWG sync.WaitGroup
+
+	for range 4 {
+		pubWG.Go(func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				b.Publish(logbroadcast.LogEntry{
+					Timestamp: time.Now(),
+					Project:   "p",
+					CardID:    "c",
+					Type:      "text",
+					Content:   "x",
+				})
+			}
+		})
+	}
+
+	// Measure how long a Subscribe/Unsubscribe round-trip takes while the
+	// burst is live. The snapshot-outside-lock design keeps this in the
+	// microsecond range; a blocking design would stall for the duration of
+	// a full publisher iteration.
+	deadline := time.Now().Add(2 * time.Second)
+
+	for time.Now().Before(deadline) {
+		start := time.Now()
+		_, u := b.Subscribe("")
+		u()
+
+		elapsed := time.Since(start)
+
+		// Generous slack for CI; the RLock-free-for-writers version runs in
+		// well under 50ms even on the race-detector run.
+		require.Less(t, elapsed, 250*time.Millisecond,
+			"Subscribe+Unsubscribe must not block on a slow Publish loop; got %s", elapsed)
+	}
+
+	close(done)
+	pubWG.Wait()
 }

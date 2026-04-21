@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -25,13 +28,20 @@ import (
 )
 
 func testManager(tr *tracker.Tracker) *container.Manager {
-	cfg := &config.Config{ContainerTimeout: "1h"}
+	cfg := &config.Config{
+		ContainerTimeout: "1h",
+		ImagePullPolicy:  config.PullNever,
+	}
 	cfg.ParseContainerTimeout()
 
 	return container.NewManager(nil, tr, nil, nil, nil, cfg, nil)
 }
 
 const testAPIKey = "test-api-key-that-is-at-least-32-chars"
+
+// testAllowedMCPHosts is the default MCP host allowlist used by handler
+// tests. Keep in sync with the `MCPURL` literals used in request payloads.
+var testAllowedMCPHosts = []string{"cm.example.com"}
 
 func signedRequest(t *testing.T, url string, payload any) *http.Request {
 	t.Helper()
@@ -60,7 +70,7 @@ func TestHmacAuth_MissingSignature(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader("{}"))
 	handler(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestHmacAuth_MissingTimestamp(t *testing.T) {
@@ -74,7 +84,7 @@ func TestHmacAuth_MissingTimestamp(t *testing.T) {
 	req.Header.Set(cmhmac.SignatureHeader, "sha256=abc")
 	handler(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestHmacAuth_InvalidSignature(t *testing.T) {
@@ -89,7 +99,7 @@ func TestHmacAuth_InvalidSignature(t *testing.T) {
 	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
 	handler(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestHmacAuth_ValidSignature(t *testing.T) {
@@ -118,7 +128,7 @@ func TestHmacAuth_ValidSignature(t *testing.T) {
 
 func TestHandleTrigger_MissingFields(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", map[string]string{"card_id": "A-001"})
@@ -136,19 +146,19 @@ func TestHandleTrigger_ConcurrencyLimit(t *testing.T) {
 	// Fill up the tracker.
 	for i := range 3 {
 		_ = tr.Add(&tracker.ContainerInfo{
-			CardID:  "EXIST-" + itoa(i),
+			CardID:  "EXIST-" + strconv.Itoa(i),
 			Project: "proj",
 		})
 	}
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", TriggerPayload{
 		CardID:  "NEW-001",
 		Project: "proj",
-		RepoURL: "git@github.com:org/repo.git",
-		MCPURL:  "http://cm:8080/mcp",
+		RepoURL: "https://github.com/org/repo.git",
+		MCPURL:  "https://cm.example.com/mcp",
 	})
 	h.hmacAuth(h.handleTrigger)(w, req)
 
@@ -162,14 +172,14 @@ func TestHandleTrigger_Duplicate(t *testing.T) {
 		Project: "my-project",
 	})
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", TriggerPayload{
 		CardID:     "PROJ-042",
 		Project:    "my-project",
-		RepoURL:    "git@github.com:org/repo.git",
-		MCPURL:     "http://cm:8080/mcp",
+		RepoURL:    "https://github.com/org/repo.git",
+		MCPURL:     "https://cm.example.com/mcp",
 		BaseBranch: "main",
 	})
 	h.hmacAuth(h.handleTrigger)(w, req)
@@ -190,14 +200,14 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 		Project: "my-project",
 	})
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/trigger", TriggerPayload{
 		CardID:     "PROJ-200",
 		Project:    "my-project",
-		RepoURL:    "git@github.com:org/repo.git",
-		MCPURL:     "http://cm:8080/mcp",
+		RepoURL:    "https://github.com/org/repo.git",
+		MCPURL:     "https://cm.example.com/mcp",
 		BaseBranch: "develop",
 	})
 	h.hmacAuth(h.handleTrigger)(w, req)
@@ -209,12 +219,16 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 	var resp Response
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
-	assert.NotContains(t, resp.Error, "invalid JSON")
+	assert.NotContains(t, resp.Message, "invalid JSON")
 }
 
-func TestHandleKill_NotFound(t *testing.T) {
+// TestHandleKill_IdempotentWhenAlreadyStopped verifies that /kill on a card
+// with no tracked container returns 200 OK (CTXRUN-056 / C8). The old
+// behaviour was 404, which made retry logic in CM harder (a legitimate
+// not-yet-started tracker miss was indistinguishable from a hard failure).
+func TestHandleKill_IdempotentWhenAlreadyStopped(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, nil)
+	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/kill", KillPayload{
@@ -223,14 +237,20 @@ func TestHandleKill_NotFound(t *testing.T) {
 	})
 	h.hmacAuth(h.handleKill)(w, req)
 
-	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp SuccessResponse
+
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+	assert.Contains(t, resp.Message, "no-op")
 }
 
 func TestHandleHealth(t *testing.T) {
 	tr := tracker.New()
 	_ = tr.Add(&tracker.ContainerInfo{CardID: "A-001", Project: "proj"})
 
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), "GET", "/health", nil)
@@ -315,13 +335,13 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := tracker.New()
 			fake := newFakeRunner()
-			h := NewHandler(fake, tr, nil, nil, testAPIKey, 3, nil)
+			h := NewHandler(fake, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 			payload := TriggerPayload{
 				CardID:      "PROJ-100",
 				Project:     "my-project",
 				RepoURL:     "https://github.com/org/repo.git",
-				MCPURL:      "http://cm:8080/mcp",
+				MCPURL:      "https://cm.example.com/mcp",
 				Interactive: tt.interactive,
 			}
 			w := httptest.NewRecorder()
@@ -341,8 +361,8 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 }
 
 func TestHandleLogs_SSEHeaders(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	// Cancel the context immediately so handleLogs exits after setup.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -360,8 +380,8 @@ func TestHandleLogs_SSEHeaders(t *testing.T) {
 }
 
 func TestHandleLogs_InitialConnectedKeepalive(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -377,8 +397,8 @@ func TestHandleLogs_InitialConnectedKeepalive(t *testing.T) {
 }
 
 func TestHandleLogs_EventStreamed(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	// Use an httptest.Server so we have a real connection with proper flushing.
 	mux := http.NewServeMux()
@@ -453,8 +473,8 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 }
 
 func TestHandleLogs_ProjectFilter(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
@@ -517,8 +537,8 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 }
 
 func TestHandleLogs_ClientDisconnect(t *testing.T) {
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
@@ -584,8 +604,8 @@ func setupMessageHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.
 	t.Helper()
 
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -749,7 +769,7 @@ func TestHandleMessage_413_ContentTooLarge(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
-func TestHandleMessage_403_InvalidHMAC(t *testing.T) {
+func TestHandleMessage_401_InvalidHMAC(t *testing.T) {
 	h, _, _ := setupMessageHandler(t, true)
 
 	body, _ := json.Marshal(MessagePayload{CardID: "PROJ-001", Project: "my-project", Content: "hi"})
@@ -760,7 +780,7 @@ func TestHandleMessage_403_InvalidHMAC(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.hmacAuth(h.handleMessage)(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 // --- /promote handler tests ---
@@ -771,8 +791,8 @@ func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.
 	t.Helper()
 
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -903,7 +923,7 @@ func TestHandlePromote_409_NoStdin(t *testing.T) {
 	assert.False(t, resp.OK)
 }
 
-func TestHandlePromote_403_InvalidHMAC(t *testing.T) {
+func TestHandlePromote_401_InvalidHMAC(t *testing.T) {
 	h, _, _ := setupPromoteHandler(t, true)
 
 	body, _ := json.Marshal(PromotePayload{CardID: "PROJ-001", Project: "my-project"})
@@ -914,19 +934,19 @@ func TestHandlePromote_403_InvalidHMAC(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.hmacAuth(h.handlePromote)(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 	// Verify that the system LogEntry is published before the stdin write occurs.
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	// A controlled stdin that signals when Write is called.
 	stdinWritten := make(chan struct{}, 1)
 	controlled := &controlledWriteCloser{writeCh: stdinWritten}
 
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -982,10 +1002,10 @@ func TestHandlePromote_APICallBeforeStdin(t *testing.T) {
 	defer cmServer.Close()
 
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 	cmClient := callback.NewClient(cmServer.URL, "key", nil)
 
-	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1016,10 +1036,10 @@ func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 	defer cmServer.Close()
 
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 	cmClient := callback.NewClient(cmServer.URL, "key", nil)
 
-	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1041,6 +1061,57 @@ func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 	assert.False(t, resp.OK)
 }
 
+// TestHandlePromote_APIFailure_GenericErrorBody verifies that the 502 body
+// returned on upstream CM failure is a fixed, generic shape — it must NOT
+// contain the upstream response body (which may leak tokens or other secrets
+// if CM is misconfigured).
+func TestHandlePromote_APIFailure_GenericErrorBody(t *testing.T) {
+	// Upstream CM response body contains a secret-like substring to ensure it
+	// cannot leak into our response body.
+	upstreamBody := `{"error":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn leaked"}`
+
+	cmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer cmServer.Close()
+
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	cmClient := callback.NewClient(cmServer.URL, "key", nil)
+
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+
+	// The response body must be the fixed generic shape — no "error":"..."
+	// echoing of the upstream body, no leaked token substring.
+	raw := w.Body.String()
+	assert.NotContains(t, raw, "ghp_", "upstream token must not leak into 502 response")
+	assert.NotContains(t, raw, "leaked", "upstream body text must not leak into 502 response")
+
+	var resp ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.False(t, resp.OK)
+	assert.Equal(t, CodeUpstreamFailure, resp.Code)
+	assert.Equal(t, "upstream verification failed", resp.Message)
+
+	// stdin must NOT have been written.
+	assert.Empty(t, fw.buf)
+}
+
 func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 	// When CM returns autonomous=false the card has not been promoted yet.
 	// The handler must return 403 and NOT write to stdin.
@@ -1051,10 +1122,10 @@ func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 	defer cmServer.Close()
 
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
+	b := logbroadcast.NewBroadcaster(nil, nil)
 	cmClient := callback.NewClient(cmServer.URL, "key", nil)
 
-	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, nil)
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1074,7 +1145,7 @@ func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 	var resp Response
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
-	assert.Contains(t, resp.Error, "autonomous flag is not set")
+	assert.Contains(t, resp.Message, "autonomous flag is not set")
 }
 
 // controlledWriteCloser records writes and signals via writeCh.
@@ -1134,8 +1205,8 @@ func setupEndSessionHandler(t *testing.T, withStdin bool) (*Handler, *logbroadca
 	t.Helper()
 
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1264,8 +1335,8 @@ func TestHandleEndSession_409_NoStdin(t *testing.T) {
 
 func TestHandleEndSession_Idempotent(t *testing.T) {
 	tr := tracker.New()
-	b := logbroadcast.NewBroadcaster()
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, nil)
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1315,7 +1386,315 @@ func (c *countingWriteCloser) Close() error {
 	return nil
 }
 
-func TestHandleEndSession_403_InvalidHMAC(t *testing.T) {
+// --- /stop-all handler tests ---
+
+// stopAllFakeRunner is a ContainerRunner double that records every Kill call
+// and can be configured to fail for a specific card ID. Unlike fakeRunner it
+// is safe for concurrent use.
+type stopAllFakeRunner struct {
+	mu       sync.Mutex
+	killed   []string
+	failFor  map[string]bool
+	killErr  error
+	runCalls int
+}
+
+func (s *stopAllFakeRunner) Run(_ context.Context, _ container.RunConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.runCalls++
+}
+
+func (s *stopAllFakeRunner) Kill(project, cardID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.failFor[project+"/"+cardID] {
+		return s.killErr
+	}
+
+	s.killed = append(s.killed, project+"/"+cardID)
+
+	return nil
+}
+
+func (s *stopAllFakeRunner) killedIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]string, len(s.killed))
+	copy(out, s.killed)
+
+	return out
+}
+
+func TestHandleStopAll_Success(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "A-001", Project: "alpha"}))
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "A-002", Project: "alpha"}))
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "B-001", Project: "beta"}))
+
+	fake := &stopAllFakeRunner{}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/stop-all", StopAllPayload{})
+	h.hmacAuth(h.handleStopAll)(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp StopAllResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+	assert.Equal(t, 3, resp.Total)
+	assert.Equal(t, 3, resp.Stopped)
+	assert.Equal(t, 0, resp.Failed)
+	assert.Len(t, resp.Results, 3)
+
+	killed := fake.killedIDs()
+	assert.ElementsMatch(t, []string{"alpha/A-001", "alpha/A-002", "beta/B-001"}, killed)
+}
+
+func TestHandleStopAll_ProjectFilter(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "A-001", Project: "alpha"}))
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "A-002", Project: "alpha"}))
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "B-001", Project: "beta"}))
+
+	fake := &stopAllFakeRunner{}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/stop-all", StopAllPayload{Project: "alpha"})
+	h.hmacAuth(h.handleStopAll)(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	killed := fake.killedIDs()
+	assert.ElementsMatch(t, []string{"alpha/A-001", "alpha/A-002"}, killed,
+		"only alpha project containers must be stopped")
+
+	// Beta container still registered.
+	_, ok := tr.Snapshot("beta", "B-001")
+	assert.True(t, ok, "beta container must not be affected by project-filtered stop-all")
+}
+
+func TestHandleStopAll_NoContainers(t *testing.T) {
+	tr := tracker.New()
+	fake := &stopAllFakeRunner{}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/stop-all", StopAllPayload{})
+	h.hmacAuth(h.handleStopAll)(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp StopAllResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+	assert.Equal(t, 0, resp.Total)
+	assert.Equal(t, 0, resp.Stopped)
+	assert.Equal(t, 0, resp.Failed)
+	assert.Empty(t, resp.Results)
+	assert.Empty(t, fake.killedIDs(), "no Kill calls should fire when tracker is empty")
+}
+
+func TestHandleStopAll_KillFailureOnOneCard(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "A-001", Project: "alpha"}))
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "A-002", Project: "alpha"}))
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "A-003", Project: "alpha"}))
+
+	fake := &stopAllFakeRunner{
+		failFor: map[string]bool{"alpha/A-002": true},
+		killErr: fmt.Errorf("simulated kill failure"),
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/stop-all", StopAllPayload{})
+	h.hmacAuth(h.handleStopAll)(w, req)
+
+	// CTXRUN-056 / M40: 207 Multi-Status when any per-card kill fails.
+	require.Equal(t, http.StatusMultiStatus, w.Code)
+
+	var resp StopAllResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK, "OK must be false when any per-card kill failed")
+	assert.Equal(t, 3, resp.Total)
+	assert.Equal(t, 2, resp.Stopped)
+	assert.Equal(t, 1, resp.Failed)
+	require.Len(t, resp.Results, 3)
+
+	// Inspect per-card results.
+	perCard := make(map[string]CardKillResult, len(resp.Results))
+	for _, r := range resp.Results {
+		perCard[r.Project+"/"+r.CardID] = r
+	}
+
+	assert.True(t, perCard["alpha/A-001"].OK)
+	assert.False(t, perCard["alpha/A-002"].OK)
+	assert.NotEmpty(t, perCard["alpha/A-002"].Error, "failed entry must carry an error label")
+	assert.True(t, perCard["alpha/A-003"].OK)
+
+	killed := fake.killedIDs()
+	assert.ElementsMatch(t, []string{"alpha/A-001", "alpha/A-003"}, killed,
+		"only non-failing cards should appear in killed list")
+}
+
+func TestHandleStopAll_InvalidJSON(t *testing.T) {
+	tr := tracker.New()
+	h := NewHandler(&stopAllFakeRunner{}, tr, nil, nil, testAPIKey, 10, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	body := []byte("not-json")
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/stop-all", strings.NewReader(string(body)))
+	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
+	req.Header.Set(cmhmac.TimestampHeader, ts)
+
+	w := httptest.NewRecorder()
+	h.hmacAuth(h.handleStopAll)(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestHandleMessage_ConcurrentNoWriteInterleave fires many concurrent signed
+// /message requests against one container's stdin and verifies none of the
+// stream-json lines get interleaved or truncated. The tracker's per-entry
+// stdin mutex is the serialisation point — if a handler change ever bypassed
+// it, the race detector would catch it here.
+func TestHandleMessage_ConcurrentNoWriteInterleave(t *testing.T) {
+	tr := tracker.New()
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	// A blocking writer that serializes each Write behind a mutex but also
+	// records them so we can parse and count whole lines afterwards.
+	fw := &concurrentFakeWriter{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /message", h.hmacAuth(h.handleMessage))
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	const concurrency = 25
+
+	var wg sync.WaitGroup
+
+	wg.Add(concurrency)
+
+	for i := range concurrency {
+		go func(i int) {
+			defer wg.Done()
+
+			payload := MessagePayload{
+				CardID:    "PROJ-001",
+				Project:   "my-project",
+				Content:   "message-" + strconv.Itoa(i),
+				MessageID: "msg-" + strconv.Itoa(i),
+			}
+
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Errorf("marshal: %v", err)
+
+				return
+			}
+
+			ts := strconv.FormatInt(time.Now().Unix(), 10)
+			sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+
+			req, err := http.NewRequestWithContext(context.Background(), "POST", srv.URL+"/message", strings.NewReader(string(body)))
+			if err != nil {
+				t.Errorf("new request: %v", err)
+
+				return
+			}
+
+			req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
+			req.Header.Set(cmhmac.TimestampHeader, ts)
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Errorf("do: %v", err)
+
+				return
+			}
+
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusAccepted {
+				t.Errorf("status: %d", resp.StatusCode)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	lines := fw.lines()
+	require.Len(t, lines, concurrency, "exactly one stream-json line per request")
+
+	// Each captured line must be valid JSON with the expected content prefix.
+	seen := make(map[string]bool)
+
+	for _, line := range lines {
+		var msg streammsg.UserMessage
+		require.NoError(t, json.Unmarshal([]byte(line), &msg), "each captured line must be valid stream-json")
+		require.Len(t, msg.Message.Content, 1)
+
+		txt := msg.Message.Content[0].Text
+		assert.True(t, strings.HasPrefix(txt, "message-"), "content must be a full 'message-N' payload, got %q", txt)
+		seen[txt] = true
+	}
+
+	assert.Len(t, seen, concurrency, "every message index must be represented exactly once")
+}
+
+// concurrentFakeWriter is an io.WriteCloser that appends each Write to a
+// slice under a mutex so callers can inspect the ordering of complete writes.
+type concurrentFakeWriter struct {
+	mu     sync.Mutex
+	writes [][]byte
+}
+
+func (c *concurrentFakeWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	c.writes = append(c.writes, buf)
+
+	return len(p), nil
+}
+
+func (c *concurrentFakeWriter) Close() error { return nil }
+
+func (c *concurrentFakeWriter) lines() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	out := make([]string, 0, len(c.writes))
+
+	for _, w := range c.writes {
+		s := string(w)
+		// Strip the trailing newline that BuildUserMessage always appends.
+		out = append(out, strings.TrimSuffix(s, "\n"))
+	}
+
+	return out
+}
+
+func TestHandleEndSession_401_InvalidHMAC(t *testing.T) {
 	h, _, _ := setupEndSessionHandler(t, true)
 
 	body, _ := json.Marshal(EndSessionPayload{CardID: "PROJ-001", Project: "my-project"})
@@ -1326,5 +1705,123 @@ func TestHandleEndSession_403_InvalidHMAC(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.hmacAuth(h.handleEndSession)(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// --- Drain / 503 tests (CTXRUN-040) ---
+//
+// When the shutdown sequence flips health.Draining to true, every handler
+// that starts or extends long-running work must short-circuit to 503 so we
+// don't start containers or stdin writes we're about to tear down.
+
+func TestHandleTrigger_503WhenDraining(t *testing.T) {
+	tr := tracker.New()
+	health := NewHealthState()
+	health.Draining.Store(true)
+
+	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/trigger", TriggerPayload{
+		CardID:  "PROJ-777",
+		Project: "my-project",
+		RepoURL: "https://github.com/org/repo.git",
+		MCPURL:  "https://cm.example.com/mcp",
+	})
+	h.hmacAuth(h.handleTrigger)(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	var resp Response
+
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+	assert.Contains(t, resp.Message, "draining")
+
+	// Tracker must remain empty — the draining branch runs before AddIfUnderLimit.
+	assert.Equal(t, 0, tr.Count())
+}
+
+func TestHandleMessage_503WhenDraining(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	health := NewHealthState()
+	health.Draining.Store(true)
+
+	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+
+	payload := MessagePayload{
+		CardID:    "PROJ-001",
+		Project:   "my-project",
+		Content:   "hello",
+		MessageID: "msg-drain-1",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/message", payload)
+	h.hmacAuth(h.handleMessage)(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	// No stdin write should have landed on the attached writer.
+	assert.Empty(t, fw.buf, "draining branch must short-circuit before any stdin write")
+}
+
+func TestHandlePromote_503WhenDraining(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	health := NewHealthState()
+	health.Draining.Store(true)
+
+	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+
+	payload := PromotePayload{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Empty(t, fw.buf, "draining branch must short-circuit before any stdin write")
+}
+
+func TestHandleEndSession_503WhenDraining(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	health := NewHealthState()
+	health.Draining.Store(true)
+
+	h := NewHandler(nil, tr, logbroadcast.NewBroadcaster(nil, nil), nil, testAPIKey, 3, testAllowedMCPHosts, nil, health)
+
+	payload := EndSessionPayload{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/end-session", payload)
+	h.hmacAuth(h.handleEndSession)(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.False(t, fw.closed, "draining branch must short-circuit before any stdin close")
 }

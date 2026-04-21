@@ -299,6 +299,36 @@ func TestRedact(t *testing.T) {
 			want:  "Authorization: [REDACTED]",
 		},
 		{
+			name:  "GitHub App installation token v1",
+			input: "got token v1." + strings.Repeat("a", 40) + " back",
+			want:  "got token [REDACTED] back",
+		},
+		{
+			name:  "GitHub App installation token v1 longer hex",
+			input: "v1." + strings.Repeat("0123456789abcdef", 4),
+			want:  "[REDACTED]",
+		},
+		{
+			name:  "CLAUDE_CODE_OAUTH_TOKEN env assignment preserves key",
+			input: "env CLAUDE_CODE_OAUTH_TOKEN=sk-oauth-abc123xyz run",
+			want:  "env CLAUDE_CODE_OAUTH_TOKEN=[REDACTED] run",
+		},
+		{
+			name:  "CM_MCP_API_KEY env assignment preserves key",
+			input: "CM_MCP_API_KEY=abc123def456 next-arg",
+			want:  "CM_MCP_API_KEY=[REDACTED] next-arg",
+		},
+		{
+			name:  "CM_GIT_TOKEN env assignment preserves key",
+			input: "dumping CM_GIT_TOKEN=v1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa now",
+			want:  "dumping CM_GIT_TOKEN=[REDACTED] now",
+		},
+		{
+			name:  "ANTHROPIC_API_KEY env assignment preserves key",
+			input: "ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+			want:  "ANTHROPIC_API_KEY=[REDACTED]",
+		},
+		{
 			name:  "no secrets",
 			input: "normal log output with no secrets",
 			want:  "normal log output with no secrets",
@@ -313,6 +343,11 @@ func TestRedact(t *testing.T) {
 			input: "ghp_short is fine",
 			want:  "ghp_short is fine",
 		},
+		{
+			name:  "short v1.hex not matched (too few hex digits)",
+			input: "version v1.abcdef is fine",
+			want:  "version v1.abcdef is fine",
+		},
 	}
 
 	for _, tc := range tests {
@@ -320,6 +355,93 @@ func TestRedact(t *testing.T) {
 			assert.Equal(t, tc.want, Redact(tc.input))
 		})
 	}
+}
+
+// TestRedactor_LiteralValues verifies that a Redactor masks literal secret
+// values supplied at construction time in addition to the static patterns.
+func TestRedactor_LiteralValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		secrets []string
+		input   string
+		want    string
+	}{
+		{
+			name:    "literal git token masked verbatim",
+			secrets: []string{"v1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			input:   "user pasted v1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa into log",
+			want:    "user pasted [REDACTED] into log",
+		},
+		{
+			name:    "literal MCP API key masked",
+			secrets: []string{"my-literal-mcp-key-0123456789"},
+			input:   "echo my-literal-mcp-key-0123456789 > /tmp/x",
+			want:    "echo [REDACTED] > /tmp/x",
+		},
+		{
+			name:    "empty secret ignored",
+			secrets: []string{""},
+			input:   "no secret here",
+			want:    "no secret here",
+		},
+		{
+			name:    "short secret ignored",
+			secrets: []string{"abc"},
+			input:   "abc def abc",
+			want:    "abc def abc",
+		},
+		{
+			name:    "duplicate secrets deduplicated",
+			secrets: []string{"my-literal-mcp-key-0123456789", "my-literal-mcp-key-0123456789"},
+			input:   "my-literal-mcp-key-0123456789",
+			want:    "[REDACTED]",
+		},
+		{
+			name:    "static pattern still applied via Redactor",
+			secrets: []string{"irrelevant-longer-secret-value"},
+			input:   "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn",
+			want:    "[REDACTED]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRedactor(tc.secrets)
+			assert.Equal(t, tc.want, r.Redact(tc.input))
+		})
+	}
+}
+
+// TestRedactor_NilFallback verifies that calling Redact on a nil *Redactor
+// falls back to the static Redact (safe default).
+func TestRedactor_NilFallback(t *testing.T) {
+	var r *Redactor
+	assert.Equal(t, "token is [REDACTED]",
+		r.Redact("token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"))
+}
+
+// TestProcessStreamWithRedactor_LiteralSecrets verifies that
+// ProcessStreamWithRedactor masks literal container-injected secrets that
+// happen to appear in a text block.
+func TestProcessStreamWithRedactor_LiteralSecrets(t *testing.T) {
+	liveToken := "live-instance-secret-value-0123456789"
+	input := `{"type":"assistant","message":{"content":[{"type":"text","text":"oops leaking ` + liveToken + ` sorry"}]}}`
+
+	logger, records := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	r := NewRedactor([]string{liveToken})
+	ProcessStreamWithRedactor(strings.NewReader(input), logger, r, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	assert.Len(t, *records, 1)
+	assert.NotContains(t, attr((*records)[0], "claude_text"), liveToken)
+	assert.Contains(t, attr((*records)[0], "claude_text"), "[REDACTED]")
+
+	assert.Len(t, emitted, 1)
+	assert.NotContains(t, emitted[0].Content, liveToken)
 }
 
 func TestProcessStream_RedactsSecrets(t *testing.T) {

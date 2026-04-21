@@ -48,10 +48,61 @@ type EndSessionPayload struct {
 	Project string `json:"project"`
 }
 
-// Response is the standard webhook response format.
+// SuccessResponse is the body returned for any 2xx webhook response. `OK` is
+// always true; `Message` is a short, free-form human-readable label (never
+// derived from user input); `MessageID` is only populated by /message acks so
+// CM can correlate the retryable request.
+type SuccessResponse struct {
+	OK        bool   `json:"ok"`
+	Message   string `json:"message,omitempty"`
+	MessageID string `json:"message_id,omitempty"`
+}
+
+// ErrorResponse is the body returned for any non-2xx webhook response (except
+// the custom /readyz shape and the SSE /logs stream). `OK` is always false;
+// `Code` is a stable enum from codes.go; `Message` is a terse human-readable
+// label that never echoes raw err.Error() strings or user-supplied values
+// beyond a single field name for validation errors.
+type ErrorResponse struct {
+	OK      bool   `json:"ok"`
+	Code    string `json:"code"`
+	Message string `json:"message,omitempty"`
+}
+
+// CardKillResult is one entry in a StopAllResponse: whether the individual
+// Kill succeeded for that (project, card_id), and a short reason if not.
+type CardKillResult struct {
+	CardID  string `json:"card_id"`
+	Project string `json:"project"`
+	OK      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
+}
+
+// StopAllResponse is the body returned by POST /stop-all. `OK` is true iff
+// every per-card Kill succeeded; on any failure the status code flips to 207
+// and `OK` is false so a single field tells the caller whether they need to
+// inspect Results.
+type StopAllResponse struct {
+	OK      bool             `json:"ok"`
+	Total   int              `json:"total"`
+	Stopped int              `json:"stopped"`
+	Failed  int              `json:"failed"`
+	Results []CardKillResult `json:"results"`
+}
+
+// Response is the legacy polymorphic webhook response body.
+//
+// Deprecated: new handlers should emit SuccessResponse or ErrorResponse via
+// writeSuccess / writeError. This type is retained because existing tests
+// decode the shape directly (and a few external consumers may depend on the
+// `error` field). It is a union of Success + Error fields and no longer
+// produced by the runner — but a JSON unmarshal of a SuccessResponse or an
+// ErrorResponse into a Response still populates the matching subset of
+// fields so older callers keep working.
 type Response struct {
 	OK        bool   `json:"ok"`
 	Message   string `json:"message,omitempty"`
 	MessageID string `json:"message_id,omitempty"`
 	Error     string `json:"error,omitempty"`
+	Code      string `json:"code,omitempty"`
 }

@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +19,9 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
@@ -26,6 +30,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/github"
+	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -56,6 +61,13 @@ func testConfig() *config.Config {
 		BaseImage:        "test-image:latest",
 		ContainerTimeout: "1h",
 		AnthropicAPIKey:  "sk-test",
+		// Explicit ImagePullPolicy: tests assert ImagePullFn is invoked, so
+		// PullAlways preserves the behavior that previously came from the
+		// now-removed empty-string fallback in Manager.pullImage.
+		ImagePullPolicy: config.PullAlways,
+		// Use the OS temp dir instead of the production default
+		// (/var/run/cm-runner/secrets) so tests work without root.
+		SecretsDir: os.TempDir() + "/cm-runner-tests-secrets",
 	}
 	// Parse the container timeout duration without full validation.
 	cfg.ParseContainerTimeout()
@@ -102,8 +114,12 @@ func testPayload() RunConfig {
 
 func TestRun_Success(t *testing.T) {
 	var (
-		createdEnv       []string
-		createdLabels    map[string]string
+		createdEnv    []string
+		createdLabels map[string]string
+		statusMu      sync.Mutex
+		// reportedStatuses is mutex-protected because the running-status
+		// callback now fires on a detached goroutine (CTXRUN-059 H23) so
+		// the handler can still be writing it after mgr.Wait() returns.
 		reportedStatuses []string
 	)
 
@@ -113,26 +129,19 @@ func TestRun_Success(t *testing.T) {
 	}))
 	defer cbSrv.Close()
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
-			assert.Equal(t, "test-image:latest", ref)
+	mock := successfulMock()
+	mock.ImagePullFn = func(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
+		assert.Equal(t, "test-image:latest", ref)
 
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
-			createdEnv = cfg.Env
-			createdLabels = cfg.Labels
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
+		createdEnv = cfg.Env
+		createdLabels = cfg.Labels
 
-			assert.Contains(t, name, "cmr-")
+		assert.Contains(t, name, "cmr-")
 
-			return container.CreateResponse{ID: "test-ctr-123"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "test-ctr-123"}, nil
 	}
 
 	// Track reported statuses.
@@ -144,7 +153,11 @@ func TestRun_Success(t *testing.T) {
 		}
 
 		_ = json.Unmarshal(body, &req)
+
+		statusMu.Lock()
+
 		reportedStatuses = append(reportedStatuses, req.RunnerStatus)
+		statusMu.Unlock()
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -175,35 +188,68 @@ func TestRun_Success(t *testing.T) {
 	assert.Contains(t, createdEnv, "CM_PROJECT=my-project")
 	assert.Contains(t, createdEnv, "CM_MCP_URL=http://cm:8080/mcp")
 	assert.Contains(t, createdEnv, "CM_REPO_URL=https://github.com/org/repo.git")
-	assert.Contains(t, createdEnv, "ANTHROPIC_API_KEY=sk-test")
+
+	// Secrets must NOT be in HostConfig.Env — they are written to a tmpfs
+	// bind-mounted file at /run/cm-secrets/env instead (CTXRUN-043).
+	for _, e := range createdEnv {
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="), "CM_GIT_TOKEN must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="), "CM_MCP_API_KEY must not be in Env")
+	}
 
 	// Verify labels.
 	assert.Equal(t, "true", createdLabels[LabelRunner])
 	assert.Equal(t, "PROJ-042", createdLabels[LabelCardID])
 	assert.Equal(t, "my-project", createdLabels[LabelProject])
 
-	// Should have reported "running".
-	assert.Contains(t, reportedStatuses, "running")
+	// Should have reported "running". The running-status callback runs on a
+	// detached goroutine (CTXRUN-059 H23) so it may land after mgr.Wait()
+	// returns — poll briefly with the mutex held.
+	require.Eventually(t, func() bool {
+		statusMu.Lock()
+		defer statusMu.Unlock()
+
+		for _, s := range reportedStatuses {
+			if s == "running" {
+				return true
+			}
+		}
+
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "running status must be reported")
 }
 
 func TestRun_PATProvider(t *testing.T) {
-	var createdEnv []string
+	var (
+		createdEnv     []string
+		createdMounts  []mount.Mount
+		secretsOnDisk  string
+		secretsSource  string
+		secretsRdOnly  bool
+		secretsMntType mount.Type
+	)
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			createdEnv = cfg.Env
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		createdEnv = cfg.Env
+		createdMounts = hc.Mounts
 
-			return container.CreateResponse{ID: "pat-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
+		// Capture the file contents now — the cleanup defer will
+		// unlink it before this test gets to make assertions.
+		for _, m := range hc.Mounts {
+			if m.Target == secretsMountTarget {
+				secretsSource = m.Source
+				secretsRdOnly = m.ReadOnly
+				secretsMntType = m.Type
+				b, err := os.ReadFile(m.Source)
+				require.NoError(t, err, "reading on-host secrets file during ContainerCreate")
 
-			return ch, make(chan error)
-		},
+				secretsOnDisk = string(b)
+			}
+		}
+
+		return container.CreateResponse{ID: "pat-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -227,11 +273,184 @@ func TestRun_PATProvider(t *testing.T) {
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
 
-	assert.Contains(t, createdEnv, "CM_GIT_TOKEN=ghp_test_pat")
+	// PAT token must NOT be in container env.
+	for _, e := range createdEnv {
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="),
+			"CM_GIT_TOKEN must not be in container env; it is delivered via /run/cm-secrets/env")
+	}
+
+	// The per-container secrets mount must exist, be a read-only bind.
+	var sawSecrets bool
+
+	for _, m := range createdMounts {
+		if m.Target == secretsMountTarget {
+			sawSecrets = true
+		}
+	}
+
+	require.True(t, sawSecrets, "secrets mount must be present")
+	assert.Equal(t, mount.TypeBind, secretsMntType)
+	assert.True(t, secretsRdOnly, "secrets mount must be read-only")
+	assert.NotEmpty(t, secretsSource, "secrets mount must have a source path")
+
+	// The file content (captured before cleanup) must contain the PAT token.
+	assert.Contains(t, secretsOnDisk, "CM_GIT_TOKEN='ghp_test_pat'",
+		"secrets file must contain the PAT token")
+
+	// And it must be deleted by the cleanup path.
+	_, err := os.Stat(secretsSource)
+	assert.True(t, os.IsNotExist(err),
+		"secrets file must be removed after the container exits; stat err=%v", err)
+}
+
+// TestStartContainer_SecretsWrittenToTmpfsBindMount verifies the happy-path
+// wiring: a secrets file is written, bind-mounted read-only at
+// /run/cm-secrets/env, and contains the expected keys with values that are
+// safe to embed inside single-quoted shell strings.
+func TestStartContainer_SecretsWrittenToTmpfsBindMount(t *testing.T) {
+	var (
+		createdEnv    []string
+		createdMounts []mount.Mount
+		secretsText   string
+	)
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+		ContainerCreateFn: func(_ context.Context, cfg *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			createdEnv = cfg.Env
+			createdMounts = hc.Mounts
+
+			for _, m := range hc.Mounts {
+				if m.Target == secretsMountTarget {
+					b, err := os.ReadFile(m.Source)
+					require.NoError(t, err)
+
+					secretsText = string(b)
+				}
+			}
+
+			return container.CreateResponse{ID: "secret-test-ctr"}, nil
+		},
+		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			ch := make(chan container.WaitResponse, 1)
+			ch <- container.WaitResponse{StatusCode: 0}
+
+			return ch, make(chan error)
+		},
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	cfg := testConfig()
+	cfg.AnthropicAPIKey = "sk-weird'quote"
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	payload := testPayload()
+	payload.MCPAPIKey = "mcp-secret"
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	// No secrets in Env.
+	for _, e := range createdEnv {
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="))
+		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="))
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="))
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="))
+	}
+
+	// Secrets mount present and read-only.
+	var found bool
+
+	for _, m := range createdMounts {
+		if m.Target == secretsMountTarget {
+			found = true
+
+			assert.Equal(t, mount.TypeBind, m.Type)
+			assert.True(t, m.ReadOnly)
+		}
+	}
+
+	require.True(t, found, "secrets mount must be present")
+
+	// File content has the expected keys and the quote in the API key is
+	// escaped as \'.
+	assert.Contains(t, secretsText, "CM_GIT_TOKEN='ghs_test_token'")
+	assert.Contains(t, secretsText, "CM_MCP_API_KEY='mcp-secret'")
+	assert.Contains(t, secretsText, `ANTHROPIC_API_KEY='sk-weird'\''quote'`,
+		"single quote in secret must be escaped as '\\''")
+}
+
+// TestSecretsFileCleanedUpOnContainerExit verifies the host-side secrets
+// file is unlinked by the waitAndCleanup path.
+func TestSecretsFileCleanedUpOnContainerExit(t *testing.T) {
+	var secretsPath string
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		for _, m := range hc.Mounts {
+			if m.Target == secretsMountTarget {
+				secretsPath = m.Source
+			}
+		}
+
+		return container.CreateResponse{ID: "cleanup-test-ctr"}, nil
+	}
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		ch := make(chan container.WaitResponse, 1)
+		ch <- container.WaitResponse{StatusCode: 0}
+
+		return ch, make(chan error)
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	require.NotEmpty(t, secretsPath, "expected secrets mount source path")
+
+	_, err := os.Stat(secretsPath)
+	assert.True(t, os.IsNotExist(err),
+		"secrets file must be gone after waitAndCleanup; stat err=%v", err)
 }
 
 func TestRun_NonZeroExit(t *testing.T) {
-	var reportedStatuses []string
+	var (
+		statusMu         sync.Mutex
+		reportedStatuses []string
+	)
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -241,23 +460,26 @@ func TestRun_NonZeroExit(t *testing.T) {
 		}
 
 		_ = json.Unmarshal(body, &req)
+
+		// Mutex-protected: the running callback now fires on a detached
+		// goroutine (CTXRUN-059 H23) concurrently with the failed
+		// callback, so plain-slice append would race under -race.
+		statusMu.Lock()
+
 		reportedStatuses = append(reportedStatuses, req.RunnerStatus)
+		statusMu.Unlock()
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer cbSrv.Close()
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 1}
+	mock := successfulMock()
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		ch := make(chan container.WaitResponse, 1)
+		ch <- container.WaitResponse{StatusCode: 1}
 
-			return ch, make(chan error)
-		},
+		return ch, make(chan error)
 	}
 
 	tr := tracker.New()
@@ -274,6 +496,9 @@ func TestRun_NonZeroExit(t *testing.T) {
 
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
+
+	statusMu.Lock()
+	defer statusMu.Unlock()
 
 	assert.Contains(t, reportedStatuses, "failed")
 	assert.Equal(t, 0, tr.Count())
@@ -299,10 +524,9 @@ func TestRun_ImagePullFailure(t *testing.T) {
 	}))
 	defer cbSrv.Close()
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return nil, fmt.Errorf("image not found")
-		},
+	mock := successfulMock()
+	mock.ImagePullFn = func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+		return nil, fmt.Errorf("image not found")
 	}
 
 	tr := tracker.New()
@@ -327,18 +551,11 @@ func TestRun_ImagePullFailure(t *testing.T) {
 func TestRun_CustomImage(t *testing.T) {
 	var pulledImage string
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
-			pulledImage = ref
+	mock := successfulMock()
+	mock.ImagePullFn = func(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
+		pulledImage = ref
 
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return io.NopCloser(strings.NewReader("")), nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -369,7 +586,7 @@ func TestRun_CustomImage(t *testing.T) {
 }
 
 func TestKill(t *testing.T) {
-	mock := &MockDockerClient{}
+	mock := successfulMock()
 	tr := tracker.New()
 	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
 
@@ -388,7 +605,7 @@ func TestKill(t *testing.T) {
 }
 
 func TestKill_NotFound(t *testing.T) {
-	mock := &MockDockerClient{}
+	mock := successfulMock()
 	tr := tracker.New()
 	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
 
@@ -399,18 +616,17 @@ func TestKill_NotFound(t *testing.T) {
 func TestCleanupOrphans(t *testing.T) {
 	var removedIDs []string
 
-	mock := &MockDockerClient{
-		ContainerListFn: func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
-			return []DockerContainer{
-				{ID: "orphan-1", Labels: map[string]string{LabelCardID: "A-001", LabelProject: "proj"}},
-				{ID: "orphan-2", Labels: map[string]string{LabelCardID: "A-002", LabelProject: "proj"}},
-			}, nil
-		},
-		ContainerRemoveFn: func(_ context.Context, id string, _ container.RemoveOptions) error {
-			removedIDs = append(removedIDs, id)
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return []DockerContainer{
+			{ID: "orphan-1", Labels: map[string]string{LabelCardID: "A-001", LabelProject: "proj"}},
+			{ID: "orphan-2", Labels: map[string]string{LabelCardID: "A-002", LabelProject: "proj"}},
+		}, nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, _ container.RemoveOptions) error {
+		removedIDs = append(removedIDs, id)
 
-			return nil
-		},
+		return nil
 	}
 
 	tr := tracker.New()
@@ -423,6 +639,65 @@ func TestCleanupOrphans(t *testing.T) {
 	assert.Contains(t, removedIDs, "orphan-2")
 }
 
+// TestCleanupOrphans_PartialFailure verifies that a per-container Stop failure
+// does not short-circuit cleanup of the remaining orphans and that the
+// returned error wraps the failure via errors.Join so callers can still see
+// which container failed. See CTXRUN-050 (M20).
+func TestCleanupOrphans_PartialFailure(t *testing.T) {
+	var (
+		stopIDs   []string
+		removeIDs []string
+		muStop    sync.Mutex
+		muRemove  sync.Mutex
+	)
+
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return []DockerContainer{
+			{ID: "orphan-1", Labels: map[string]string{LabelCardID: "A-001", LabelProject: "proj"}},
+			{ID: "orphan-2-bad", Labels: map[string]string{LabelCardID: "A-002", LabelProject: "proj"}},
+			{ID: "orphan-3", Labels: map[string]string{LabelCardID: "A-003", LabelProject: "proj"}},
+		}, nil
+	}
+	mock.ContainerStopFn = func(_ context.Context, id string, _ container.StopOptions) error {
+		muStop.Lock()
+
+		stopIDs = append(stopIDs, id)
+		muStop.Unlock()
+
+		if id == "orphan-2-bad" {
+			return fmt.Errorf("docker stop failed for %s", id)
+		}
+
+		return nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, _ container.RemoveOptions) error {
+		muRemove.Lock()
+
+		removeIDs = append(removeIDs, id)
+		muRemove.Unlock()
+
+		return nil
+	}
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	err := mgr.CleanupOrphans(context.Background())
+	require.Error(t, err, "CleanupOrphans must return the joined per-container failures")
+	assert.Contains(t, err.Error(), "orphan-2-bad",
+		"joined error must identify the failing container")
+	assert.Contains(t, err.Error(), "stop orphan",
+		"joined error must describe which operation failed")
+
+	// All three containers must have been attempted regardless of the middle
+	// failure: the bug this test guards against was aborting on first error.
+	assert.ElementsMatch(t, []string{"orphan-1", "orphan-2-bad", "orphan-3"}, stopIDs,
+		"every orphan must have ContainerStop attempted")
+	assert.ElementsMatch(t, []string{"orphan-1", "orphan-2-bad", "orphan-3"}, removeIDs,
+		"every orphan must have ContainerRemove attempted even after a Stop failure")
+}
+
 func TestStreamLogs_WithLogData(t *testing.T) {
 	// Sample stream-json lines that logparser would process.
 	// We pass them as raw bytes (not Docker multiplexed format).
@@ -431,19 +706,9 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 	// an empty stream. The test verifies the pipeline does not panic or hang.
 	sampleJSON := `{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n"
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerLogsFn: func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader(sampleJSON)), nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+	mock := successfulMock()
+	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(sampleJSON)), nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -471,30 +736,31 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 	assert.Equal(t, 0, tr.Count())
 }
 
-// buildAuthTestManager creates a manager with a mock that captures env and mounts,
-// runs a container, and returns the captured values. The cfg argument controls auth.
-func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mounts []string) {
+// buildAuthTestManager creates a manager with a mock that captures env and
+// mounts, runs a container, and returns the captured values. The cfg argument
+// controls auth. The returned `mountTargets` contains all Mount.Target paths
+// for tests that only care about presence/absence. `secretsContent` is the
+// body of the per-container secrets file captured at ContainerCreate time
+// (the file is deleted during cleanup before this function returns).
+func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mountTargets []string, secretsContent string) {
 	t.Helper()
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, c *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			env = c.Env
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, c *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		env = c.Env
 
-			for _, m := range hc.Mounts {
-				mounts = append(mounts, m.Target)
+		for _, m := range hc.Mounts {
+			mountTargets = append(mountTargets, m.Target)
+
+			if m.Target == secretsMountTarget {
+				b, err := os.ReadFile(m.Source)
+				require.NoError(t, err, "reading secrets file at create time")
+
+				secretsContent = string(b)
 			}
+		}
 
-			return container.CreateResponse{ID: "auth-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "auth-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -517,11 +783,24 @@ func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mount
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
 
-	return env, mounts
+	return env, mountTargets, secretsContent
+}
+
+// assertNoAuthEnv fails if any of the secret env vars appear in env.
+func assertNoAuthEnv(t *testing.T, env []string) {
+	t.Helper()
+
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="), "CM_GIT_TOKEN must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="), "CM_MCP_API_KEY must not be in Env")
+	}
 }
 
 // TestAuthPriority_ClaudeAuthDir verifies that when ClaudeAuthDir is set alongside
-// oauth token and API key, only the directory mount is used — no auth env vars injected.
+// oauth token and API key, only the directory mount is used — no auth env vars,
+// and no Claude token in the secrets file.
 func TestAuthPriority_ClaudeAuthDir(t *testing.T) {
 	// Create a temporary directory to use as ClaudeAuthDir so validation passes.
 	dir := t.TempDir()
@@ -531,73 +810,81 @@ func TestAuthPriority_ClaudeAuthDir(t *testing.T) {
 	cfg.ClaudeOAuthToken = "oauth-tok"
 	cfg.AnthropicAPIKey = "sk-api"
 
-	env, mounts := buildAuthTestManager(t, cfg)
+	env, targets, secrets := buildAuthTestManager(t, cfg)
 
-	// Mount should be present.
-	assert.Contains(t, mounts, "/claude-auth", "claude-auth mount should be present")
+	// The claude-auth mount is present; so is the secrets mount (for CM_GIT_TOKEN).
+	assert.Contains(t, targets, "/claude-auth", "claude-auth mount should be present")
+	assert.Contains(t, targets, secretsMountTarget, "secrets mount should be present")
 
-	// No auth env vars should be injected.
-	for _, e := range env {
-		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when ClaudeAuthDir is highest priority")
-		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be set when ClaudeAuthDir is highest priority")
-	}
+	assertNoAuthEnv(t, env)
+
+	// When ClaudeAuthDir takes priority, the Claude auth tokens must NOT
+	// appear in the secrets file either — the container reads them from
+	// the mounted $HOME/.claude directory.
+	assert.NotContains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN",
+		"CLAUDE_CODE_OAUTH_TOKEN must not be in secrets file when ClaudeAuthDir is highest priority")
+	assert.NotContains(t, secrets, "ANTHROPIC_API_KEY",
+		"ANTHROPIC_API_KEY must not be in secrets file when ClaudeAuthDir is highest priority")
 }
 
 // TestAuthPriority_OAuthToken verifies that when ClaudeAuthDir is unset but
-// ClaudeOAuthToken and AnthropicAPIKey are both set, only the OAuth token env var is injected.
+// ClaudeOAuthToken and AnthropicAPIKey are both set, only the OAuth token
+// appears in the secrets file.
 func TestAuthPriority_OAuthToken(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = "oauth-tok"
 	cfg.AnthropicAPIKey = "sk-api"
 
-	env, mounts := buildAuthTestManager(t, cfg)
+	env, targets, secrets := buildAuthTestManager(t, cfg)
 
-	// No mount should be present.
-	assert.Empty(t, mounts, "no mounts should be present when using oauth token")
+	// The only mount must be the secrets tmpfs bind mount.
+	assert.Equal(t, []string{secretsMountTarget}, targets,
+		"only the secrets mount should be present when using oauth token")
 
-	// Only CLAUDE_CODE_OAUTH_TOKEN should be injected.
-	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-tok")
+	assertNoAuthEnv(t, env)
 
-	for _, e := range env {
-		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when OAuth token takes priority")
-	}
+	assert.Contains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN='oauth-tok'")
+	assert.NotContains(t, secrets, "ANTHROPIC_API_KEY",
+		"ANTHROPIC_API_KEY must not appear in secrets file when OAuth token takes priority")
 }
 
 // TestAuthPriority_APIKeyOnly verifies that when only AnthropicAPIKey is set,
-// only ANTHROPIC_API_KEY is injected and no mounts are added.
+// only ANTHROPIC_API_KEY is written to the secrets file.
 func TestAuthPriority_APIKeyOnly(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = ""
 	cfg.AnthropicAPIKey = "sk-only"
 
-	env, mounts := buildAuthTestManager(t, cfg)
+	env, targets, secrets := buildAuthTestManager(t, cfg)
 
-	assert.Empty(t, mounts, "no mounts should be present when using API key only")
-	assert.Contains(t, env, "ANTHROPIC_API_KEY=sk-only")
+	assert.Equal(t, []string{secretsMountTarget}, targets,
+		"only the secrets mount should be present when using API key only")
+	assertNoAuthEnv(t, env)
 
-	for _, e := range env {
-		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be set when only API key is configured")
-	}
+	assert.Contains(t, secrets, "ANTHROPIC_API_KEY='sk-only'")
+	assert.NotContains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN",
+		"CLAUDE_CODE_OAUTH_TOKEN must not appear in secrets file when only API key is configured")
 }
 
-// TestAuthPriority_OAuthTokenOnly verifies that when only ClaudeOAuthToken is set,
-// only CLAUDE_CODE_OAUTH_TOKEN is injected and no mounts are added.
+// TestAuthPriority_OAuthTokenOnly verifies that when only ClaudeOAuthToken is
+// set, only CLAUDE_CODE_OAUTH_TOKEN is written to the secrets file.
 func TestAuthPriority_OAuthTokenOnly(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = "oauth-only"
 	cfg.AnthropicAPIKey = ""
 
-	env, mounts := buildAuthTestManager(t, cfg)
+	env, targets, secrets := buildAuthTestManager(t, cfg)
 
-	assert.Empty(t, mounts, "no mounts should be present when using OAuth token only")
-	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-only")
+	assert.Equal(t, []string{secretsMountTarget}, targets,
+		"only the secrets mount should be present when using OAuth token only")
+	assertNoAuthEnv(t, env)
 
-	for _, e := range env {
-		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be set when only OAuth token is configured")
-	}
+	assert.Contains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN='oauth-only'")
+	assert.NotContains(t, secrets, "ANTHROPIC_API_KEY",
+		"ANTHROPIC_API_KEY must not appear in secrets file when only OAuth token is configured")
 }
 
 // TestClaudeSettings_EnvVarPresentWhenSet verifies that CM_CLAUDE_SETTINGS is
@@ -606,7 +893,7 @@ func TestClaudeSettings_EnvVarPresentWhenSet(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClaudeSettings = `{"enabledTools":["Bash","Edit"]}`
 
-	env, _ := buildAuthTestManager(t, cfg)
+	env, _, _ := buildAuthTestManager(t, cfg)
 
 	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"enabledTools":["Bash","Edit"]}`)
 }
@@ -617,7 +904,7 @@ func TestClaudeSettings_EnvVarAbsentWhenEmpty(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClaudeSettings = ""
 
-	env, _ := buildAuthTestManager(t, cfg)
+	env, _, _ := buildAuthTestManager(t, cfg)
 
 	for _, e := range env {
 		assert.False(t, strings.HasPrefix(e, "CM_CLAUDE_SETTINGS="), "CM_CLAUDE_SETTINGS must not be set when ClaudeSettings is empty")
@@ -633,14 +920,14 @@ func TestClaudeSettings_WithClaudeAuthDir(t *testing.T) {
 	cfg.ClaudeAuthDir = dir
 	cfg.ClaudeSettings = `{"model":"claude-sonnet-4-6"}`
 
-	env, mounts := buildAuthTestManager(t, cfg)
+	env, targets, _ := buildAuthTestManager(t, cfg)
 
-	assert.Contains(t, mounts, "/claude-auth", "claude-auth mount should be present")
+	assert.Contains(t, targets, "/claude-auth", "claude-auth mount should be present")
 	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"model":"claude-sonnet-4-6"}`)
 }
 
 // TestClaudeSettings_WithOAuthToken verifies that CM_CLAUDE_SETTINGS is
-// injected alongside the OAuth token env var.
+// set alongside the OAuth token being written to the secrets file.
 func TestClaudeSettings_WithOAuthToken(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClaudeAuthDir = ""
@@ -648,14 +935,15 @@ func TestClaudeSettings_WithOAuthToken(t *testing.T) {
 	cfg.AnthropicAPIKey = ""
 	cfg.ClaudeSettings = `{"theme":"dark"}`
 
-	env, _ := buildAuthTestManager(t, cfg)
+	env, _, secrets := buildAuthTestManager(t, cfg)
 
-	assert.Contains(t, env, "CLAUDE_CODE_OAUTH_TOKEN=oauth-tok")
+	assertNoAuthEnv(t, env)
 	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"theme":"dark"}`)
+	assert.Contains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN='oauth-tok'")
 }
 
-// TestClaudeSettings_WithAPIKey verifies that CM_CLAUDE_SETTINGS is
-// injected alongside the Anthropic API key env var.
+// TestClaudeSettings_WithAPIKey verifies that CM_CLAUDE_SETTINGS is set
+// alongside the Anthropic API key being written to the secrets file.
 func TestClaudeSettings_WithAPIKey(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClaudeAuthDir = ""
@@ -663,30 +951,21 @@ func TestClaudeSettings_WithAPIKey(t *testing.T) {
 	cfg.AnthropicAPIKey = "sk-test-key"
 	cfg.ClaudeSettings = `{"permissions":{"allow":["Bash"]}}`
 
-	env, _ := buildAuthTestManager(t, cfg)
+	env, _, secrets := buildAuthTestManager(t, cfg)
 
-	assert.Contains(t, env, "ANTHROPIC_API_KEY=sk-test-key")
+	assertNoAuthEnv(t, env)
 	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"permissions":{"allow":["Bash"]}}`)
+	assert.Contains(t, secrets, "ANTHROPIC_API_KEY='sk-test-key'")
 }
 
 // TestOrchestratorModel_EnvVarPresentWhenSet verifies that CM_ORCHESTRATOR_MODEL
 // is injected into the container env when RunConfig.Model is non-empty.
 func TestOrchestratorModel_EnvVarPresentWhenSet(t *testing.T) {
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			assert.Contains(t, cfg.Env, "CM_ORCHESTRATOR_MODEL=claude-opus-4-7")
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		assert.Contains(t, cfg.Env, "CM_ORCHESTRATOR_MODEL=claude-opus-4-7")
 
-			return container.CreateResponse{ID: "model-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "model-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -715,24 +994,14 @@ func TestOrchestratorModel_EnvVarPresentWhenSet(t *testing.T) {
 // TestOrchestratorModel_EnvVarAbsentWhenEmpty verifies that CM_ORCHESTRATOR_MODEL
 // is not injected into the container env when RunConfig.Model is empty.
 func TestOrchestratorModel_EnvVarAbsentWhenEmpty(t *testing.T) {
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			for _, e := range cfg.Env {
-				assert.False(t, strings.HasPrefix(e, "CM_ORCHESTRATOR_MODEL="),
-					"CM_ORCHESTRATOR_MODEL must not be set when Model is empty")
-			}
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		for _, e := range cfg.Env {
+			assert.False(t, strings.HasPrefix(e, "CM_ORCHESTRATOR_MODEL="),
+				"CM_ORCHESTRATOR_MODEL must not be set when Model is empty")
+		}
 
-			return container.CreateResponse{ID: "no-model-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "no-model-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -761,21 +1030,11 @@ func TestOrchestratorModel_EnvVarAbsentWhenEmpty(t *testing.T) {
 // TestBaseBranch_EnvVarPresentWhenSet verifies that CM_BASE_BRANCH is injected
 // into the container env when RunConfig.BaseBranch is non-empty.
 func TestBaseBranch_EnvVarPresentWhenSet(t *testing.T) {
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			assert.Contains(t, cfg.Env, "CM_BASE_BRANCH=main")
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		assert.Contains(t, cfg.Env, "CM_BASE_BRANCH=main")
 
-			return container.CreateResponse{ID: "bb-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "bb-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -806,21 +1065,11 @@ func TestBaseBranch_EnvVarPresentWhenSet(t *testing.T) {
 // TestInteractive_EnvVarPresentWhenTrue verifies that CM_INTERACTIVE=1 is injected
 // into the container env when RunConfig.Interactive is true.
 func TestInteractive_EnvVarPresentWhenTrue(t *testing.T) {
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			assert.Contains(t, cfg.Env, "CM_INTERACTIVE=1")
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		assert.Contains(t, cfg.Env, "CM_INTERACTIVE=1")
 
-			return container.CreateResponse{ID: "interactive-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "interactive-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -849,23 +1098,13 @@ func TestInteractive_EnvVarPresentWhenTrue(t *testing.T) {
 // TestInteractive_EnvVarAbsentWhenFalse verifies that CM_INTERACTIVE is not injected
 // into the container env when RunConfig.Interactive is false (the default).
 func TestInteractive_EnvVarAbsentWhenFalse(t *testing.T) {
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			for _, e := range cfg.Env {
-				assert.False(t, strings.HasPrefix(e, "CM_INTERACTIVE="), "CM_INTERACTIVE must not be set when Interactive is false")
-			}
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		for _, e := range cfg.Env {
+			assert.False(t, strings.HasPrefix(e, "CM_INTERACTIVE="), "CM_INTERACTIVE must not be set when Interactive is false")
+		}
 
-			return container.CreateResponse{ID: "non-interactive-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "non-interactive-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -892,23 +1131,13 @@ func TestInteractive_EnvVarAbsentWhenFalse(t *testing.T) {
 }
 
 func TestBaseBranch_EnvVarAbsentWhenEmpty(t *testing.T) {
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			for _, e := range cfg.Env {
-				assert.False(t, strings.HasPrefix(e, "CM_BASE_BRANCH="), "CM_BASE_BRANCH must not be set when BaseBranch is empty")
-			}
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		for _, e := range cfg.Env {
+			assert.False(t, strings.HasPrefix(e, "CM_BASE_BRANCH="), "CM_BASE_BRANCH must not be set when BaseBranch is empty")
+		}
 
-			return container.CreateResponse{ID: "bb-test-ctr"}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "bb-test-ctr"}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -942,26 +1171,16 @@ func TestInteractive_StdinConfigFlags(t *testing.T) {
 		attachCalled int
 	)
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			capturedCfg = cfg
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedCfg = cfg
 
-			return container.CreateResponse{ID: "stdin-test-ctr"}, nil
-		},
-		ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
-			attachCalled++
-			// Use a discarding writer so the priming write does not block.
-			return &HijackedResponse{Conn: nopWriteCloser{}}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return container.CreateResponse{ID: "stdin-test-ctr"}, nil
+	}
+	mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+		attachCalled++
+		// Use a discarding writer so the priming write does not block.
+		return &HijackedResponse{Conn: nopWriteCloser{}}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1022,19 +1241,9 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 			},
 		}
 
-		mock := &MockDockerClient{
-			ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-				return io.NopCloser(strings.NewReader("")), nil
-			},
-			ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
-				return &HijackedResponse{Conn: spyWriter}, nil
-			},
-			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-				ch := make(chan container.WaitResponse, 1)
-				ch <- container.WaitResponse{StatusCode: 0}
-
-				return ch, make(chan error)
-			},
+		mock := successfulMock()
+		mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+			return &HijackedResponse{Conn: spyWriter}, nil
 		}
 
 		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1092,22 +1301,12 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 	t.Run("interactive=false writes no priming message", func(t *testing.T) {
 		var attachCalled int
 
-		mock := &MockDockerClient{
-			ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-				return io.NopCloser(strings.NewReader("")), nil
-			},
-			ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
-				attachCalled++
-				_, pw := io.Pipe()
+		mock := successfulMock()
+		mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+			attachCalled++
+			_, pw := io.Pipe()
 
-				return &HijackedResponse{Conn: pw}, nil
-			},
-			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-				ch := make(chan container.WaitResponse, 1)
-				ch <- container.WaitResponse{StatusCode: 0}
-
-				return ch, make(chan error)
-			},
+			return &HijackedResponse{Conn: pw}, nil
 		}
 
 		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1157,19 +1356,9 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 			},
 		}
 
-		mock := &MockDockerClient{
-			ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-				return io.NopCloser(strings.NewReader("")), nil
-			},
-			ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
-				return &HijackedResponse{Conn: spyWriter}, nil
-			},
-			ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-				ch := make(chan container.WaitResponse, 1)
-				ch <- container.WaitResponse{StatusCode: 0}
-
-				return ch, make(chan error)
-			},
+		mock := successfulMock()
+		mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+			return &HijackedResponse{Conn: spyWriter}, nil
 		}
 
 		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1250,33 +1439,130 @@ func TestBuildPrimingContent(t *testing.T) {
 	})
 }
 
+// blockingWriteCloser blocks every Write until Close is called, at which
+// point it returns io.ErrClosedPipe. Used to simulate a wedged hijacked
+// socket for TestPrimingWriteStdin_WriteDeadline.
+type blockingWriteCloser struct {
+	mu     sync.Mutex
+	closed bool
+	done   chan struct{}
+}
+
+func newBlockingWriteCloser() *blockingWriteCloser {
+	return &blockingWriteCloser{done: make(chan struct{})}
+}
+
+func (b *blockingWriteCloser) Write(_ []byte) (int, error) {
+	<-b.done
+
+	return 0, io.ErrClosedPipe
+}
+
+func (b *blockingWriteCloser) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return nil
+	}
+
+	b.closed = true
+
+	close(b.done)
+
+	return nil
+}
+
+// TestPrimingWriteStdin_WriteDeadline asserts that a priming WriteStdin that
+// wedges on the hijacked conn does not stall the Run goroutine: after
+// primingWriteTimeout elapses the manager logs and continues into
+// waitAndCleanup, and the whole test exits well before any real timeout
+// could fire. CTXRUN-040 (C11).
+func TestPrimingWriteStdin_WriteDeadline(t *testing.T) {
+	// Shrink the deadline for the duration of this test so we don't
+	// spend 5 s on a synthetic wedge. Snapshot + restore around the run.
+	saved := primingWriteTimeout
+	primingWriteTimeout = 100 * time.Millisecond
+
+	t.Cleanup(func() { primingWriteTimeout = saved })
+
+	blocker := newBlockingWriteCloser()
+
+	mock := successfulMock()
+	mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+		return &HijackedResponse{Conn: blocker}, nil
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	payload.Interactive = true
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	start := time.Now()
+	done := make(chan struct{})
+
+	go func() {
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Run completed without being blocked by the wedged write.
+	case <-time.After(5 * time.Second):
+		// Unblock any stray goroutine so the test exits cleanly, then fail.
+		_ = blocker.Close()
+
+		t.Fatalf("Manager.Run wedged on priming write (elapsed %s)", time.Since(start))
+	}
+
+	// With primingWriteTimeout at 100ms, end-to-end Run should take well
+	// under a second. A slow CI may add some, so allow 3 s of slack.
+	elapsed := time.Since(start)
+	assert.Less(t, elapsed, 3*time.Second,
+		"priming write deadline did not bound the Run goroutine (elapsed %s)", elapsed)
+
+	// Release the blocker so the detached priming-write goroutine unwinds
+	// and doesn't leak into later tests. Safe to call even if already closed.
+	_ = blocker.Close()
+
+	// Tracker entry must have been removed via the normal waitAndCleanup
+	// path — confirming that the wedge did not short-circuit cleanup.
+	assert.Equal(t, 0, tr.Count())
+}
+
 func TestInteractive_FalseNoStdinFlagsNoAttach(t *testing.T) {
 	var (
 		capturedCfg  *container.Config
 		attachCalled int
 	)
 
-	mock := &MockDockerClient{
-		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("")), nil
-		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			capturedCfg = cfg
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedCfg = cfg
 
-			return container.CreateResponse{ID: "non-interactive-stdin-ctr"}, nil
-		},
-		ContainerAttachFn: func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
-			attachCalled++
-			_, pw := io.Pipe()
+		return container.CreateResponse{ID: "non-interactive-stdin-ctr"}, nil
+	}
+	mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+		attachCalled++
+		_, pw := io.Pipe()
 
-			return &HijackedResponse{Conn: pw}, nil
-		},
-		ContainerWaitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
-			ch := make(chan container.WaitResponse, 1)
-			ch <- container.WaitResponse{StatusCode: 0}
-
-			return ch, make(chan error)
-		},
+		return &HijackedResponse{Conn: pw}, nil
 	}
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1320,6 +1606,683 @@ func TestSanitizeContainerName(t *testing.T) {
 	for _, tt := range tests {
 		assert.Equal(t, tt.expected, sanitizeContainerName(tt.project, tt.cardID))
 	}
+}
+
+// TestWaitAndCleanup_ParentContextCanceled verifies that when the parent ctx
+// is canceled mid-wait, the manager takes the kill path: the container is
+// stopped and removed, the tracker slot is freed, a "container canceled"
+// system event is emitted, AND reportFailure is invoked with a "killed by
+// operator" message so ContextMatrix can transition the card out of
+// `running`. See CTXRUN-050.
+func TestWaitAndCleanup_ParentContextCanceled(t *testing.T) {
+	type statusReport struct {
+		status, message string
+	}
+
+	var (
+		stopCalled       atomic.Bool
+		removeCalled     atomic.Bool
+		reportedStatuses = make(chan statusReport, 4)
+	)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+			Message      string `json:"message"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reportedStatuses <- statusReport{req.RunnerStatus, req.Message}:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	// ContainerWait blocks forever so the only exit from waitAndCleanup is
+	// the `<-ctx.Done()` branch. We deliberately do NOT send on errCh — if we
+	// did, the errCh branch plus waitCtx.Err() != nil would classify the
+	// shutdown as a timeout instead of a cancel.
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		return make(chan container.WaitResponse), make(chan error)
+	}
+	mock.ContainerStopFn = func(_ context.Context, _ string, _ container.StopOptions) error {
+		stopCalled.Store(true)
+
+		return nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, _ container.RemoveOptions) error {
+		removeCalled.Store(true)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	b := newRecordingBroadcaster()
+	mgr := NewManager(mock, tr, cb, tp, b.Broadcaster(), testConfig(), testLogger())
+
+	payload := testPayload()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+
+	// Let the container get started and enter waitAndCleanup, then cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	mgr.Wait()
+
+	// The recording goroutine drains asynchronously — give it a chance.
+	require.Eventually(t, func() bool {
+		return strings.Contains(joinContents(b.filterType("system")), "container canceled")
+	}, 2*time.Second, 10*time.Millisecond,
+		"a 'container canceled' system event must be emitted")
+
+	assert.True(t, stopCalled.Load(), "killContainer must stop the container")
+	assert.True(t, removeCalled.Load(), "container must be removed")
+	assert.Equal(t, 0, tr.Count(), "tracker slot must be freed")
+
+	// CTXRUN-050: reportFailure must fire via a detached context so CM sees
+	// the terminal status even though the parent ctx is already cancelled.
+	var (
+		sawFailed           bool
+		sawKilledByOperator bool
+	)
+
+drainLoop:
+	for {
+		select {
+		case s := <-reportedStatuses:
+			if s.status == "failed" {
+				sawFailed = true
+			}
+
+			if strings.Contains(s.message, "killed by operator") {
+				sawKilledByOperator = true
+			}
+		default:
+			break drainLoop
+		}
+	}
+
+	assert.True(t, sawFailed, "reportFailure must fire on parent-context cancel")
+	assert.True(t, sawKilledByOperator, "failure message must be 'killed by operator'")
+}
+
+// TestStartFailure_ReportsFailureDespiteCancelledContext verifies that when
+// ContainerStart fails while the parent ctx has already been cancelled (e.g.
+// the Kill webhook raced the start goroutine), reportFailure still fires via
+// a detached context so CM sees the `failed` status instead of the card
+// getting stuck in `running`. See CTXRUN-050 (C12).
+func TestStartFailure_ReportsFailureDespiteCancelledContext(t *testing.T) {
+	type statusReport struct {
+		status, message string
+	}
+
+	reportedStatuses := make(chan statusReport, 4)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+			Message      string `json:"message"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reportedStatuses <- statusReport{req.RunnerStatus, req.Message}:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	// We need to cancel the parent ctx BEFORE ContainerStart returns its
+	// error so the failure path sees ctx.Err() != nil. The mock blocks on the
+	// passed-in context until it is cancelled, then returns the start failure
+	// — mimicking a real daemon call that was in flight when the operator
+	// hit /kill.
+	startEntered := make(chan struct{})
+
+	mock := successfulMock()
+	mock.ContainerStartFn = func(ctx context.Context, _ string, _ container.StartOptions) error {
+		close(startEntered)
+		<-ctx.Done()
+
+		return fmt.Errorf("synthetic start failure")
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+
+	// Wait for ContainerStart to be entered, then cancel so its ctx is dead
+	// before the start-failure branch runs reportFailure.
+	<-startEntered
+	cancel()
+	mgr.Wait()
+
+	assert.Equal(t, 0, tr.Count(), "tracker slot must be freed after start failure")
+
+	var (
+		sawFailed     bool
+		sawStartMsg   bool
+		sawStartError bool
+	)
+
+drainLoop:
+	for {
+		select {
+		case s := <-reportedStatuses:
+			if s.status == "failed" {
+				sawFailed = true
+			}
+
+			if strings.Contains(s.message, "start failed") {
+				sawStartMsg = true
+			}
+
+			if strings.Contains(s.message, "synthetic start failure") {
+				sawStartError = true
+			}
+		default:
+			break drainLoop
+		}
+	}
+
+	assert.True(t, sawFailed,
+		"reportFailure must fire even when the parent ctx was cancelled during start")
+	assert.True(t, sawStartMsg, "message must include 'start failed' prefix")
+	assert.True(t, sawStartError, "message must include the underlying error")
+}
+
+// TestWaitAndCleanup_Timeout exercises the timeout path: ContainerWait blocks
+// until waitCtx's deadline expires. killContainer must be invoked with the
+// correct container ID and a failed status callback issued.
+func TestWaitAndCleanup_Timeout(t *testing.T) {
+	var (
+		stopID           atomic.Value // string
+		reportedStatuses = make(chan string, 4)
+	)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reportedStatuses <- req.RunnerStatus:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		return container.CreateResponse{ID: "timeout-ctr-id"}, nil
+	}
+	// ContainerWait blocks until its ctx (waitCtx) expires — then sends the
+	// deadline error on errCh so the wait-error branch fires and
+	// waitCtx.Err() is non-nil, triggering the timeout path.
+	mock.ContainerWaitFn = func(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		errCh := make(chan error, 1)
+
+		go func() {
+			<-ctx.Done()
+
+			errCh <- ctx.Err()
+		}()
+
+		return make(chan container.WaitResponse), errCh
+	}
+	mock.ContainerStopFn = func(_ context.Context, id string, _ container.StopOptions) error {
+		stopID.Store(id)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	cfg := testConfig()
+	cfg.ContainerTimeout = "100ms"
+	cfg.ParseContainerTimeout()
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	id, _ := stopID.Load().(string)
+	assert.Equal(t, "timeout-ctr-id", id, "killContainer must be called with the created container ID")
+
+	var sawFailed bool
+
+	for {
+		select {
+		case s := <-reportedStatuses:
+			if s == "failed" {
+				sawFailed = true
+			}
+		default:
+			assert.True(t, sawFailed, "reportFailure must be called on container timeout")
+
+			return
+		}
+	}
+}
+
+// TestWaitAndCleanup_ErrChFromContainerWait exercises the generic errCh path:
+// ContainerWait emits a non-timeout error (e.g. daemon disconnect). The
+// manager must kill the container, report failure, and clean up the tracker.
+func TestWaitAndCleanup_ErrChFromContainerWait(t *testing.T) {
+	var (
+		stopCalled       atomic.Bool
+		removeCalled     atomic.Bool
+		reportedStatuses = make(chan string, 4)
+	)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reportedStatuses <- req.RunnerStatus:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		errCh := make(chan error, 1)
+		errCh <- fmt.Errorf("docker daemon closed connection")
+
+		return make(chan container.WaitResponse), errCh
+	}
+	mock.ContainerStopFn = func(_ context.Context, _ string, _ container.StopOptions) error {
+		stopCalled.Store(true)
+
+		return nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, _ container.RemoveOptions) error {
+		removeCalled.Store(true)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	assert.True(t, stopCalled.Load(), "killContainer must fire on errCh path")
+	assert.True(t, removeCalled.Load(), "container must be removed after errCh path")
+	assert.Equal(t, 0, tr.Count(), "tracker slot must be freed")
+
+	var sawFailed bool
+
+	for {
+		select {
+		case s := <-reportedStatuses:
+			if s == "failed" {
+				sawFailed = true
+			}
+		default:
+			assert.True(t, sawFailed, "reportFailure must be called on errCh error")
+
+			return
+		}
+	}
+}
+
+// TestKillContainer_Success directly drives the killContainer helper and
+// verifies ContainerStop is called with the provided ID and grace period.
+func TestKillContainer_Success(t *testing.T) {
+	var (
+		gotID      string
+		gotTimeout int
+	)
+
+	mock := successfulMock()
+	mock.ContainerStopFn = func(_ context.Context, id string, opts container.StopOptions) error {
+		gotID = id
+
+		if opts.Timeout != nil {
+			gotTimeout = *opts.Timeout
+		}
+
+		return nil
+	}
+
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr.killContainer(context.Background(), "target-id", testLogger())
+
+	assert.Equal(t, "target-id", gotID)
+	assert.Equal(t, 10, gotTimeout, "killContainer must use the stopGracePeriod")
+}
+
+// TestKillContainer_StopError verifies that a ContainerStop failure is logged
+// and swallowed — killContainer must not propagate errors because it runs
+// inside deferred cleanup where there is no meaningful recovery path.
+func TestKillContainer_StopError(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerStopFn = func(_ context.Context, _ string, _ container.StopOptions) error {
+		return fmt.Errorf("docker not reachable")
+	}
+
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	// Must not panic or block.
+	assert.NotPanics(t, func() {
+		mgr.killContainer(context.Background(), "id", testLogger())
+	})
+}
+
+// TestRemoveContainer_Failure verifies that a ContainerRemove failure is
+// logged and swallowed (same rationale as killContainer).
+func TestRemoveContainer_Failure(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, _ container.RemoveOptions) error {
+		return fmt.Errorf("container busy")
+	}
+
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+
+	assert.NotPanics(t, func() {
+		mgr.removeContainer(context.Background(), "id", testLogger())
+	})
+}
+
+// TestRun_PanicInStartContainer_RecoveryFreesTrackerAndReports verifies the
+// recover() in Manager.Run: when startContainer panics (here, injected via
+// ContainerCreate), the deferred recover must free the tracker slot and
+// report the failure via the callback.
+func TestRun_PanicInStartContainer_RecoveryFreesTrackerAndReports(t *testing.T) {
+	reportedStatuses := make(chan string, 4)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reportedStatuses <- req.RunnerStatus:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	// Inject a panic deep in the start-container path. Using ContainerStart
+	// panics after ContainerCreate succeeds, so the panic fires inside
+	// startContainer and exercises the Run() recover path.
+	mock.ContainerStartFn = func(_ context.Context, _ string, _ container.StartOptions) error {
+		panic("docker sdk exploded")
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	// Must not crash the test binary.
+	assert.NotPanics(t, func() {
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+	})
+
+	assert.Equal(t, 0, tr.Count(), "tracker slot must be freed after panic recovery")
+
+	var sawFailed bool
+
+	for {
+		select {
+		case s := <-reportedStatuses:
+			if s == "failed" {
+				sawFailed = true
+			}
+		default:
+			assert.True(t, sawFailed, "reportFailure must fire from the recover() path")
+
+			return
+		}
+	}
+}
+
+// TestStreamLogs_StderrScannerPanic asserts that CTXRUN-040's per-goroutine
+// recover inside streamLogs isolates a panic in one of the three child
+// goroutines (here: stdcopy, which calls Read on the injected panicReader).
+// Before the fix a panic in these goroutines unwound the entire runner
+// process; now the runner must continue, the panic is surfaced as a
+// `system` LogEntry so operators see it, and waitAndCleanup must still run
+// to completion so the tracker entry is removed.
+func TestStreamLogs_StderrScannerPanic(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+		// panicReader's Read panics on first call. stdcopy.StdCopy will
+		// panic trying to read from it; the recover() installed by
+		// CTXRUN-040 must catch it and emit a system event.
+		return io.NopCloser(&panicReader{}), nil
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	broadcaster := newRecordingBroadcaster()
+	defer broadcaster.Close()
+
+	mgr := NewManager(mock, tr, cb, tp, broadcaster.inner, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	assert.NotPanics(t, func() {
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+	})
+	assert.Equal(t, 0, tr.Count(), "tracker entry must be removed even after child goroutine panic")
+
+	// Assert the system event announcing the recovered panic was published.
+	// We don't pin the exact goroutine name (stdcopy vs stderr_scanner vs
+	// logparser) because which child catches the panic depends on how
+	// stdcopy propagates it — the contract is "a system 'panicked' event
+	// shows up", not "this specific goroutine".
+	entries := broadcaster.Entries()
+
+	var panicSystemSeen bool
+
+	for _, e := range entries {
+		if e.Type == "system" && strings.Contains(e.Content, "panicked") {
+			panicSystemSeen = true
+
+			break
+		}
+	}
+
+	assert.True(t, panicSystemSeen, "expected a system LogEntry containing 'panicked'; got %d entries", len(entries))
+}
+
+// panicReader's Read method panics on first call — used only by the skipped
+// TestStreamLogs_StderrScannerPanic test body.
+type panicReader struct{}
+
+func (p *panicReader) Read(_ []byte) (int, error) {
+	panic("synthetic read panic for CTXRUN-040")
+}
+
+// recordingBroadcaster wraps logbroadcast.Broadcaster and captures published
+// entries so tests can assert on emitted LogEntry types/contents without
+// spawning a goroutine to drain a subscriber channel.
+type recordingBroadcaster struct {
+	inner *logbroadcast.Broadcaster
+	ch    <-chan logbroadcast.LogEntry
+	unsub func()
+
+	mu      sync.Mutex
+	entries []logbroadcast.LogEntry
+
+	done chan struct{}
+}
+
+func newRecordingBroadcaster() *recordingBroadcaster {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	ch, unsub := b.Subscribe("")
+
+	rec := &recordingBroadcaster{
+		inner: b,
+		ch:    ch,
+		unsub: unsub,
+		done:  make(chan struct{}),
+	}
+
+	go func() {
+		for {
+			select {
+			case <-rec.done:
+				return
+			case e, ok := <-ch:
+				if !ok {
+					return
+				}
+
+				rec.mu.Lock()
+				rec.entries = append(rec.entries, e)
+				rec.mu.Unlock()
+			}
+		}
+	}()
+
+	return rec
+}
+
+func (r *recordingBroadcaster) Broadcaster() *logbroadcast.Broadcaster {
+	return r.inner
+}
+
+// Close stops the drain goroutine and releases the subscription.
+func (r *recordingBroadcaster) Close() {
+	close(r.done)
+	r.unsub()
+}
+
+// Entries returns a snapshot of all published LogEntry values so far.
+func (r *recordingBroadcaster) Entries() []logbroadcast.LogEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make([]logbroadcast.LogEntry, len(r.entries))
+	copy(out, r.entries)
+
+	return out
+}
+
+func (r *recordingBroadcaster) filterType(typ string) []logbroadcast.LogEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make([]logbroadcast.LogEntry, 0, len(r.entries))
+
+	for _, e := range r.entries {
+		if e.Type == typ {
+			out = append(out, e)
+		}
+	}
+
+	return out
+}
+
+func joinContents(entries []logbroadcast.LogEntry) string {
+	var b strings.Builder
+
+	for _, e := range entries {
+		b.WriteString(e.Content)
+		b.WriteString("\n")
+	}
+
+	return b.String()
 }
 
 func TestNormalizeRepoURL(t *testing.T) {
@@ -1374,4 +2337,544 @@ func TestNormalizeRepoURL(t *testing.T) {
 			assert.Equal(t, tt.expected, normalizeRepoURL(tt.input))
 		})
 	}
+}
+
+// TestPullImage_EmptyPolicyReturnsError asserts that pullImage fails fast with
+// a descriptive error when ImagePullPolicy is unset, instead of silently
+// falling back to PullAlways. See CTXRUN-051.
+func TestPullImage_EmptyPolicyReturnsError(t *testing.T) {
+	// MockDockerClient with no function fields set: any call into the
+	// docker client would fall through to a default that either succeeds
+	// or returns a different error. We rely on pullImage short-circuiting
+	// before any docker call when the policy is empty.
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			t.Fatal("ImagePull must not be called when policy is unset")
+
+			return nil, nil
+		},
+	}
+
+	cfg := &config.Config{
+		BaseImage:        "test-image:latest",
+		ContainerTimeout: "1h",
+		// ImagePullPolicy intentionally left empty.
+	}
+	cfg.ParseContainerTimeout()
+
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, cfg, testLogger())
+
+	err := mgr.pullImage(context.Background(), "test-image:latest")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "image_pull_policy is unset")
+	assert.Contains(t, err.Error(), "programming error")
+}
+
+// TestWaitAndCleanup_MessageDuringCleanupGets404 verifies that the tracker
+// entry is removed BEFORE the Docker container is removed during cleanup
+// (H21 in REVIEW.md). The old defer order left the tracker entry in place
+// while the container was already gone, so a /message or /promote arriving
+// in that window tried to write stdin to a dead container and produced a
+// 500. After the fix, the tracker is unpublished first and the same request
+// gets the correct 404.
+//
+// We exercise the race by blocking ContainerRemove on a channel. Inside
+// that blocked window we inspect the tracker state: with the correct LIFO
+// ordering (tracker.Remove runs first), the entry must already be gone by
+// the time ContainerRemove is entered — so the webhook's "is there a
+// container tracked?" check returns false → 404.
+func TestWaitAndCleanup_MessageDuringCleanupGets404(t *testing.T) {
+	var (
+		release           = make(chan struct{})
+		trackedDuringRm   atomic.Bool
+		containerRemoved  atomic.Bool
+		messageAttemptErr atomic.Value // holds error
+	)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		return container.CreateResponse{ID: "ctr-55"}, nil
+	}
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		ch := make(chan container.WaitResponse, 1)
+		ch <- container.WaitResponse{StatusCode: 0}
+
+		return ch, make(chan error)
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, _ container.RemoveOptions) error {
+		// The defer LIFO fix means tracker.Remove runs BEFORE
+		// removeContainer. Record the tracker state at entry so the
+		// assertion below can catch a regression.
+		_, stillTracked := tr.Snapshot("my-project", "PROJ-042")
+		trackedDuringRm.Store(stillTracked)
+
+		// Simulate a concurrent /message path that would take: Has() check
+		// → WriteStdin. Both should now fail with "not tracked" shape,
+		// producing a 404 at the webhook layer instead of a 500.
+		err := tr.WriteStdin("my-project", "PROJ-042", []byte("late\n"))
+		messageAttemptErr.Store(err)
+
+		<-release
+		containerRemoved.Store(true)
+
+		return nil
+	}
+
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:    payload.CardID,
+		Project:   payload.Project,
+		StartedAt: time.Now(),
+	}))
+
+	done := make(chan struct{})
+
+	go func() {
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+		close(done)
+	}()
+
+	// Let ContainerRemove get called and block.
+	require.Eventually(t, func() bool {
+		return messageAttemptErr.Load() != nil
+	}, 2*time.Second, 10*time.Millisecond,
+		"ContainerRemove must be entered so the test can inspect tracker state")
+
+	// H21 assertion: by the time ContainerRemove is entered, the tracker
+	// entry must already be gone — tracker.Remove is the last defer (first
+	// to execute) in waitAndCleanup.
+	assert.False(t, trackedDuringRm.Load(),
+		"tracker.Remove must run before ContainerRemove so /message gets 404")
+
+	// The simulated /message write must have failed with the no-container-
+	// tracked error (not an ErrNoStdinAttached, not nil). The handler maps
+	// that shape to 404.
+	errV := messageAttemptErr.Load()
+	require.NotNil(t, errV, "WriteStdin must have been attempted during cleanup")
+
+	err, _ := errV.(error)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no container tracked",
+		"WriteStdin during cleanup must return the 'no container tracked' shape (404), not a 500")
+	require.NotErrorIs(t, err, tracker.ErrNoStdinAttached,
+		"must not surface as ErrNoStdinAttached (409); the entry is gone, not just stdin")
+
+	close(release)
+	<-done
+
+	assert.True(t, containerRemoved.Load(), "ContainerRemove must complete after release")
+	assert.Equal(t, 0, tr.Count(), "tracker must end empty")
+}
+
+// TestIdleWatchdog_KillsOnSilence verifies the CTXRUN-058 idle-output watchdog
+// kills the container and emits a "idle timeout" system event when no output
+// has been observed for longer than IdleOutputTimeout. Exercises the goroutine
+// directly (rather than via streamLogs + a fake stream) so the test is
+// deterministic and does not depend on docker multiplexed framing.
+func TestIdleWatchdog_KillsOnSilence(t *testing.T) {
+	// Shrink the poll tick so the watchdog reacts promptly inside the test.
+	prev := idleWatchdogCheckInterval
+	idleWatchdogCheckInterval = 10 * time.Millisecond
+
+	t.Cleanup(func() { idleWatchdogCheckInterval = prev })
+
+	cfg := testConfig()
+	cfg.IdleOutputTimeout = 50 * time.Millisecond
+
+	mock := successfulMock()
+
+	tr := tracker.New()
+	broadcaster := newRecordingBroadcaster()
+	t.Cleanup(broadcaster.Close)
+
+	mgr := NewManager(mock, tr, nil, nil, broadcaster.Broadcaster(), cfg, testLogger())
+
+	// Register a tracker entry whose Cancel is observable. A successful Kill
+	// path invokes tracker.Cancel, which flips cancelled.
+	var cancelled atomic.Bool
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  func() { cancelled.Store(true) },
+	}))
+
+	// Seed lastOutputAt to a time well before now so the very first poll
+	// deems the container idle.
+	var lastOutputAt atomic.Pointer[time.Time]
+
+	stale := time.Now().Add(-time.Hour)
+	lastOutputAt.Store(&stale)
+
+	done := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		defer close(done)
+
+		mgr.runIdleWatchdog(ctx, make(chan struct{}), "ctr-idle", payload, testLogger(), &lastOutputAt, cfg.IdleOutputTimeout)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not fire within 2s")
+	}
+
+	assert.True(t, cancelled.Load(), "watchdog must Cancel the tracker entry")
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(joinContents(broadcaster.filterType("system")), "idle timeout")
+	}, 2*time.Second, 10*time.Millisecond,
+		"an 'idle timeout' system event must be emitted")
+}
+
+// TestIdleWatchdog_DoesNotKillWhileActive verifies the watchdog stays silent
+// while the container keeps publishing output faster than the idle timeout.
+func TestIdleWatchdog_DoesNotKillWhileActive(t *testing.T) {
+	prev := idleWatchdogCheckInterval
+	idleWatchdogCheckInterval = 5 * time.Millisecond
+
+	t.Cleanup(func() { idleWatchdogCheckInterval = prev })
+
+	cfg := testConfig()
+	cfg.IdleOutputTimeout = 50 * time.Millisecond
+
+	mock := successfulMock()
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, cfg, testLogger())
+
+	var cancelled atomic.Bool
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  func() { cancelled.Store(true) },
+	}))
+
+	var lastOutputAt atomic.Pointer[time.Time]
+
+	now := time.Now()
+	lastOutputAt.Store(&now)
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	stopFeed := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopFeed:
+				return
+			case t := <-ticker.C:
+				lastOutputAt.Store(&t)
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		mgr.runIdleWatchdog(ctx, stopFeed, "ctr-active", payload, testLogger(), &lastOutputAt, cfg.IdleOutputTimeout)
+	}()
+
+	// Feed events for 200 ms; watchdog must remain quiet.
+	time.Sleep(200 * time.Millisecond)
+	close(stopFeed) // closing stops both the feeder and the watchdog
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("watchdog did not exit after done was closed")
+	}
+
+	assert.False(t, cancelled.Load(), "watchdog must not fire while output is flowing")
+}
+
+// TestIdleWatchdog_Disabled verifies that IdleOutputTimeout=0 prevents the
+// watchdog from being spawned at all: streamLogs runs to completion without a
+// kill even though the stream is empty and lastOutputAt never advances.
+func TestIdleWatchdog_Disabled(t *testing.T) {
+	cfg := testConfig()
+	cfg.IdleOutputTimeout = 0 // disabled
+
+	mock := successfulMock()
+
+	// Empty log stream: logparser will hit EOF immediately, streamLogs done
+	// closes, and since the watchdog is disabled no Kill path fires.
+	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+
+	var cancelled atomic.Bool
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  func() { cancelled.Store(true) },
+	}))
+
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	assert.False(t, cancelled.Load(), "watchdog must not fire when IdleOutputTimeout is 0")
+}
+
+// TestPruneImages_CallsDockerWithCorrectFilters verifies PruneImages forwards
+// the CTXRUN-058 filters (dangling=true, until=24h) to dockerd and surfaces
+// the prune report as a nil error.
+func TestPruneImages_CallsDockerWithCorrectFilters(t *testing.T) {
+	var capturedFilter filters.Args
+
+	mock := successfulMock()
+	mock.ImagesPruneFn = func(_ context.Context, f filters.Args) (image.PruneReport, error) {
+		capturedFilter = f
+
+		return image.PruneReport{
+			ImagesDeleted:  []image.DeleteResponse{{Deleted: "sha256:aaa"}},
+			SpaceReclaimed: 42,
+		}, nil
+	}
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	err := mgr.PruneImages(context.Background())
+	require.NoError(t, err)
+
+	// dangling=true / until=24h must be present. filters.Args.Get returns
+	// the slice of values for the given key.
+	danglingVals := capturedFilter.Get("dangling")
+	assert.Contains(t, danglingVals, "true", "filter must include dangling=true")
+
+	untilVals := capturedFilter.Get("until")
+	assert.Contains(t, untilVals, "24h", "filter must include until=24h")
+}
+
+// TestPruneImages_PropagatesDockerError verifies that an ImagesPrune failure
+// is wrapped and returned so the maintenance loop can log it.
+func TestPruneImages_PropagatesDockerError(t *testing.T) {
+	mock := successfulMock()
+	mock.ImagesPruneFn = func(_ context.Context, _ filters.Args) (image.PruneReport, error) {
+		return image.PruneReport{}, errors.New("dockerd gone")
+	}
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	err := mgr.PruneImages(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "images prune")
+	assert.Contains(t, err.Error(), "dockerd gone")
+}
+
+// stubResolver is a test double for hostResolver. Calls increments a counter;
+// sleep simulates a slow authoritative DNS server; addrs is the canned
+// response used when the sleep (if any) completes in time.
+type stubResolver struct {
+	calls atomic.Int64
+	sleep time.Duration
+	addrs []string
+	err   error
+}
+
+func (s *stubResolver) LookupHost(ctx context.Context, _ string) ([]string, error) {
+	s.calls.Add(1)
+
+	if s.sleep > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(s.sleep):
+		}
+	}
+
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	return s.addrs, nil
+}
+
+// TestBuildExtraHosts_DNSTimeout asserts that a hostile / slow authoritative
+// DNS server cannot stall the spawn path indefinitely. The stub sleeps well
+// past the 2s cap; buildExtraHosts must return within a small envelope of the
+// cap and must return only the default host-gateway entry (no MCP mapping).
+// CTXRUN-059 (H24).
+func TestBuildExtraHosts_DNSTimeout(t *testing.T) {
+	mock := successfulMock()
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr.resolver = &stubResolver{sleep: 5 * time.Second, addrs: []string{"10.0.0.1"}}
+
+	start := time.Now()
+	hosts := mgr.buildExtraHosts(context.Background(), "http://slow-dns.example:8080/mcp")
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"buildExtraHosts must honour the 2s cap; got %s", elapsed)
+	assert.Equal(t, []string{"host.docker.internal:host-gateway"}, hosts,
+		"on timeout buildExtraHosts must return only the default entry")
+}
+
+// TestBuildExtraHosts_DNSCache asserts that a second resolution for the same
+// hostname is served from the cache without a second resolver call. This is
+// the spawn-burst case: three containers starting in quick succession against
+// the same MCP host should pay at most one DNS RTT between them.
+func TestBuildExtraHosts_DNSCache(t *testing.T) {
+	mock := successfulMock()
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	stub := &stubResolver{addrs: []string{"192.0.2.17"}}
+	mgr.resolver = stub
+
+	// First call populates the cache.
+	h1 := mgr.buildExtraHosts(context.Background(), "http://cache-me.example:8080/mcp")
+	require.Contains(t, h1, "cache-me.example:192.0.2.17")
+	require.Equal(t, int64(1), stub.calls.Load(), "first call must hit the resolver")
+
+	// Second call must be served from the cache.
+	h2 := mgr.buildExtraHosts(context.Background(), "http://cache-me.example:8080/mcp")
+	require.Contains(t, h2, "cache-me.example:192.0.2.17")
+	assert.Equal(t, int64(1), stub.calls.Load(),
+		"second call with same hostname must be served from cache; got %d calls", stub.calls.Load())
+}
+
+// TestRun_RunningCallbackAsync asserts that startContainer + waitAndCleanup
+// do not block on a slow running-status callback. The mock callback server
+// sleeps 500ms before responding; the whole Run must still complete well
+// under 1s because the callback is fired on a detached goroutine. CTXRUN-059
+// (H23).
+func TestRun_RunningCallbackAsync(t *testing.T) {
+	var runningSeen atomic.Bool
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+
+		if req.RunnerStatus == "running" {
+			runningSeen.Store(true)
+			// Simulate a slow CM by sleeping before responding.
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	start := time.Now()
+
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	elapsed := time.Since(start)
+
+	// The container's Wait path returns immediately via the mock, so the
+	// whole Run should complete in well under 1s. If the running callback
+	// were synchronous, the 500ms CM sleep would push us past that mark.
+	assert.Less(t, elapsed, 500*time.Millisecond,
+		"Run must not block on the running-status callback; got %s", elapsed)
+
+	// Give the async callback a chance to land so we don't leak a goroutine
+	// into subsequent tests. We don't assert runningSeen inside the <500ms
+	// window because the goroutine may not have raced ahead of mgr.Wait().
+	require.Eventually(t, runningSeen.Load, 2*time.Second, 10*time.Millisecond,
+		"running callback must eventually fire on its own goroutine")
+}
+
+// TestDNSCache_PutGet exercises the cache primitives directly: a put/get
+// pair must hit, and an expired entry must miss.
+func TestDNSCache_PutGet(t *testing.T) {
+	c := newDNSCache(50*time.Millisecond, 16)
+
+	c.put("h.example", []string{"10.0.0.1"})
+
+	got, ok := c.get("h.example")
+	require.True(t, ok)
+	assert.Equal(t, []string{"10.0.0.1"}, got)
+
+	// Expire.
+	time.Sleep(75 * time.Millisecond)
+
+	_, ok = c.get("h.example")
+	assert.False(t, ok, "expired entry must miss")
+}
+
+// TestDNSCache_Capacity evicts the oldest entry on overflow.
+func TestDNSCache_Capacity(t *testing.T) {
+	c := newDNSCache(time.Hour, 2)
+
+	c.put("a", []string{"1"})
+	c.put("b", []string{"2"})
+	c.put("c", []string{"3"})
+
+	assert.Equal(t, 2, c.len())
+
+	_, ok := c.get("a")
+	assert.False(t, ok, "oldest entry must be evicted")
+
+	_, ok = c.get("b")
+	assert.True(t, ok)
+
+	_, ok = c.get("c")
+	assert.True(t, ok)
 }

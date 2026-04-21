@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,7 +156,7 @@ func (p *TokenProvider) GenerateToken(ctx context.Context) (string, error) {
 func (p *TokenProvider) createJWT() (string, error) {
 	now := time.Now()
 	claims := jwt.RegisteredClaims{
-		Issuer:    fmt.Sprintf("%d", p.appID),
+		Issuer:    strconv.FormatInt(p.appID, 10),
 		IssuedAt:  jwt.NewNumericDate(now.Add(-60 * time.Second)), // clock skew tolerance
 		ExpiresAt: jwt.NewNumericDate(now.Add(jwtExpiry)),
 	}
