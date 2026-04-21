@@ -17,8 +17,17 @@ import (
 )
 
 // maxScannerBuf is the maximum token size for the scanner. Thinking blocks
-// can be very long, so we allocate a generous buffer.
+// can be very long, so we allow up to 1MiB — but the scanner allocates only
+// initScannerBuf up front and grows geometrically on demand so the typical
+// short-line case doesn't pin the worst-case buffer for the container's
+// lifetime. See CTXRUN-059 (H26).
 const maxScannerBuf = 1 << 20 // 1 MiB
+
+// initScannerBuf is the initial capacity handed to bufio.Scanner.Buffer.
+// bufio.Scanner doubles internally when a line exceeds the current capacity,
+// so this only sets the starting allocation — long stream-json lines still
+// work up to maxScannerBuf.
+const initScannerBuf = 64 * 1024 // 64 KiB
 
 // maxToolCallLen is the maximum number of runes in a formatted tool call
 // summary before it is truncated with a trailing ellipsis.
@@ -29,6 +38,12 @@ var whitespaceRun = regexp.MustCompile(`\s+`)
 
 // secretPatterns matches common credential formats that should never appear in
 // logs. Compiled once at package init time.
+//
+// The KEY=VALUE patterns (e.g. CLAUDE_CODE_OAUTH_TOKEN=...) use a capturing
+// group on the key so the replacement can preserve the key name while
+// redacting only the value — useful when the match appears in a docker
+// inspect-style env dump, where knowing *which* env var was present is
+// helpful for debugging.
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`ghp_[A-Za-z0-9_]{36,}`),           // GitHub personal access token
 	regexp.MustCompile(`gho_[A-Za-z0-9_]{36,}`),           // GitHub OAuth token
@@ -36,21 +51,122 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`ghs_[A-Za-z0-9_]{36,}`),           // GitHub server-to-server token
 	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`),    // GitHub fine-grained PAT
 	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`),       // Anthropic API key
+	regexp.MustCompile(`v1\.[0-9a-f]{40,}`),               // GitHub App installation token
 	regexp.MustCompile(`Bearer\s+[A-Za-z0-9._\-/+]{20,}`), // Bearer tokens in output
 }
 
-// Redact replaces recognized secret patterns with [REDACTED].
+// envSecretKeys are environment-variable names whose values are secrets the
+// runner injects into worker containers. When they appear as KEY=value in a
+// log line (e.g. a dumped env block or a shell trace), the value is redacted
+// but the key name is preserved.
+var envSecretKeys = []string{
+	"CLAUDE_CODE_OAUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"CM_MCP_API_KEY",
+	"CM_GIT_TOKEN",
+}
+
+// envSecretPatterns is a derived slice of regexps matching KEY=<non-whitespace>
+// for each entry in envSecretKeys. Compiled once at package init time.
+var envSecretPatterns = buildEnvSecretPatterns(envSecretKeys)
+
+func buildEnvSecretPatterns(keys []string) []*regexp.Regexp {
+	out := make([]*regexp.Regexp, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, regexp.MustCompile(`(`+regexp.QuoteMeta(k)+`)=\S+`))
+	}
+
+	return out
+}
+
+// Redact replaces recognized secret patterns with [REDACTED]. For KEY=value
+// style env-var secrets it preserves the key name (e.g.
+// "CM_MCP_API_KEY=[REDACTED]") so operators can still tell which secret was
+// about to be logged.
 //
-// Redact is called only on container output: assistant text/thinking blocks
-// inside ProcessStream, and stderr lines in container/manager.go. It is NOT
-// applied to "user" or "system" LogEntry values, which are published directly
-// by webhook handlers without passing through this function.
+// Redact is called on container output: assistant text/thinking blocks inside
+// ProcessStream, stderr lines in container/manager.go, and tool_use summaries.
+// It is NOT applied to "user" or "system" LogEntry values, which are published
+// directly by webhook handlers without passing through this function.
 func Redact(s string) string {
+	for _, re := range envSecretPatterns {
+		s = re.ReplaceAllString(s, "$1=[REDACTED]")
+	}
+
 	for _, re := range secretPatterns {
 		s = re.ReplaceAllString(s, "[REDACTED]")
 	}
 
 	return s
+}
+
+// Redactor redacts secrets from a string, including the static Redact
+// patterns and an additional set of literal secret values supplied at
+// construction time. Redactor is intended to be created per container so
+// live tokens (installation tokens, MCP API keys, Anthropic OAuth tokens)
+// injected into that container's environment are masked even if they appear
+// verbatim in the container's output — a belt-and-suspenders complement to
+// the static patterns.
+//
+// A Redactor with no secrets is equivalent to Redact.
+type Redactor struct {
+	// secrets is the list of literal strings to mask, sorted longest-first
+	// so that substring overlaps redact at the longest match.
+	secrets []string
+}
+
+// NewRedactor returns a Redactor that masks the static secret patterns and
+// each non-empty value in secrets. Duplicate and empty values are discarded;
+// values shorter than 8 bytes are also discarded to avoid catastrophic
+// over-redaction (e.g. redacting every occurrence of a 4-character token).
+func NewRedactor(secrets []string) *Redactor {
+	const minSecretLen = 8
+
+	seen := make(map[string]struct{}, len(secrets))
+	filtered := make([]string, 0, len(secrets))
+
+	for _, s := range secrets {
+		if len(s) < minSecretLen {
+			continue
+		}
+
+		if _, ok := seen[s]; ok {
+			continue
+		}
+
+		seen[s] = struct{}{}
+
+		filtered = append(filtered, s)
+	}
+
+	// Sort longest-first so overlapping substrings redact at the broader
+	// match (e.g. a token that happens to contain a shorter secret as a
+	// prefix).
+	sortLongestFirst(filtered)
+
+	return &Redactor{secrets: filtered}
+}
+
+func sortLongestFirst(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && len(s[j]) > len(s[j-1]); j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+// Redact returns input with literal secret values and recognized patterns
+// replaced by [REDACTED].
+func (r *Redactor) Redact(input string) string {
+	if r == nil {
+		return Redact(input)
+	}
+
+	for _, secret := range r.secrets {
+		input = strings.ReplaceAll(input, secret, "[REDACTED]")
+	}
+
+	return Redact(input)
 }
 
 // event is the top-level structure of every stream-json line.
@@ -256,10 +372,29 @@ func compactJSON(input json.RawMessage) string {
 //
 // emit is called for each parsed block after the slog call. If emit is nil,
 // it is skipped (backward-compatible with callers that do not need broadcasting).
+//
+// ProcessStream applies the static Redact patterns. Callers wanting
+// per-container literal-secret redaction should use ProcessStreamWithRedactor.
 func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogEntry)) {
+	ProcessStreamWithRedactor(r, logger, nil, emit)
+}
+
+// ProcessStreamWithRedactor is like ProcessStream but applies redactor to
+// every text/thinking/tool_use block before logging and emission. If redactor
+// is nil the behaviour falls back to the static Redact.
+func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redactor, emit func(logbroadcast.LogEntry)) {
+	redact := func(s string) string {
+		if redactor == nil {
+			return Redact(s)
+		}
+
+		return redactor.Redact(s)
+	}
+
 	scanner := bufio.NewScanner(r)
-	buf := make([]byte, maxScannerBuf)
-	scanner.Buffer(buf, maxScannerBuf)
+	// Start at initScannerBuf; bufio.Scanner grows as needed up to maxScannerBuf.
+	// See CTXRUN-059 (H26) for the memory-footprint rationale.
+	scanner.Buffer(make([]byte, 0, initScannerBuf), maxScannerBuf)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -281,14 +416,14 @@ func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogE
 		for _, block := range ev.Message.Content {
 			switch block.Type {
 			case "text":
-				content := Redact(block.Text)
+				content := redact(block.Text)
 				logger.Info("claude", "claude_text", content)
 
 				if emit != nil {
 					emit(logbroadcast.LogEntry{Type: "text", Content: content})
 				}
 			case "thinking":
-				content := Redact(block.Thinking)
+				content := redact(block.Thinking)
 				logger.Info("claude", "claude_thinking", content)
 
 				if emit != nil {
@@ -299,7 +434,7 @@ func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogE
 					continue
 				}
 
-				content := Redact(formatToolCall(block.Name, block.Input))
+				content := redact(formatToolCall(block.Name, block.Input))
 				logger.Info("claude", "claude_tool", content)
 
 				if emit != nil {
