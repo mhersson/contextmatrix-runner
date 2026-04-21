@@ -94,7 +94,7 @@ RUN set -eux; \
 # (~350MB) and keeps Trivy's secret scanner from matching against regex
 # literals inside gosec's source that ships in that cache.
 RUN GOBIN=/usr/local/go/bin go install "golang.org/x/tools/gopls@${GOPLS_VERSION}" \
-    && GOBIN=/usr/local/bin go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}" \
+    && CGO_ENABLED=0 GOBIN=/usr/local/bin go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}" \
     && go clean -modcache
 
 # Install Claude Code CLI via npm at an exact version. Replaces the prior
