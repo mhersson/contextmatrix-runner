@@ -31,10 +31,6 @@ ARG GO_SHA256_AMD64=990e6b4bbba816dc3ee129eaeaf4b42f17c2800b88a2166c265ac1a20026
 ARG GO_SHA256_ARM64=c958a1fe1b361391db163a485e21f5f228142d6f8b584f6bef89b26f66dc5b23
 ARG GOPLS_VERSION=v0.21.1
 ARG GOLANGCI_LINT_VERSION=v2.11.4
-# SHA256 of the golangci-lint installer script at GOLANGCI_LINT_VERSION.
-# Captured on 2026-04-21. Update alongside GOLANGCI_LINT_VERSION; CI will
-# fail closed if the installer ever mutates under a pinned tag.
-ARG GOLANGCI_LINT_INSTALL_SHA256=edfa587f31bde70db161d1e5b783e086a1627d7e2f7c91de5f7cca79bcdf8631
 ARG CLAUDE_CODE_VERSION=2.1.116
 # NodeSource publishes rolling "setup_25.x" packages, so nodejs itself is
 # pinned via the NodeSource apt repo; the installed package version tracks
@@ -91,20 +87,15 @@ RUN set -eux; \
     tar -C /usr/local -xzf "/tmp/${TARBALL}"; \
     rm -f "/tmp/${TARBALL}"
 
-# Install gopls (Go language server for Claude Code LSP integration) at a
-# pinned tag — never @latest.
-RUN GOBIN=/usr/local/go/bin go install "golang.org/x/tools/gopls@${GOPLS_VERSION}"
-
-# Install golangci-lint. The installer script is fetched at the pinned tag,
-# its SHA256 verified, then piped to sh. Fetching `.../<tag>/install.sh`
-# and pinning the content hash protects against both a tag mutation and a
-# supply-chain compromise of the release branch.
-RUN set -eux; \
-    curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh" \
-      -o /tmp/golangci-lint-install.sh; \
-    echo "${GOLANGCI_LINT_INSTALL_SHA256}  /tmp/golangci-lint-install.sh" | sha256sum -c -; \
-    sh /tmp/golangci-lint-install.sh -b /usr/local/bin "${GOLANGCI_LINT_VERSION}"; \
-    rm -f /tmp/golangci-lint-install.sh
+# Install gopls (Go language server for Claude Code LSP integration) at
+# a pinned tag — never @latest — and golangci-lint from source so both
+# binaries are compiled against the Go toolchain we just pinned. Running
+# both in one RUN lets us drop the shared module cache in the same layer
+# (~350MB) and keeps Trivy's secret scanner from matching against regex
+# literals inside gosec's source that ships in that cache.
+RUN GOBIN=/usr/local/go/bin go install "golang.org/x/tools/gopls@${GOPLS_VERSION}" \
+    && GOBIN=/usr/local/bin go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}" \
+    && go clean -modcache
 
 # Install Claude Code CLI via npm at an exact version. Replaces the prior
 # `curl … | bash` installer (REVIEW.md C15). The npm tarball integrity is

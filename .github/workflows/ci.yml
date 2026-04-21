@@ -173,6 +173,16 @@ jobs:
           exit-code: "1"
           ignore-unfixed: true
           vuln-type: os,library
+          # Only scan for vulnerabilities. The default also runs a
+          # secret scanner which flags regex literals in gosec (shipped
+          # as part of golangci-lint) as hardcoded credentials — those
+          # are false positives. Dedicated secret scanning, if wanted,
+          # belongs in a separate workflow against the source tree.
+          scanners: vuln
+          # Accept upstream-unreachable transitive CVEs (gopls deps, npm
+          # picomatch). Each entry has a justification + review prompt in
+          # the file itself.
+          trivyignores: .trivyignore
 
   worker-image-sbom:
     name: worker-image-sbom
