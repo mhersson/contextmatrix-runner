@@ -925,6 +925,128 @@ func TestIsDev(t *testing.T) {
 	}
 }
 
+// baseDevConfig returns a minimal valid config in dev mode without GitHub auth.
+// Tests that exercise dev-mode digest-pin relaxation set their own GitHub auth.
+func baseDevConfig(t *testing.T, pemPath string) *Config {
+	t.Helper()
+
+	return &Config{
+		ContextMatrixURL:  "http://localhost",
+		APIKey:            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:         testDigestImage,
+		ImagePullPolicy:   PullAlways,
+		MaxConcurrent:     1,
+		ContainerTimeout:  "1h",
+		AnthropicAPIKey:   "sk-ant-test",
+		DeploymentProfile: ProfileDev,
+		GitHubApp: GitHubApp{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+}
+
+// TestValidate_DevMode_UnpinnedBaseImage verifies that in dev mode an unpinned
+// base_image does not cause Validate to return an error, and the reference is
+// collected in UnpinnedImageRefs.
+func TestValidate_DevMode_UnpinnedBaseImage(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.BaseImage = "contextmatrix/worker:latest"
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+
+	require.Len(t, cfg.UnpinnedImageRefs, 1)
+	assert.Equal(t, "base_image", cfg.UnpinnedImageRefs[0].Field)
+	assert.Equal(t, "contextmatrix/worker:latest", cfg.UnpinnedImageRefs[0].Image)
+}
+
+// TestValidate_DevMode_MultipleUnpinnedAllowedImages verifies that all unpinned
+// allowed_images entries are collected in dev mode with their indexed field names.
+func TestValidate_DevMode_MultipleUnpinnedAllowedImages(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.AllowedImages = []string{
+		"contextmatrix/worker:v1",
+		"contextmatrix/worker:v2",
+	}
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+
+	require.Len(t, cfg.UnpinnedImageRefs, 2)
+	assert.Equal(t, "allowed_images[0]", cfg.UnpinnedImageRefs[0].Field)
+	assert.Equal(t, "contextmatrix/worker:v1", cfg.UnpinnedImageRefs[0].Image)
+	assert.Equal(t, "allowed_images[1]", cfg.UnpinnedImageRefs[1].Field)
+	assert.Equal(t, "contextmatrix/worker:v2", cfg.UnpinnedImageRefs[1].Image)
+}
+
+// TestValidate_Production_UnpinnedBaseImageFails verifies that production mode
+// keeps the existing fail-closed behaviour for unpinned base_image.
+func TestValidate_Production_UnpinnedBaseImageFails(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := baseValidConfigNoGitHub(t)
+	cfg.GitHubApp = GitHubApp{
+		AppID:          1,
+		InstallationID: 1,
+		PrivateKeyPath: pemPath,
+	}
+	cfg.BaseImage = "contextmatrix/worker:latest"
+	// DeploymentProfile is zero-value ("") which Validate normalises to production.
+
+	err := cfg.Validate()
+	require.ErrorContains(t, err, "base_image must be @sha256:... pinned")
+	assert.Nil(t, cfg.UnpinnedImageRefs)
+}
+
+// TestValidate_DevMode_FullyPinned verifies that when all images are digest-pinned
+// in dev mode, UnpinnedImageRefs is empty (no spurious WARNs on startup).
+func TestValidate_DevMode_FullyPinned(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	pinnedA := "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pinnedB := "contextmatrix/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.BaseImage = pinnedA
+	cfg.AllowedImages = []string{pinnedB}
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.UnpinnedImageRefs)
+}
+
+// TestValidate_DevMode_MixedPinning verifies that only unpinned entries appear
+// in UnpinnedImageRefs when some allowed_images are pinned and some are not.
+func TestValidate_DevMode_MixedPinning(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	pinnedB := "contextmatrix/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	cfg := baseDevConfig(t, pemPath)
+	cfg.AllowedImages = []string{
+		pinnedB,
+		"contextmatrix/worker:unpinned",
+	}
+
+	err := cfg.Validate()
+	require.NoError(t, err)
+
+	require.Len(t, cfg.UnpinnedImageRefs, 1)
+	assert.Equal(t, "allowed_images[1]", cfg.UnpinnedImageRefs[0].Field)
+	assert.Equal(t, "contextmatrix/worker:unpinned", cfg.UnpinnedImageRefs[0].Image)
+}
+
 // TestValidate_AllowedImagesDigestPin ensures every entry in the
 // allowed_images allowlist is digest-pinned, not just base_image. A single
 // tag-only entry must fail validation so H2's "allowlist matches strings

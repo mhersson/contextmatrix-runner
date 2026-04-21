@@ -30,6 +30,14 @@ const (
 	ProfileDev        = "dev"
 )
 
+// UnpinnedImageRef records an image reference that failed the digest-pin check
+// but was accepted because the runner is in dev mode. Populated during
+// Validate(); never serialised to YAML.
+type UnpinnedImageRef struct {
+	Field string
+	Image string
+}
+
 // Config holds all runner configuration.
 type Config struct {
 	Port                 int       `yaml:"port"`
@@ -87,6 +95,11 @@ type Config struct {
 	// Follow-up subtasks document which specific validators are relaxed in
 	// dev mode. Env: CMR_DEPLOYMENT_PROFILE.
 	DeploymentProfile string `yaml:"deployment_profile"`
+
+	// UnpinnedImageRefs is populated during Validate() when IsDev() is true
+	// and one or more image references are not digest-pinned. Callers (main.go)
+	// log a WARN per entry. Never serialised to YAML.
+	UnpinnedImageRefs []UnpinnedImageRef `yaml:"-"`
 
 	containerTimeoutDuration time.Duration
 }
@@ -207,13 +220,28 @@ func (c *Config) Validate() error {
 	// A mutable tag like `:latest` would let a rebuilt upstream image
 	// silently ship into production; require `@sha256:...` so operators
 	// roll base images intentionally.
+	//
+	// In dev mode we collect unpinned references instead of failing hard, so
+	// local development setups can use mutable tags. The caller (main.go) logs
+	// a WARN per entry. Production mode keeps the fail-closed behaviour.
+	c.UnpinnedImageRefs = nil
+
 	if err := requireDigestPin("base_image", c.BaseImage); err != nil {
-		return err
+		if !c.IsDev() {
+			return err
+		}
+
+		c.UnpinnedImageRefs = append(c.UnpinnedImageRefs, UnpinnedImageRef{Field: "base_image", Image: c.BaseImage})
 	}
 
 	for i, img := range c.AllowedImages {
-		if err := requireDigestPin(fmt.Sprintf("allowed_images[%d]", i), img); err != nil {
-			return err
+		field := fmt.Sprintf("allowed_images[%d]", i)
+		if err := requireDigestPin(field, img); err != nil {
+			if !c.IsDev() {
+				return err
+			}
+
+			c.UnpinnedImageRefs = append(c.UnpinnedImageRefs, UnpinnedImageRef{Field: field, Image: img})
 		}
 	}
 

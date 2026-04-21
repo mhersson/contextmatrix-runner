@@ -73,6 +73,10 @@ func main() {
 
 	logger := newLogger(cfg)
 
+	for _, ref := range cfg.UnpinnedImageRefs {
+		logger.Warn("dev profile: accepting unpinned image reference", "field", ref.Field, "image", ref.Image)
+	}
+
 	// Initialize OpenTelemetry. When OTEL_EXPORTER_OTLP_ENDPOINT is unset the
 	// provider runs in no-op mode, so local dev needs no collector.
 	shutdownTracer, err := tracing.Init(context.Background(), logger)
