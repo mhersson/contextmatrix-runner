@@ -42,6 +42,12 @@ ARG CLAUDE_CODE_VERSION=2.1.116
 # version pin (e.g. nodejs=25.9.0-1nodesource1) once NodeSource publishes a
 # snapshot-style archive we can rely on for reproducibility.
 
+# Use bash with pipefail for all RUN instructions so a pipe component
+# failing mid-chain (e.g. the curl half of a `curl | sha256sum -c -`
+# checksum verification) aborts the step instead of getting masked by a
+# zero exit code from the final command.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     PATH="/usr/local/go/bin:/home/user/go/bin:/home/user/.local/bin:${PATH}"
@@ -56,7 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Node 25 to match contextmatrix's frontend build stage. NodeSource's
 # setup_25.x script is executed via bash but all packages ultimately come
 # from a signed apt repo (keyring added by the setup script).
-# hadolint ignore=DL3008,DL4006
+# hadolint ignore=DL3008
 RUN curl -fsSL https://deb.nodesource.com/setup_25.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -102,10 +108,12 @@ RUN set -eux; \
 
 # Copy entrypoint.
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod 755 /entrypoint.sh
 
-# Create non-root user at UID 1000 (Debian slim has no default user at this UID).
-RUN useradd -m -u 1000 -s /bin/bash user
+# Make entrypoint executable and create non-root user at UID 1000
+# (Debian slim has no default user at this UID). Combined into one RUN
+# so hadolint DL3059 does not flag the consecutive instructions.
+RUN chmod 755 /entrypoint.sh \
+    && useradd -m -u 1000 -s /bin/bash user
 USER user
 WORKDIR /home/user
 
