@@ -70,6 +70,12 @@ ALLOWED_TOOLS_COMMON=(
     "Bash(go run:*)"
     "Bash(go install:*)"
     "Bash(make:*)"
+    # Node.js / frontend workflow (npm install/test/build, node scripts).
+    "Bash(npm:*)"
+    "Bash(node:*)"
+    # Python — generic scripts, pip for packages; pytest etc. run via python3 -m.
+    "Bash(python3:*)"
+    "Bash(pip3:*)"
     # Filesystem basics. rm is intentionally broad because worker containers
     # are disposable; the real blast-radius control is container isolation,
     # not shell argument filtering.
@@ -99,6 +105,7 @@ ALLOWED_TOOLS_COMMON=(
     "Bash(tee:*)"
     "Bash(xargs:*)"
     "Bash(date:*)"
+    "Bash(jq:*)"
     "mcp__contextmatrix__add_log"
     "mcp__contextmatrix__check_agent_health"
     "mcp__contextmatrix__claim_card"
