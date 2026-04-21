@@ -11,6 +11,8 @@ type PATProvider struct {
 	token string
 }
 
+var _ TokenGenerator = (*PATProvider)(nil)
+
 // NewPATProvider returns a PATProvider wrapping the given token.
 // Returns an error if token is empty.
 func NewPATProvider(token string) (*PATProvider, error) {
