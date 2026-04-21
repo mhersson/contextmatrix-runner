@@ -84,6 +84,14 @@ func (sr *statusRecorder) Flush() {
 	}
 }
 
+// Unwrap lets http.NewResponseController walk past this wrapper to reach the
+// underlying ResponseWriter. Without it, SetWriteDeadline on the SSE /logs
+// handler silently fails and the server's WriteTimeout terminates every
+// long-lived connection after ~30s. See handler.handleLogs.
+func (sr *statusRecorder) Unwrap() http.ResponseWriter {
+	return sr.ResponseWriter
+}
+
 // withMetrics wraps every webhook handler and records request count + duration
 // on the provided metrics bundle. The endpoint label is the URL path with a
 // leading slash stripped; status is the HTTP status code; code is a coarse

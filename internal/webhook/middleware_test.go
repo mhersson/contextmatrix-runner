@@ -128,6 +128,21 @@ func TestMetricsMiddleware_RateLimitedCode(t *testing.T) {
 	assert.True(t, got, "rate_limited code bucket not recorded")
 }
 
+// TestStatusRecorder_UnwrapExposesUnderlyingWriter verifies statusRecorder
+// exposes Unwrap() so http.NewResponseController can walk through it to the
+// underlying conn. Without this, the SSE /logs handler's SetWriteDeadline
+// call silently fails and the server's 30s WriteTimeout drops every
+// long-lived connection.
+func TestStatusRecorder_UnwrapExposesUnderlyingWriter(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sr := &statusRecorder{ResponseWriter: inner}
+
+	unwrapper, ok := any(sr).(interface{ Unwrap() http.ResponseWriter })
+	require.True(t, ok, "statusRecorder must implement Unwrap() http.ResponseWriter")
+	assert.Same(t, http.ResponseWriter(inner), unwrapper.Unwrap(),
+		"Unwrap must return the wrapped ResponseWriter so ResponseController can reach the conn")
+}
+
 func labelMap(pairs []*dto.LabelPair) map[string]string {
 	out := make(map[string]string, len(pairs))
 	for _, p := range pairs {

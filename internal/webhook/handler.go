@@ -706,11 +706,14 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	project := r.URL.Query().Get("project")
 
 	// Clear the write deadline — the server has a 30s WriteTimeout that would
-	// otherwise terminate the long-lived SSE connection.
+	// otherwise terminate the long-lived SSE connection. This depends on every
+	// middleware in the chain exposing Unwrap() so http.NewResponseController
+	// can reach the underlying conn; logged at WARN if it ever fails again.
 	rc := http.NewResponseController(w)
 	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
 		if h.logger != nil {
-			h.logger.Debug("SSE could not clear write deadline", "error", err)
+			h.logger.Warn("SSE could not clear write deadline; connection will drop on WriteTimeout",
+				"error", err)
 		}
 	}
 
