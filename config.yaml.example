@@ -9,6 +9,17 @@
 # Env: CMR_PORT
 port: 9090
 
+# Admin port for Prometheus /metrics and /ready. Bound to 127.0.0.1 only.
+# Reuses the webhook HMAC secret — scrape with a signed request, e.g.
+# prometheus scrape_configs can run a local exporter that signs on behalf of
+# the collector.
+# Env: CMR_ADMIN_PORT
+admin_port: 9091
+
+# Structured log output format: "text" (human-readable) or "json" (machine-
+# parseable, for log shippers). Env: CMR_LOG_FORMAT
+log_format: "text"
+
 # ----- ContextMatrix Connection -----
 
 # Base URL of the ContextMatrix instance. Used for status callbacks.
@@ -24,14 +35,31 @@ api_key: ""
 
 # Default Docker image for worker containers. Can be overridden per-project
 # via runner_image in the trigger payload.
+#
+# base_image MUST be @sha256:... pinned (enforced by Validate). See CTXRUN-044.
+# Mutable tags like `:latest` are rejected so a rebuilt upstream image can
+# never silently ship into production. Replace the digest below with the
+# output of `docker inspect --format='{{index .RepoDigests 0}}' <image>`.
 # Env: CMR_BASE_IMAGE
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 # Allowlist of permitted Docker images. When set, only these images may be used
 # (including via runner_image in the trigger payload). When empty, only base_image
 # is permitted — any runner_image override that differs from base_image is rejected.
+# Every entry MUST be @sha256:... pinned for the same reason as base_image.
 # No env var override (list type).
 allowed_images: []
+
+# Allowlist of permitted MCP hosts (exact-host, case-insensitive) used by the
+# webhook payload validator (see CTXRUN-039). Every /trigger request's mcp_url
+# must parse as https:// and its host must appear in this list. An empty list
+# fail-closes: every mcp_url is rejected. Set this to the hostname(s) of your
+# ContextMatrix instance(s). No env var override (list type).
+# Example:
+#   allowed_mcp_hosts:
+#     - cm.example.com
+#     - cm-staging.example.com
+allowed_mcp_hosts: []
 
 # When to pull the container image: always, never, if-not-present.
 # Use "never" or "if-not-present" for locally-built images.
@@ -115,6 +143,49 @@ github_app:
 #   # Fine-grained personal access token.
 #   # Env: CMR_GITHUB_PAT_TOKEN
 #   token: ""
+
+# ----- Webhook replay protection (CTXRUN-047) -----
+
+# Max number of recently-seen HMAC signatures to keep in memory. A larger
+# value increases coverage against replay attacks at the cost of RAM; the
+# default is comfortably above peak throughput for a single runner.
+webhook_replay_cache_size: 10000
+
+# TTL (seconds) for each cached signature. Should be HMAC clock-skew
+# window (300s) plus a small grace margin so an entry can never expire
+# before a replay becomes out-of-window on its own.
+webhook_replay_skew_seconds: 330
+
+# /message idempotency cache: stores the ack for each successful
+# (project, card_id, message_id) tuple so a client retry after a network
+# timeout sees the original 202 without a second stdin write.
+message_dedup_cache_size: 1000
+
+# TTL (seconds) for the /message dedup cache. Default 10 minutes — long
+# enough to cover operator-side retries but short enough that a new
+# message_id collision is vanishingly unlikely.
+message_dedup_ttl_seconds: 600
+
+# ----- Runtime watchdogs (CTXRUN-058) -----
+
+# Kill a container that has produced no output for this long. Go duration
+# format. Zero or a negative value disables the watchdog. Prevents a hung
+# Claude from burning the full container_timeout (default 2h) while holding
+# both a concurrency slot and a live Anthropic token budget.
+# No env var override.
+idle_output_timeout: "30m"
+
+# Tick interval for the background maintenance loop that sweeps orphaned
+# worker containers (left over from crashes) and prunes dangling images
+# older than 24h. Must be positive. No env var override.
+maintenance_interval: "10m"
+
+# ----- Callback auth (CTXRUN-048) -----
+
+# Use HMAC-signed GET for VerifyAutonomous callbacks to ContextMatrix.
+# Set to false ONLY during the cross-repo transition if the CM server
+# does not yet accept HMAC on that endpoint. See CTXRUN-048.
+use_hmac_for_verify_autonomous: true
 
 # ----- Logging -----
 

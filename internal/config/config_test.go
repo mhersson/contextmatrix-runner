@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +12,64 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// testDigestImage is a placeholder digest-pinned reference that satisfies
+// Validate()'s CTXRUN-044 digest-pinning check. Tests that do not exercise
+// the pinning rule itself reuse this constant so the unrelated Validate
+// paths stay readable.
+const testDigestImage = "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// TestLogFormat_JSON_EmitsValidJSON verifies that configuring log_format: json
+// produces parseable JSON log lines. (Belongs to CTXRUN-053.)
+func TestLogFormat_JSON_EmitsValidJSON(t *testing.T) {
+	var buf bytes.Buffer
+
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger.Info("hello", "k", "v", "n", 7)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &decoded), "JSON handler output must parse cleanly")
+
+	assert.Equal(t, "hello", decoded["msg"])
+	assert.Equal(t, "v", decoded["k"])
+}
+
+// TestLogFormat_ValidationRejectsUnknown verifies that invalid log_format
+// values are rejected at Validate-time.
+func TestLogFormat_ValidationRejectsUnknown(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	claudeDir := dir
+
+	yaml := validConfig(pemPath, claudeDir) + "\nlog_format: yaml\n"
+	path := writeConfig(t, dir, yaml)
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "log_format")
+}
+
+// TestAdminPort_DefaultsAnd_ValidationRange verifies the default admin_port
+// value and that out-of-range values fail validation.
+func TestAdminPort_DefaultsAnd_ValidationRange(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	claudeDir := dir
+
+	// Default should be 9091 when unset.
+	path := writeConfig(t, dir, validConfig(pemPath, claudeDir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 9091, cfg.AdminPort)
+
+	// Out-of-range should fail.
+	yaml := validConfig(pemPath, claudeDir) + "\nadmin_port: 70000\n"
+	path = writeConfig(t, dir, yaml)
+	_, err = Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "admin_port")
+}
 
 func writeConfig(t *testing.T, dir, content string) string {
 	t.Helper()
@@ -32,7 +93,7 @@ func validConfig(pemPath, claudeDir string) string {
 	return `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "` + claudeDir + `"
 github_app:
   app_id: 12345
@@ -53,7 +114,7 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, 9090, cfg.Port)
 	assert.Equal(t, "http://localhost:8080", cfg.ContextMatrixURL)
 	assert.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.APIKey)
-	assert.Equal(t, "contextmatrix/worker:latest", cfg.BaseImage)
+	assert.Equal(t, "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.BaseImage)
 	assert.Equal(t, 3, cfg.MaxConcurrent)
 	assert.Equal(t, "2h", cfg.ContainerTimeout)
 	assert.Equal(t, "info", cfg.LogLevel)
@@ -74,6 +135,9 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 3, cfg.MaxConcurrent)
 	assert.Equal(t, "2h", cfg.ContainerTimeout)
 	assert.Equal(t, "info", cfg.LogLevel)
+	// CTXRUN-048: default auth mode for VerifyAutonomous is HMAC.
+	assert.True(t, cfg.UseHMACForVerifyAutonomous,
+		"use_hmac_for_verify_autonomous must default to true")
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -97,7 +161,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 func TestValidate_MissingContextMatrixURL(t *testing.T) {
 	cfg := &Config{
 		APIKey:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage: "img",
+		BaseImage: testDigestImage,
 	}
 	err := cfg.Validate()
 	assert.ErrorContains(t, err, "contextmatrix_url is required")
@@ -107,7 +171,7 @@ func TestValidate_APIKeyTooShort(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "short",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 	}
 	err := cfg.Validate()
 	assert.ErrorContains(t, err, "api_key must be at least")
@@ -131,7 +195,7 @@ func TestValidate_NoCCAuth(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -152,7 +216,7 @@ func TestValidate_AnthropicAPIKeyAlone(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -174,7 +238,7 @@ func TestValidate_ClaudeOAuthTokenAlone(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -197,7 +261,7 @@ func TestValidate_AuthMethodsSatisfyRequirement(t *testing.T) {
 		return &Config{
 			ContextMatrixURL: "http://localhost",
 			APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			BaseImage:        "img",
+			BaseImage:        testDigestImage,
 			ImagePullPolicy:  PullAlways,
 			MaxConcurrent:    1,
 			ContainerTimeout: "1h",
@@ -265,7 +329,7 @@ func TestLoad_ClaudeOAuthTokenEnvOverride(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 github_app:
   app_id: 12345
   installation_id: 67890
@@ -284,7 +348,7 @@ func TestValidate_InvalidContainerTimeout(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "not-a-duration",
@@ -301,7 +365,7 @@ func TestValidate_GitHubAppMissingFields(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -332,7 +396,7 @@ func TestContainerTimeoutDuration(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "2h",
@@ -355,7 +419,7 @@ func TestValidate_ClaudeSettings(t *testing.T) {
 		return &Config{
 			ContextMatrixURL: "http://localhost",
 			APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			BaseImage:        "img",
+			BaseImage:        testDigestImage,
 			ImagePullPolicy:  PullAlways,
 			MaxConcurrent:    1,
 			ContainerTimeout: "1h",
@@ -444,7 +508,7 @@ func TestLoad_GitHubApp_APIBaseURL_YAML(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "` + dir + `"
 github_app:
   app_id: 12345
@@ -465,7 +529,7 @@ func TestLoad_GitHubApp_APIBaseURL_EnvOverride(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "` + dir + `"
 github_app:
   app_id: 12345
@@ -518,7 +582,7 @@ func baseValidConfigNoGitHub(t *testing.T) *Config {
 	return &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        "img",
+		BaseImage:        testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -617,6 +681,68 @@ func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
 	}
 }
 
+func TestValidate_ReplayCacheDefaultsWhenUnset(t *testing.T) {
+	// A Config literal that leaves the new CTXRUN-047 tunables at zero
+	// must validate and receive the documented defaults.
+	cfg := baseValidConfigNoGitHub(t)
+	cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+
+	require.NoError(t, cfg.Validate())
+
+	assert.Equal(t, 10000, cfg.WebhookReplayCacheSize)
+	assert.Equal(t, 330, cfg.WebhookReplaySkewSeconds)
+	assert.Equal(t, 1000, cfg.MessageDedupCacheSize)
+	assert.Equal(t, 600, cfg.MessageDedupTTLSeconds)
+}
+
+func TestValidate_ReplayCacheRejectsNegative(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name: "negative cache size",
+			mutate: func(c *Config) {
+				c.WebhookReplayCacheSize = -1
+			},
+			want: "webhook_replay_cache_size must be positive",
+		},
+		{
+			name: "negative skew seconds",
+			mutate: func(c *Config) {
+				c.WebhookReplaySkewSeconds = -1
+			},
+			want: "webhook_replay_skew_seconds must be positive",
+		},
+		{
+			name: "negative dedup cache size",
+			mutate: func(c *Config) {
+				c.MessageDedupCacheSize = -1
+			},
+			want: "message_dedup_cache_size must be positive",
+		},
+		{
+			name: "negative dedup ttl",
+			mutate: func(c *Config) {
+				c.MessageDedupTTLSeconds = -1
+			},
+			want: "message_dedup_ttl_seconds must be positive",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfigNoGitHub(t)
+			cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
 func TestLoad_GitHubPAT_EnvOverride(t *testing.T) {
 	dir := t.TempDir()
 
@@ -624,7 +750,7 @@ func TestLoad_GitHubPAT_EnvOverride(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 anthropic_api_key: "sk-ant-test"
 `
 	path := writeConfig(t, dir, content)
@@ -642,7 +768,7 @@ func TestLoad_GitHubPAT_YAMLOverriddenByEnv(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker:latest"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 anthropic_api_key: "sk-ant-test"
 github_pat:
   token: "ghp_fromyaml"
@@ -654,4 +780,95 @@ github_pat:
 	cfg, err := Load(path)
 	require.NoError(t, err)
 	assert.Equal(t, "ghp_fromenv", cfg.GitHubPAT.Token)
+}
+
+// TestValidate_BaseImageDigestPin covers the CTXRUN-044 requirement that
+// base_image be an @sha256:... reference. Mutable tags and malformed digests
+// must fail validation so a rebuilt upstream image can never silently ship.
+func TestValidate_BaseImageDigestPin(t *testing.T) {
+	validDigest := "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	tests := []struct {
+		name        string
+		image       string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "digest-pinned base_image is accepted",
+			image:   validDigest,
+			wantErr: false,
+		},
+		{
+			name:        "tag-only base_image is rejected",
+			image:       "contextmatrix/worker:latest",
+			wantErr:     true,
+			errContains: "base_image must be @sha256:... pinned",
+		},
+		{
+			name:        "bare name without tag or digest is rejected",
+			image:       "contextmatrix/worker",
+			wantErr:     true,
+			errContains: "base_image must be @sha256:... pinned",
+		},
+		{
+			name:        "digest of wrong length is rejected",
+			image:       "contextmatrix/worker@sha256:deadbeef",
+			wantErr:     true,
+			errContains: "invalid sha256 digest length",
+		},
+		{
+			name:        "digest with non-hex characters is rejected",
+			image:       "contextmatrix/worker@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+			wantErr:     true,
+			errContains: "non-hex characters",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfigNoGitHub(t)
+			cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+			cfg.BaseImage = tt.image
+
+			err := cfg.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.errContains)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestValidate_AllowedImagesDigestPin ensures every entry in the
+// allowed_images allowlist is digest-pinned, not just base_image. A single
+// tag-only entry must fail validation so H2's "allowlist matches strings
+// not digests" gap stays closed.
+func TestValidate_AllowedImagesDigestPin(t *testing.T) {
+	validDigest := "contextmatrix/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	t.Run("all digest-pinned entries pass", func(t *testing.T) {
+		cfg := baseValidConfigNoGitHub(t)
+		cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+		cfg.AllowedImages = []string{testDigestImage, validDigest}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("one tag-only entry fails", func(t *testing.T) {
+		cfg := baseValidConfigNoGitHub(t)
+		cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+		cfg.AllowedImages = []string{testDigestImage, "contextmatrix/worker:latest"}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "allowed_images[1] must be @sha256:... pinned")
+	})
+
+	t.Run("empty list is accepted", func(t *testing.T) {
+		cfg := baseValidConfigNoGitHub(t)
+		cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+		cfg.AllowedImages = nil
+		assert.NoError(t, cfg.Validate())
+	})
 }
