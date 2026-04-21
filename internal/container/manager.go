@@ -3,14 +3,23 @@ package container
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
+	"runtime/debug"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -25,6 +34,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/github"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/logparser"
+	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 	"github.com/mhersson/contextmatrix-runner/internal/streammsg"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
@@ -32,15 +42,16 @@ import (
 // RunConfig holds the parameters needed to start a container.
 // This mirrors the webhook TriggerPayload but avoids an import cycle.
 type RunConfig struct {
-	CardID      string
-	Project     string
-	RepoURL     string
-	MCPURL      string
-	MCPAPIKey   string
-	BaseBranch  string
-	RunnerImage string
-	Interactive bool
-	Model       string
+	CardID        string
+	Project       string
+	RepoURL       string
+	MCPURL        string
+	MCPAPIKey     string
+	BaseBranch    string
+	RunnerImage   string
+	Interactive   bool
+	Model         string
+	CorrelationID string
 }
 
 const (
@@ -53,7 +64,46 @@ const (
 
 	imagePullTimeout = 5 * time.Minute
 	stopGracePeriod  = 10 // seconds
+	// callbackTimeout bounds the detached context used to deliver a status
+	// callback after the parent ctx has already been cancelled (e.g. on a Kill
+	// or start failure race). See CTXRUN-050.
+	callbackTimeout = 10 * time.Second
+
+	// dockerCleanupTimeout bounds the detached contexts used for
+	// best-effort Docker cleanup (Stop / Remove / Kill) that must run
+	// even when the parent ctx has already been cancelled. A hung
+	// dockerd used to stall shutdown forever; now every such call has
+	// a hard cap. See CTXRUN-040.
+	dockerCleanupTimeout = 5 * time.Second
 )
+
+// primingWriteTimeout bounds the priming WriteStdin call made right after
+// ContainerAttach. A wedged hijacked socket used to hang the Run goroutine
+// indefinitely; now the goroutine gives up after this deadline and continues
+// into waitAndCleanup so normal cancellation paths work. See CTXRUN-040 (C11).
+//
+// Declared as a package var (not a const) so tests can shrink it to keep
+// synthetic-wedge cases fast.
+var primingWriteTimeout = 5 * time.Second
+
+// idleWatchdogCheckInterval is the poll cadence for the per-container
+// idle-output watchdog introduced in CTXRUN-058. Declared as a package var so
+// tests can shrink it to a few milliseconds without waiting 30s of wall time
+// per synthetic idle scenario.
+var idleWatchdogCheckInterval = 30 * time.Second
+
+// imagePruneMaxAge is the "until" filter passed to ImagesPrune so the
+// maintenance loop only reclaims images older than this. Keeping it at 24h
+// means freshly-pulled worker images are never a prune target mid-run.
+const imagePruneMaxAge = "24h"
+
+// dnsLookupTimeout bounds buildExtraHosts' resolver call. An attacker who
+// points the card's MCP URL at a slow-responding authoritative server used
+// to be able to stall the spawn path indefinitely (H24); the deadline caps
+// exposure at 2s and then falls back to running the container without the
+// ExtraHosts entry. The container can still reach the MCP server via the
+// normal host-gateway route if DNS inside the container itself works.
+const dnsLookupTimeout = 2 * time.Second
 
 // Manager handles the lifecycle of Docker containers for task execution.
 type Manager struct {
@@ -64,7 +114,23 @@ type Manager struct {
 	broadcaster *logbroadcast.Broadcaster
 	cfg         *config.Config
 	logger      *slog.Logger
-	wg          sync.WaitGroup
+	metrics     *metrics.Metrics
+	// dnsCache memoises buildExtraHosts() resolver calls so a spawn burst
+	// against the same MCP hostname doesn't pay N DNS RTTs. Lifetime is
+	// process-long; TTL is dnsCacheTTL.
+	dnsCache *dnsCache
+	// resolver is the DNS resolver used by buildExtraHosts. Swappable for
+	// tests; nil is treated as net.DefaultResolver.
+	resolver hostResolver
+	wg       sync.WaitGroup
+}
+
+// WithMetrics attaches a metrics bundle to the manager. A nil bundle disables
+// metric observation (useful in tests that do not care about Prometheus).
+func (m *Manager) WithMetrics(mx *metrics.Metrics) *Manager {
+	m.metrics = mx
+
+	return m
 }
 
 // NewManager creates a container manager.
@@ -85,27 +151,84 @@ func NewManager(
 		broadcaster: broadcaster,
 		cfg:         cfg,
 		logger:      logger,
+		dnsCache:    newDNSCache(dnsCacheTTL, dnsCacheCapacity),
+		resolver:    net.DefaultResolver,
 	}
+}
+
+// withCleanupTimeout returns a fresh, parent-detached context bounded by
+// callbackTimeout. Used by all cleanup / callback code paths that MUST run
+// even when the caller's ctx has already been cancelled (e.g. shutdown,
+// container-kill). The parent is intentionally not plumbed in: inheriting a
+// cancelled parent would turn every callback into a no-op, which is exactly
+// the hang CTXRUN-040 is fixing.
+//
+// Callers must defer the returned CancelFunc.
+func withCleanupTimeout(_ context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), callbackTimeout)
+}
+
+// withDockerCleanupTimeout is like withCleanupTimeout but bounded by the
+// shorter dockerCleanupTimeout. Used for Docker Stop/Remove/Kill calls where
+// we'd rather give up quickly and move on than wait for a hung daemon.
+func withDockerCleanupTimeout(_ context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), dockerCleanupTimeout)
 }
 
 // Run launches the full container lifecycle for a triggered task in a goroutine.
 // Use Wait to block until all launched goroutines have finished.
 func (m *Manager) Run(ctx context.Context, payload RunConfig) {
-	m.wg.Add(1)
+	started := time.Now()
 
-	go func() {
-		defer m.wg.Done()
+	m.wg.Go(func() {
+		outcome := metrics.OutcomeSuccess
+
 		defer func() {
 			if r := recover(); r != nil {
+				outcome = metrics.OutcomeFailure
+
+				if m.metrics != nil {
+					m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineRun).Inc()
+				}
+
 				m.logger.Error("container run panicked",
-					"panic", r, "card_id", payload.CardID, "project", payload.Project)
+					"panic", r, "card_id", payload.CardID, "project", payload.Project,
+					"stack", string(debug.Stack()))
+
+				// H22: close the partial-failure window. If startContainer had
+				// already returned a container ID and then something downstream
+				// panicked before waitAndCleanup installed its defers, the
+				// Docker container would leak because tracker.Remove alone only
+				// clears the in-memory entry. Look up the ID from the tracker
+				// (UpdateContainerID was called between startContainer and
+				// waitAndCleanup) and Force-remove the container on a fresh,
+				// bounded ctx.
+				if snap, ok := m.tracker.Snapshot(payload.Project, payload.CardID); ok && snap.ContainerID != "" {
+					rmCtx, rmCancel := withDockerCleanupTimeout(context.Background())
+					if rmErr := m.docker.ContainerRemove(rmCtx, snap.ContainerID, container.RemoveOptions{Force: true}); rmErr != nil {
+						m.logger.Warn("panic recovery: docker remove failed",
+							"container_id", snap.ContainerID,
+							"card_id", payload.CardID,
+							"error", rmErr)
+					}
+
+					rmCancel()
+				}
+
 				m.tracker.Remove(payload.Project, payload.CardID)
-				m.reportFailure(context.Background(), payload, fmt.Sprintf("internal error: %v", r))
+
+				cbCtx, cbCancel := withCleanupTimeout(context.Background())
+				m.reportFailure(cbCtx, payload, fmt.Sprintf("internal error: %v", r))
+				cbCancel()
+			}
+
+			if m.metrics != nil {
+				m.metrics.ContainerDuration.WithLabelValues(outcome).Observe(time.Since(started).Seconds())
 			}
 		}()
 
-		m.run(ctx, payload)
-	}()
+		outcome = m.run(ctx, payload)
+	})
 }
 
 // Wait blocks until all container goroutines launched by Run have finished.
@@ -113,16 +236,26 @@ func (m *Manager) Wait() {
 	m.wg.Wait()
 }
 
-func (m *Manager) run(ctx context.Context, payload RunConfig) {
+func (m *Manager) run(ctx context.Context, payload RunConfig) string {
 	log := m.logger.With("card_id", payload.CardID, "project", payload.Project)
 
-	containerID, err := m.startContainer(ctx, payload)
+	containerID, secretsPath, secretValues, err := m.startContainer(ctx, payload)
 	if err != nil {
 		log.Error("failed to start container", "error", err)
-		m.reportFailure(ctx, payload, fmt.Sprintf("start failed: %v", err))
+		m.removeSecretsFile(secretsPath, log)
+
+		// Use a detached context for the callback: if start raced with a Kill
+		// (or the runner is shutting down), ctx is already cancelled and the
+		// HTTP request would be a no-op, leaving CM blind to the failure.
+		// The outer flow still honours parent cancellation — only the
+		// "tell CM we failed" side-effect gets a fresh deadline. See CTXRUN-050.
+		cbCtx, cancel := withCleanupTimeout(ctx)
+		defer cancel()
+
+		m.reportFailure(cbCtx, payload, fmt.Sprintf("start failed: %v", err))
 		m.tracker.Remove(payload.Project, payload.CardID)
 
-		return
+		return metrics.OutcomeFailure
 	}
 
 	m.tracker.UpdateContainerID(payload.Project, payload.CardID, containerID)
@@ -138,16 +271,58 @@ func (m *Manager) run(ctx context.Context, payload RunConfig) {
 		})
 	}
 
-	// Report running status to CM.
-	if err := m.callback.ReportStatus(ctx, payload.CardID, payload.Project, "running", "container started"); err != nil {
-		log.Warn("failed to report running status", "error", err)
-	}
+	// Report running status to CM asynchronously. The callback can take up
+	// to ~37s on sustained 5xx/backoff, and blocking the spawn path on it
+	// prevents streamLogs from draining stdout so the container stalls on
+	// kernel buffer pressure. CTXRUN-059 (H23): fire and forget on a
+	// detached 30s context with a panic-safe wrapper.
+	m.runningCallbackAsync(payload, log)
 
-	// Wait for container to finish.
-	m.waitAndCleanup(ctx, containerID, payload, log)
+	// Wait for container to finish and return its outcome so the caller's
+	// duration histogram carries the right label.
+	return m.waitAndCleanup(ctx, containerID, secretsPath, payload, secretValues, log)
 }
 
-func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string, error) {
+// runningCallbackAsync fires ReportStatus("running") on a background
+// goroutine with a fresh 30s ctx. The parent ctx is intentionally NOT
+// inherited: if the parent is already near-cancel (e.g. rapid Kill after
+// spawn), the callback would become a no-op and CM would see the card
+// stuck. Panics are recovered and counted so one bad callback cannot take
+// down the runner.
+func (m *Manager) runningCallbackAsync(payload RunConfig, log *slog.Logger) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if m.metrics != nil {
+					m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineRun).Inc()
+				}
+
+				m.logger.Error("running-status callback panicked",
+					"panic", r,
+					"card_id", payload.CardID,
+					"project", payload.Project,
+					"stack", string(debug.Stack()))
+			}
+		}()
+
+		// 30s is generous enough to absorb the full 3-attempt retry ladder
+		// (1s + 2s + 4s backoff + per-request 10s timeout each) while
+		// still bounding the goroutine's lifetime.
+		cbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := m.callback.ReportStatus(cbCtx, payload.CardID, payload.Project, "running", "container started"); err != nil {
+			log.Warn("failed to report running status (async)", "error", err)
+		}
+	}()
+}
+
+// secretsMountTarget is the in-container path where the per-container
+// secrets file is bind-mounted read-only. It is a PATH, not a credential;
+// the gosec G101 flag is a false positive.
+const secretsMountTarget = "/run/cm-secrets/env" //nolint:gosec // path, not a credential
+
+func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string, string, []string, error) {
 	img := payload.RunnerImage
 	if img == "" {
 		img = m.cfg.BaseImage
@@ -155,44 +330,49 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	// Validate image against allowlist.
 	if len(m.cfg.AllowedImages) > 0 {
-		allowed := false
-
-		for _, ai := range m.cfg.AllowedImages {
-			if img == ai {
-				allowed = true
-
-				break
-			}
-		}
-
-		if !allowed {
-			return "", fmt.Errorf("image %q not in allowed_images list", img)
+		if !slices.Contains(m.cfg.AllowedImages, img) {
+			return "", "", nil, fmt.Errorf("image %q not in allowed_images list", img)
 		}
 	} else if img != m.cfg.BaseImage {
-		return "", fmt.Errorf("image %q not allowed (only base_image %q permitted when allowed_images is empty)", img, m.cfg.BaseImage)
+		return "", "", nil, fmt.Errorf("image %q not allowed (only base_image %q permitted when allowed_images is empty)", img, m.cfg.BaseImage)
 	}
 
 	// Pull image according to policy.
 	if err := m.pullImage(ctx, img); err != nil {
-		return "", err
+		return "", "", nil, err
 	}
 
 	// Generate GitHub App token.
 	gitToken, err := m.token.GenerateToken(ctx)
 	if err != nil {
-		return "", fmt.Errorf("generate git token: %w", err)
+		return "", "", nil, fmt.Errorf("generate git token: %w", err)
 	}
 
-	// Build environment variables.
+	// Secrets (CM_GIT_TOKEN, CM_MCP_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
+	// ANTHROPIC_API_KEY) are written to a mode-0600 file on a tmpfs dir
+	// and bind-mounted read-only into the container at
+	// /run/cm-secrets/env. This keeps them out of HostConfig.Env (so
+	// `docker inspect` cannot leak them) and out of PID 1's initial
+	// /proc/1/environ. The same values are also collected into
+	// secretValues so the per-container Redactor can mask their literal
+	// forms in output (CTXRUN-049).
+	secrets := map[string]string{
+		"CM_GIT_TOKEN": gitToken,
+	}
+	if payload.MCPAPIKey != "" {
+		secrets["CM_MCP_API_KEY"] = payload.MCPAPIKey
+	}
+
+	// Build environment variables — NON-SECRET ONLY.
 	env := []string{
 		"CM_CARD_ID=" + payload.CardID,
 		"CM_PROJECT=" + payload.Project,
 		"CM_MCP_URL=" + payload.MCPURL,
 		"CM_REPO_URL=" + normalizeRepoURL(payload.RepoURL),
-		"CM_GIT_TOKEN=" + gitToken,
 	}
-	if payload.MCPAPIKey != "" {
-		env = append(env, "CM_MCP_API_KEY="+payload.MCPAPIKey)
+
+	if payload.CorrelationID != "" {
+		env = append(env, "CM_CORRELATION_ID="+payload.CorrelationID)
 	}
 
 	if payload.BaseBranch != "" {
@@ -211,7 +391,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		env = append(env, "CM_CLAUDE_SETTINGS="+m.cfg.ClaudeSettings)
 	}
 
-	// Apply highest-priority auth method only.
+	// Apply highest-priority Claude auth method only.
 	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
 	var mounts []mount.Mount
 
@@ -225,10 +405,41 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			ReadOnly: true,
 		})
 	case m.cfg.ClaudeOAuthToken != "":
-		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+m.cfg.ClaudeOAuthToken)
+		secrets["CLAUDE_CODE_OAUTH_TOKEN"] = m.cfg.ClaudeOAuthToken
 	case m.cfg.AnthropicAPIKey != "":
-		env = append(env, "ANTHROPIC_API_KEY="+m.cfg.AnthropicAPIKey)
+		secrets["ANTHROPIC_API_KEY"] = m.cfg.AnthropicAPIKey
 	}
+
+	// Collect secret values (deterministic order, sorted by key) for the
+	// per-container Redactor so output redacts literal values in addition
+	// to the static KEY=... patterns.
+	secretKeys := make([]string, 0, len(secrets))
+	for k := range secrets {
+		secretKeys = append(secretKeys, k)
+	}
+
+	sort.Strings(secretKeys)
+
+	secretValues := make([]string, 0, len(secrets))
+
+	for _, k := range secretKeys {
+		secretValues = append(secretValues, secrets[k])
+	}
+
+	// Write the per-container secrets file and add the bind mount. If
+	// the directory cannot be prepared we fail closed — leaking secrets
+	// into env would defeat the whole point of this card.
+	secretsPath, err := m.writeSecretsFile(payload, secrets)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("write secrets file: %w", err)
+	}
+
+	mounts = append(mounts, mount.Mount{
+		Type:     mount.TypeBind,
+		Source:   secretsPath,
+		Target:   secretsMountTarget,
+		ReadOnly: true,
+	})
 
 	name := sanitizeContainerName(payload.Project, payload.CardID)
 
@@ -244,8 +455,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	if payload.Interactive {
 		containerCfg.OpenStdin = true
 		containerCfg.AttachStdin = true
-		containerCfg.Tty = false
-		containerCfg.StdinOnce = false
+		// Tty and StdinOnce default to false; leaving them zero-valued.
 	}
 
 	resp, err := m.docker.ContainerCreate(ctx,
@@ -263,7 +473,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		nil, nil, name,
 	)
 	if err != nil {
-		return "", fmt.Errorf("create container: %w", err)
+		return "", secretsPath, nil, fmt.Errorf("create container: %w", err)
 	}
 
 	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
@@ -272,7 +482,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			m.logger.Warn("failed to remove container after start failure", "container_id", resp.ID, "error", rmErr)
 		}
 
-		return "", fmt.Errorf("start container: %w", err)
+		return "", secretsPath, nil, fmt.Errorf("start container: %w", err)
 	}
 
 	if payload.Interactive {
@@ -298,17 +508,103 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 					"card_id", payload.CardID,
 					"project", payload.Project,
 					"error", buildErr)
-			} else if writeErr := m.tracker.WriteStdin(payload.Project, payload.CardID, b); writeErr != nil {
-				m.logger.Warn("failed to write priming message to container stdin",
-					"container_id", truncateID(resp.ID),
-					"card_id", payload.CardID,
-					"project", payload.Project,
-					"error", writeErr)
+			} else {
+				// CTXRUN-040 (C11): wrap the priming WriteStdin with a
+				// deadline. The hijacked net.Conn can wedge on kernel
+				// buffer pressure, a slow container, or a misbehaving
+				// proxy, and a synchronous write used to block the Run
+				// goroutine forever. We can't reach through
+				// tracker.WriteStdin to set a net.Conn write deadline (the
+				// writer is behind an io.WriteCloser interface and mocks
+				// in tests wouldn't honour it anyway). Instead: spawn the
+				// write, time out after primingWriteTimeout, and on
+				// timeout close the underlying writer directly — this
+				// unblocks the wedged Write inside tracker.WriteStdin so
+				// stdin.mu gets released and the normal cleanup path can
+				// make progress.
+				m.writePrimingWithTimeout(payload, resp.ID, b, attached.Conn)
 			}
 		}
 	}
 
-	return resp.ID, nil
+	return resp.ID, secretsPath, secretValues, nil
+}
+
+// writeSecretsFile writes a per-container env-style secrets file to
+// cfg.SecretsDir with mode 0600. The file is later bind-mounted read-only
+// into the container at /run/cm-secrets/env. Returns the host-side path so
+// the caller can unlink it once the container has exited.
+//
+// Format: one `export KEY='VALUE'` per line. Values are single-quoted with
+// internal `'` escaped as `'\”` so any byte — including a newline — cannot
+// break out of the quote and inject another shell statement.
+func (m *Manager) writeSecretsFile(payload RunConfig, secrets map[string]string) (string, error) {
+	dir := m.cfg.SecretsDir
+	if dir == "" {
+		dir = "/var/run/cm-runner/secrets"
+	}
+
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create secrets dir: %w", err)
+	}
+
+	// A 16-byte random nonce avoids collisions if the same card_id is
+	// re-triggered while a previous file is still being unlinked.
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generate secrets nonce: %w", err)
+	}
+
+	base := sanitizeContainerName(payload.Project, payload.CardID) + "-" + hex.EncodeToString(nonce[:]) + ".env"
+	path := filepath.Join(dir, base)
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("open secrets file: %w", err)
+	}
+
+	// Deterministic iteration for stable tests and reviewable diffs.
+	keys := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		if _, werr := fmt.Fprintf(f, "export %s='%s'\n", k, shellSingleQuoteEscape(secrets[k])); werr != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+
+			return "", fmt.Errorf("write secret %s: %w", k, werr)
+		}
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+
+		return "", fmt.Errorf("close secrets file: %w", err)
+	}
+
+	return path, nil
+}
+
+// shellSingleQuoteEscape returns s with every `'` replaced by `'\”` so the
+// result can be safely embedded inside a single-quoted shell string.
+func shellSingleQuoteEscape(s string) string {
+	return strings.ReplaceAll(s, `'`, `'\''`)
+}
+
+// removeSecretsFile best-effort unlinks the per-container secrets file from
+// the host. No-op if path is empty.
+func (m *Manager) removeSecretsFile(path string, log *slog.Logger) {
+	if path == "" {
+		return
+	}
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Warn("failed to remove secrets file", "path", path, "error", err)
+	}
 }
 
 // buildPrimingContent returns the text of the priming stream-json user message
@@ -334,12 +630,29 @@ func buildPrimingContent(payload RunConfig) string {
 	return content
 }
 
-func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payload RunConfig, log *slog.Logger) {
+func (m *Manager) waitAndCleanup(ctx context.Context, containerID, secretsPath string, payload RunConfig, secrets []string, log *slog.Logger) string {
+	// Defers run LIFO, so the declared order here is the REVERSE of the
+	// execution order. We want the tracker entry to disappear first so
+	// `/message`, `/promote`, and `/end-session` requests that race with
+	// cleanup return 404 (no container tracked) rather than 500 (stdin
+	// write against a dead container). H21.
+	//
+	// Actual execution order:
+	//   1. tracker.Remove     — unpublish the entry (also closes stdin).
+	//   2. removeSecretsFile  — unlink the host-side per-container secrets file.
+	//   3. removeContainer    — delete the Docker container (CTXRUN-040:
+	//      bounded ctx so a hung dockerd cannot stall the goroutine).
+	defer func() {
+		rmCtx, cancel := withDockerCleanupTimeout(context.Background())
+		defer cancel()
+
+		m.removeContainer(rmCtx, containerID, log)
+	}()
+	defer m.removeSecretsFile(secretsPath, log)
 	defer m.tracker.Remove(payload.Project, payload.CardID)
-	defer m.removeContainer(context.Background(), containerID, log)
 
 	// Stream container logs in real time.
-	logDone := m.streamLogs(ctx, containerID, payload, log)
+	logDone := m.streamLogs(ctx, containerID, payload, secrets, log)
 
 	// Apply container timeout.
 	timeout := m.cfg.ContainerTimeoutDuration()
@@ -357,48 +670,99 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
 			log.Warn(msg, "exit_code", result.StatusCode)
 			m.emitSystem(payload, "container failed: "+msg)
-			m.reportFailure(context.Background(), payload, msg)
 
-			return
+			cbCtx, cbCancel := withCleanupTimeout(ctx)
+			m.reportFailure(cbCtx, payload, msg)
+			cbCancel()
+
+			return metrics.OutcomeFailure
 		}
 
 		log.Info("container completed successfully")
 		m.emitSystem(payload, "container completed")
-		m.reportCompleted(context.Background(), payload)
+
+		cbCtx, cbCancel := withCleanupTimeout(ctx)
+		m.reportCompleted(cbCtx, payload)
+		cbCancel()
+
+		return metrics.OutcomeSuccess
 
 	case err := <-errCh:
 		if waitCtx.Err() != nil {
 			// Timeout.
 			msg := fmt.Sprintf("container timed out after %s", timeout)
 			log.Warn(msg)
-			m.killContainer(context.Background(), containerID, log)
+
+			killCtx, killCancel := withDockerCleanupTimeout(ctx)
+			m.killContainer(killCtx, containerID, log)
+			killCancel()
+
 			<-logDone
 			m.emitSystem(payload, "container failed: "+msg)
-			m.reportFailure(context.Background(), payload, msg)
 
-			return
+			cbCtx, cbCancel := withCleanupTimeout(ctx)
+			m.reportFailure(cbCtx, payload, msg)
+			cbCancel()
+
+			return metrics.OutcomeTimeout
 		}
 
 		msg := fmt.Sprintf("wait error: %v", err)
 		log.Error(msg)
-		m.killContainer(context.Background(), containerID, log)
+
+		killCtx, killCancel := withDockerCleanupTimeout(ctx)
+		m.killContainer(killCtx, containerID, log)
+		killCancel()
+
 		<-logDone
 		m.emitSystem(payload, "container failed: "+msg)
-		m.reportFailure(context.Background(), payload, msg)
+
+		cbCtx, cbCancel := withCleanupTimeout(ctx)
+		m.reportFailure(cbCtx, payload, msg)
+		cbCancel()
+
+		return metrics.OutcomeFailure
 
 	case <-ctx.Done():
 		// Parent context canceled (e.g., kill or shutdown).
 		log.Info("container canceled")
-		m.killContainer(context.Background(), containerID, log)
+
+		killCtx, killCancel := withDockerCleanupTimeout(ctx)
+		m.killContainer(killCtx, containerID, log)
+		killCancel()
+
 		<-logDone
 		m.emitSystem(payload, "container canceled")
+
+		// Report failure to CM via a detached context: the parent ctx is
+		// already cancelled, so passing it to ReportStatus would turn the
+		// callback into a no-op and CM would see the card stuck in
+		// `running` forever. See CTXRUN-050.
+		cbCtx, cbCancel := withCleanupTimeout(ctx)
+		m.reportFailure(cbCtx, payload, "killed by operator")
+		cbCancel()
+
+		return metrics.OutcomeKilled
 	}
 }
 
 // streamLogs follows container stdout/stderr and logs each line. The returned
 // channel is closed when the stream ends (container exit or context cancel).
-func (m *Manager) streamLogs(ctx context.Context, containerID string, payload RunConfig, log *slog.Logger) <-chan struct{} {
+// secrets holds the live secret values injected into this container's
+// environment; they are wrapped into a per-container Redactor so literal
+// occurrences in container output are masked in addition to the static
+// pattern-based redactions.
+//
+// If the configured IdleOutputTimeout is > 0 a per-container watchdog
+// goroutine is spawned that kills the container with an "idle timeout" reason
+// when no text/thinking/tool_call/stderr event has been observed for longer
+// than the timeout. The watchdog exits when the outer streamLogs goroutine
+// finishes (done is closed) or when the parent ctx is cancelled, so it does
+// not outlive the container it watches. See CTXRUN-058 (H15).
+func (m *Manager) streamLogs(ctx context.Context, containerID string, payload RunConfig, secrets []string, log *slog.Logger) <-chan struct{} {
 	done := make(chan struct{})
+
+	redactor := logparser.NewRedactor(secrets)
 
 	reader, err := m.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
 		ShowStdout: true,
@@ -412,55 +776,280 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 		return done
 	}
 
+	// Track the last time any output was observed from this container.
+	// Updated by both the stderr scanner and the logparser emit callback.
+	// Initialised to "now" so a container that exits before producing any
+	// output is not flagged idle retroactively.
+	var lastOutputAt atomic.Pointer[time.Time]
+
+	now := time.Now()
+	lastOutputAt.Store(&now)
+
+	// Start the watchdog if idle-kill is enabled. It closes itself on
+	// ctx.Done() or when done is closed (below via `defer close(done)`).
+	if idle := m.cfg.IdleOutputTimeout; idle > 0 {
+		go m.runIdleWatchdog(ctx, done, containerID, payload, log, &lastOutputAt, idle)
+	}
+
 	go func() {
 		defer close(done)
 		defer func() { _ = reader.Close() }()
 
-		stdoutPr, stdoutPw := io.Pipe()
-		stderrPr, stderrPw := io.Pipe()
+		// CTXRUN-040 (C13): the three child goroutines spawned below can
+		// each take a panic from third-party input — stdcopy on a malformed
+		// docker multiplex frame, bufio.Scanner on bogus UTF-8, the
+		// logparser on a bad stream-json line. A panic in any of them used
+		// to unwind the whole runner process; the recover() wrappers below
+		// isolate each goroutine so one bad container can't crash
+		// everything else. The outer goroutine runs logparser
+		// synchronously, so it shares the outer's recovery — we recover()
+		// there too.
+		defer func() {
+			if r := recover(); r != nil {
+				if m.metrics != nil {
+					m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineLogparser).Inc()
+				}
 
-		go func() {
-			defer func() { _ = stdoutPw.Close(); _ = stderrPw.Close() }()
-
-			_, _ = stdcopy.StdCopy(stdoutPw, stderrPw, reader)
-		}()
-
-		// Log stderr lines as warnings and emit to broadcaster.
-		go func() {
-			scanner := bufio.NewScanner(stderrPr)
-			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-			for scanner.Scan() {
-				line := scanner.Text()
-				log.Warn("container stderr", "line", line)
+				m.logger.Error("streamLogs child panicked",
+					"goroutine", "logparser",
+					"container_id", containerID,
+					"card_id", payload.CardID,
+					"project", payload.Project,
+					"panic", r,
+					"stack", string(debug.Stack()))
 
 				if m.broadcaster != nil {
 					m.broadcaster.Publish(logbroadcast.LogEntry{
 						Timestamp: time.Now(),
 						CardID:    payload.CardID,
 						Project:   payload.Project,
-						Type:      "stderr",
-						Content:   logparser.Redact(line),
+						Type:      "system",
+						Content:   "internal error: logparser panicked",
 					})
 				}
 			}
 		}()
 
-		// Build emit callback with card_id/project pre-filled from RunConfig.
-		var emit func(logbroadcast.LogEntry)
-		if m.broadcaster != nil {
-			emit = func(e logbroadcast.LogEntry) {
-				e.Timestamp = time.Now()
-				e.CardID = payload.CardID
-				e.Project = payload.Project
-				m.broadcaster.Publish(e)
+		stdoutPr, stdoutPw := io.Pipe()
+		stderrPr, stderrPw := io.Pipe()
+
+		go func() {
+			defer func() { _ = stdoutPw.Close(); _ = stderrPw.Close() }()
+			defer func() {
+				if r := recover(); r != nil {
+					if m.metrics != nil {
+						m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineStreamStdout).Inc()
+					}
+
+					m.logger.Error("streamLogs child panicked",
+						"goroutine", "stdcopy",
+						"container_id", containerID,
+						"card_id", payload.CardID,
+						"project", payload.Project,
+						"panic", r,
+						"stack", string(debug.Stack()))
+
+					if m.broadcaster != nil {
+						m.broadcaster.Publish(logbroadcast.LogEntry{
+							Timestamp: time.Now(),
+							CardID:    payload.CardID,
+							Project:   payload.Project,
+							Type:      "system",
+							Content:   "internal error: stdcopy panicked",
+						})
+					}
+				}
+			}()
+
+			_, _ = stdcopy.StdCopy(stdoutPw, stderrPw, reader)
+		}()
+
+		// Log stderr lines as warnings and emit to broadcaster.
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if m.metrics != nil {
+						m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineStreamStderr).Inc()
+					}
+
+					m.logger.Error("streamLogs child panicked",
+						"goroutine", "stderr_scanner",
+						"container_id", containerID,
+						"card_id", payload.CardID,
+						"project", payload.Project,
+						"panic", r,
+						"stack", string(debug.Stack()))
+
+					if m.broadcaster != nil {
+						m.broadcaster.Publish(logbroadcast.LogEntry{
+							Timestamp: time.Now(),
+							CardID:    payload.CardID,
+							Project:   payload.Project,
+							Type:      "system",
+							Content:   "internal error: stderr_scanner panicked",
+						})
+					}
+				}
+			}()
+
+			// CTXRUN-059 (H26): start small, grow only when a long line
+			// demands it. bufio.Scanner grows geometrically up to max, so
+			// a 64KiB initial buffer covers the common case (most stderr
+			// lines are a few hundred bytes) while still tolerating up to
+			// 1MiB per-line for stack traces. Resident memory per running
+			// container drops from ~2MiB of scanner buffers to ~128KiB.
+			scanner := bufio.NewScanner(stderrPr)
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+			for scanner.Scan() {
+				line := scanner.Text()
+				// Redact before slog too: a rogue child process echoing the
+				// container env through /proc can easily end up on stderr.
+				redacted := redactor.Redact(line)
+				log.Warn("container stderr", "line", redacted)
+
+				// CTXRUN-058: record the observation so the idle watchdog
+				// sees forward progress. Stderr noise counts: a container
+				// spewing stack traces is not "idle".
+				nowT := time.Now()
+				lastOutputAt.Store(&nowT)
+
+				if m.broadcaster != nil {
+					m.broadcaster.Publish(logbroadcast.LogEntry{
+						Timestamp: nowT,
+						CardID:    payload.CardID,
+						Project:   payload.Project,
+						Type:      "stderr",
+						Content:   redacted,
+					})
+				}
 			}
+		}()
+
+		// emit is invoked by the logparser for every published assistant
+		// text / thinking / tool_use event. We always wire it (even when
+		// broadcaster is nil) so the idle watchdog gets fed — that's the
+		// whole point of CTXRUN-058 H15.
+		emit := func(e logbroadcast.LogEntry) {
+			nowT := time.Now()
+			lastOutputAt.Store(&nowT)
+
+			if m.broadcaster == nil {
+				return
+			}
+
+			e.Timestamp = nowT
+			e.CardID = payload.CardID
+			e.Project = payload.Project
+			m.broadcaster.Publish(e)
 		}
 
-		logparser.ProcessStream(stdoutPr, log, emit)
+		logparser.ProcessStreamWithRedactor(stdoutPr, log, redactor, emit)
 	}()
 
 	return done
+}
+
+// runIdleWatchdog polls lastOutputAt and kills the container when no output
+// has been seen for longer than idleTimeout. It returns when done is closed
+// (the logstream ended), when ctx is cancelled, or after it fires — a single
+// kill is enough, and the container's normal cleanup path takes it from
+// there.
+//
+// The watchdog does not attempt drain-awareness: on shutdown the tracker
+// entries are cancelled by the outer shutdown sequence anyway, and a race
+// between that and this goroutine is harmless (both paths end with the same
+// Kill → waitAndCleanup result).
+func (m *Manager) runIdleWatchdog(
+	ctx context.Context,
+	done <-chan struct{},
+	containerID string,
+	payload RunConfig,
+	log *slog.Logger,
+	lastOutputAt *atomic.Pointer[time.Time],
+	idleTimeout time.Duration,
+) {
+	tick := idleWatchdogCheckInterval
+	// Never let the poll interval exceed the idle timeout — otherwise a tight
+	// idle deadline (e.g. 50ms in tests) would be missed until the next 30s
+	// tick. Clamp the poll interval so the watchdog reacts within roughly one
+	// timeout window even for small values.
+	if tick > idleTimeout {
+		tick = idleTimeout
+	}
+
+	if tick <= 0 {
+		tick = time.Millisecond
+	}
+
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case now := <-ticker.C:
+			last := lastOutputAt.Load()
+			if last == nil {
+				continue
+			}
+
+			if now.Sub(*last) <= idleTimeout {
+				continue
+			}
+
+			reason := fmt.Sprintf("idle timeout: no output for %s", idleTimeout)
+			log.Warn("container hit idle-output timeout, killing",
+				"container_id", truncateID(containerID),
+				"idle_timeout", idleTimeout,
+				"last_output_at", last.Format(time.RFC3339Nano),
+			)
+
+			m.emitSystem(payload, reason)
+
+			// Prefer Kill (which cancels the run's ctx so waitAndCleanup
+			// takes the normal cancel path and reports failure to CM).
+			// Fall back to a direct stop if the tracker entry has already
+			// been removed (race with exit).
+			if err := m.Kill(payload.Project, payload.CardID); err != nil {
+				log.Warn("idle watchdog Kill failed; attempting direct stop",
+					"container_id", truncateID(containerID),
+					"error", err,
+				)
+
+				stopCtx, cancel := withDockerCleanupTimeout(ctx)
+				m.killContainer(stopCtx, containerID, log)
+				cancel()
+			}
+
+			return
+		}
+	}
+}
+
+// PruneImages asks dockerd to delete dangling/unused images older than
+// imagePruneMaxAge. Called on each tick of the maintenance loop. Returning
+// an error does not stop the loop — the caller logs and continues.
+// See CTXRUN-058 (M12).
+func (m *Manager) PruneImages(ctx context.Context) error {
+	args := filters.NewArgs()
+	args.Add("dangling", "true")
+	args.Add("until", imagePruneMaxAge)
+
+	report, err := m.docker.ImagesPrune(ctx, args)
+	if err != nil {
+		return fmt.Errorf("images prune: %w", err)
+	}
+
+	m.logger.Info("image prune complete",
+		"deleted", len(report.ImagesDeleted),
+		"space_reclaimed_bytes", report.SpaceReclaimed,
+	)
+
+	return nil
 }
 
 func (m *Manager) killContainer(ctx context.Context, containerID string, log *slog.Logger) {
@@ -473,6 +1062,65 @@ func (m *Manager) killContainer(ctx context.Context, containerID string, log *sl
 func (m *Manager) removeContainer(ctx context.Context, containerID string, log *slog.Logger) {
 	if err := m.docker.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
 		log.Warn("failed to remove container", "error", err)
+	}
+}
+
+// ForceKillContainer is the shutdown-path backstop: stop + force-remove a
+// container directly by ID, ignoring the tracker. Used by the main shutdown
+// sequence's force-cleanup phase, after the normal Kill + mgr.Wait has
+// already timed out. The caller must pass a bounded ctx.
+func (m *Manager) ForceKillContainer(ctx context.Context, containerID string) error {
+	grace := 0
+
+	var errs []error
+
+	if err := m.docker.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &grace}); err != nil {
+		errs = append(errs, fmt.Errorf("stop: %w", err))
+	}
+
+	if err := m.docker.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+		errs = append(errs, fmt.Errorf("remove: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
+// writePrimingWithTimeout writes the priming stream-json message to the
+// attached container's stdin, bounded by primingWriteTimeout. If the write
+// doesn't land in time we force-close the writer directly (bypassing the
+// tracker) so the wedged Write inside tracker.WriteStdin returns an error
+// and releases stdin.mu — otherwise it would hold the per-entry mutex and
+// block a subsequent Remove forever. We close the raw writer rather than
+// going through tracker.CloseStdin because CloseStdin also acquires
+// stdin.mu, which would deadlock against the in-flight Write. Closing the
+// writer directly is safe: tracker.Remove's Close is a no-op on an
+// already-closed WriteCloser. See CTXRUN-040 (C11).
+func (m *Manager) writePrimingWithTimeout(payload RunConfig, containerID string, b []byte, writer io.Closer) {
+	done := make(chan error, 1)
+
+	go func() {
+		done <- m.tracker.WriteStdin(payload.Project, payload.CardID, b)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			m.logger.Warn("failed to write priming message to container stdin",
+				"container_id", truncateID(containerID),
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"error", err)
+		}
+	case <-time.After(primingWriteTimeout):
+		m.logger.Warn("priming stdin write timed out; closing writer to unblock",
+			"container_id", truncateID(containerID),
+			"card_id", payload.CardID,
+			"project", payload.Project,
+			"timeout", primingWriteTimeout)
+
+		if writer != nil {
+			_ = writer.Close()
+		}
 	}
 }
 
@@ -508,20 +1156,21 @@ func (m *Manager) emitSystem(payload RunConfig, content string) {
 
 // Kill stops and removes a specific container by project and card ID.
 func (m *Manager) Kill(project, cardID string) error {
-	info, ok := m.tracker.Get(project, cardID)
-	if !ok {
+	// Cancel runs the stored context.CancelFunc under tracker.mu, so an
+	// inflight Remove cannot observe a nil Cancel or clear the entry from
+	// under us. Returns false iff no entry is tracked.
+	if !m.tracker.Cancel(project, cardID) {
 		return fmt.Errorf("no container tracked for %s/%s", project, cardID)
-	}
-
-	// Cancel the container's context to trigger cleanup in Run.
-	if info.Cancel != nil {
-		info.Cancel()
 	}
 
 	return nil
 }
 
 // CleanupOrphans removes any leftover containers from a previous runner crash.
+// Per-container Stop/Remove failures are logged individually and collected
+// into the returned error via errors.Join so that callers can see which
+// containers failed without aborting cleanup of the rest. A nil return means
+// every listed container was successfully stopped and removed. See CTXRUN-050.
 func (m *Manager) CleanupOrphans(ctx context.Context) error {
 	containers, err := m.docker.ContainerList(ctx, container.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("label", LabelRunner+"=true")),
@@ -531,27 +1180,67 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 		return fmt.Errorf("list orphan containers: %w", err)
 	}
 
+	var errs []error
+
 	for _, ctr := range containers {
+		idShort := truncateID(ctr.ID)
 		m.logger.Info("cleaning up orphan container",
-			"container_id", truncateID(ctr.ID),
+			"container_id", idShort,
 			"card_id", ctr.Labels[LabelCardID],
 			"project", ctr.Labels[LabelProject],
 		)
-		_ = m.docker.ContainerStop(ctx, ctr.ID, container.StopOptions{Timeout: intPtr(5)})
-		_ = m.docker.ContainerRemove(ctx, ctr.ID, container.RemoveOptions{Force: true})
+
+		// CTXRUN-040: each per-container Stop/Remove is bounded so one
+		// wedged orphan can't stall cleanup of the rest. Using a fresh
+		// dockerCleanupTimeout-scoped ctx here (rather than a child of
+		// the caller's ctx) matches the semantics we want on shutdown:
+		// we'd rather give up quickly and log than wait for a hung
+		// daemon.
+		stopCtx, stopCancel := withDockerCleanupTimeout(ctx)
+
+		stopTimeout := 5
+		if stopErr := m.docker.ContainerStop(stopCtx, ctr.ID, container.StopOptions{Timeout: &stopTimeout}); stopErr != nil {
+			m.logger.Warn("orphan stop failed",
+				"container_id", idShort,
+				"card_id", ctr.Labels[LabelCardID],
+				"project", ctr.Labels[LabelProject],
+				"error", stopErr,
+			)
+			errs = append(errs, fmt.Errorf("stop orphan %s: %w", idShort, stopErr))
+		}
+
+		stopCancel()
+
+		rmCtx, rmCancel := withDockerCleanupTimeout(ctx)
+
+		if rmErr := m.docker.ContainerRemove(rmCtx, ctr.ID, container.RemoveOptions{Force: true}); rmErr != nil {
+			m.logger.Warn("orphan remove failed",
+				"container_id", idShort,
+				"card_id", ctr.Labels[LabelCardID],
+				"project", ctr.Labels[LabelProject],
+				"error", rmErr,
+			)
+			errs = append(errs, fmt.Errorf("remove orphan %s: %w", idShort, rmErr))
+		}
+
+		rmCancel()
 	}
 
 	if len(containers) > 0 {
-		m.logger.Info("orphan cleanup complete", "removed", len(containers))
+		m.logger.Info("orphan cleanup complete",
+			"removed", len(containers)-len(errs),
+			"attempted", len(containers),
+			"errors", len(errs),
+		)
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m *Manager) pullImage(ctx context.Context, img string) error {
 	policy := m.cfg.ImagePullPolicy
 	if policy == "" {
-		policy = config.PullAlways
+		return fmt.Errorf("image_pull_policy is unset; this is a programming error, set it explicitly in Config")
 	}
 
 	if policy == config.PullNever {
@@ -633,8 +1322,6 @@ func sanitizeContainerName(project, cardID string) string {
 	return containerNameRe.ReplaceAllString(name, "-")
 }
 
-func intPtr(v int) *int { return &v }
-
 func truncateID(id string) string {
 	if len(id) > 12 {
 		return id[:12]
@@ -647,7 +1334,17 @@ func truncateID(id string) string {
 // Always includes host.docker.internal. If the MCP URL contains a hostname
 // that resolves on the host (e.g. via /etc/hosts), it's added so containers
 // can reach it too.
-func (m *Manager) buildExtraHosts(ctx context.Context, mcpURL string) []string {
+//
+// The lookup is bounded by dnsLookupTimeout and memoised via m.dnsCache so
+// an attacker-influenced MCPURL hostname can't stall the spawn path. A
+// timeout or error returns the default entry set only — the container can
+// still reach the MCP server if in-container DNS works. See CTXRUN-059 (H24).
+//
+// The caller's ctx is intentionally ignored: the 2s cap is already tight
+// enough that inheriting a near-cancelled parent ctx would effectively
+// disable the cache-miss path. The parameter is retained (as _) so the
+// signature stays stable for call sites that pass ctx unconditionally.
+func (m *Manager) buildExtraHosts(_ context.Context, mcpURL string) []string {
 	hosts := []string{"host.docker.internal:host-gateway"}
 
 	u, err := url.Parse(mcpURL)
@@ -661,12 +1358,44 @@ func (m *Manager) buildExtraHosts(ctx context.Context, mcpURL string) []string {
 		return hosts
 	}
 
-	addrs, err := net.DefaultResolver.LookupHost(ctx, hostname)
-	if err != nil || len(addrs) == 0 {
-		m.logger.Warn("could not resolve MCP hostname for container", "hostname", hostname, "error", err)
+	// Cache hit: return the memoised IPs without touching the resolver.
+	if addrs, ok := m.dnsCache.get(hostname); ok && len(addrs) > 0 {
+		hosts = append(hosts, hostname+":"+addrs[0])
 
 		return hosts
 	}
+
+	resolver := m.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+
+	// Bound the lookup so a slow authoritative server can't stall us.
+	// Use context.Background as the parent so a nearly-cancelled parent ctx
+	// doesn't cut the deadline short (the 2s cap is already tight enough).
+	lookupCtx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
+	defer cancel()
+
+	addrs, err := resolver.LookupHost(lookupCtx, hostname)
+	if err != nil || len(addrs) == 0 {
+		// Distinguish timeout from other failures so operators know when
+		// to look at DNS latency versus a misconfigured hostname.
+		if errors.Is(err, context.DeadlineExceeded) || lookupCtx.Err() != nil {
+			if m.metrics != nil {
+				m.metrics.DNSLookupTimeoutsTotal.Inc()
+			}
+
+			m.logger.Warn("MCP hostname lookup timed out; container will run without ExtraHosts mapping",
+				"hostname", hostname, "timeout", dnsLookupTimeout)
+		} else {
+			m.logger.Warn("could not resolve MCP hostname for container",
+				"hostname", hostname, "error", err)
+		}
+
+		return hosts
+	}
+
+	m.dnsCache.put(hostname, addrs)
 
 	hosts = append(hosts, hostname+":"+addrs[0])
 	m.logger.Info("added MCP host to container", "hostname", hostname, "ip", addrs[0])
