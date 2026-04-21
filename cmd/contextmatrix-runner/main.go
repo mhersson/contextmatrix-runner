@@ -77,6 +77,10 @@ func main() {
 		logger.Warn("dev profile: accepting unpinned image reference", "field", ref.Field, "image", ref.Image)
 	}
 
+	if len(cfg.AppliedDevDefaults) > 0 {
+		logger.Info("dev profile: applied defaults", "defaults", cfg.AppliedDevDefaults)
+	}
+
 	// Initialize OpenTelemetry. When OTEL_EXPORTER_OTLP_ENDPOINT is unset the
 	// provider runs in no-op mode, so local dev needs no collector.
 	shutdownTracer, err := tracing.Init(context.Background(), logger)
@@ -191,7 +195,8 @@ func main() {
 	go runMaintenanceLoop(monitorCtx, mgr, cfg.MaintenanceInterval, health, logger)
 
 	// Webhook handler.
-	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, cfg.AllowedMCPHosts, logger, health, cfg.IsDev()).WithMetrics(mx)
+	webhookSkew := time.Duration(cfg.WebhookReplaySkewSeconds) * time.Second
+	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, cfg.AllowedMCPHosts, logger, webhookSkew, health, cfg.IsDev()).WithMetrics(mx)
 
 	// Signature-replay and /message idempotency caches. Both run
 	// eviction goroutines tied to the main process context so they

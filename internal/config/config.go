@@ -101,6 +101,11 @@ type Config struct {
 	// log a WARN per entry. Never serialised to YAML.
 	UnpinnedImageRefs []UnpinnedImageRef `yaml:"-"`
 
+	// AppliedDevDefaults records which defaults were automatically applied
+	// because DeploymentProfile == ProfileDev and the value was unset.
+	// Read-only after Load returns. Empty in production mode.
+	AppliedDevDefaults []string `yaml:"-"`
+
 	containerTimeoutDuration time.Duration
 }
 
@@ -138,7 +143,6 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		Port:                       9090,
 		AdminPort:                  9091,
-		ImagePullPolicy:            PullNever,
 		MaxConcurrent:              3,
 		ContainerTimeout:           "2h",
 		ContainerMemoryLimit:       8 * 1024 * 1024 * 1024, // 8 GiB
@@ -146,7 +150,6 @@ func Load(path string) (*Config, error) {
 		LogLevel:                   "info",
 		LogFormat:                  LogFormatText,
 		WebhookReplayCacheSize:     10000,
-		WebhookReplaySkewSeconds:   330,
 		MessageDedupCacheSize:      1000,
 		MessageDedupTTLSeconds:     600,
 		SecretsDir:                 defaultSecretsDir,
@@ -160,6 +163,32 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyEnvOverrides(cfg)
+
+	// Apply production default for ImagePullPolicy when neither the YAML nor
+	// the env set it. Keeping this assignment here (rather than in the struct
+	// literal) lets the dev block below distinguish "user left it unset" from
+	// "user explicitly chose PullNever".
+	if cfg.ImagePullPolicy == "" {
+		cfg.ImagePullPolicy = PullNever
+	}
+
+	// Dev-profile defaults: loosen a handful of tunables for local
+	// single-box setups. Only applied when the user did NOT explicitly set
+	// the value in YAML or via env (zero / empty sentinel check).
+	if cfg.DeploymentProfile == ProfileDev {
+		if cfg.WebhookReplaySkewSeconds == 0 {
+			cfg.WebhookReplaySkewSeconds = 86400 // 24 h
+			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "webhook_replay_skew_seconds=86400")
+		}
+
+		if cfg.ImagePullPolicy == PullNever {
+			// ImagePullPolicy was set to PullNever by the production-default
+			// branch above (user left it unset). Switch to if-not-present,
+			// which is more convenient in dev where images are built locally.
+			cfg.ImagePullPolicy = PullIfNotPresent
+			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "image_pull_policy=if-not-present")
+		}
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)

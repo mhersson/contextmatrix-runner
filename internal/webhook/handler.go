@@ -59,6 +59,11 @@ type Handler struct {
 	seenMCPHosts map[string]struct{}
 	seenMCPMu    sync.Mutex
 
+	// webhookReplaySkew is the maximum allowed age for webhook timestamps.
+	// Defaults to cmhmac.DefaultMaxClockSkew when zero (for backward
+	// compatibility with tests that construct Handler literals directly).
+	webhookReplaySkew time.Duration
+
 	// replayCache rejects previously-seen HMAC signatures; messageDedup
 	// returns the original ack for a repeated (project, card_id, message_id).
 	// Both are optional — if nil the corresponding protection is disabled,
@@ -75,8 +80,12 @@ type Handler struct {
 //
 // devMode enables dev-profile behaviour: relaxed empty-allowlist MCP URL
 // validation and per-new-host INFO logging in /trigger. Pass false (the zero
-// value) in tests that do not need dev-mode behaviour — the existing test
-// helpers compile unchanged.
+// value) in tests that do not need dev-mode behaviour.
+//
+// webhookReplaySkew is the maximum allowed age for incoming webhook timestamps.
+// Pass time.Duration(cfg.WebhookReplaySkewSeconds)*time.Second from main; in
+// tests that construct Handler literals directly the field defaults to zero
+// which falls back to cmhmac.DefaultMaxClockSkew inside hmacAuth.
 //
 // health is optional — pass nil in tests that do not exercise /readyz. In
 // production wiring (cmd/contextmatrix-runner/main.go), the same
@@ -92,21 +101,23 @@ func NewHandler(
 	maxConcurrent int,
 	allowedMCPHosts []string,
 	logger *slog.Logger,
+	webhookReplaySkew time.Duration,
 	health *HealthState,
 	devMode bool,
 ) *Handler {
 	return &Handler{
-		manager:         manager,
-		tracker:         tracker,
-		broadcaster:     broadcaster,
-		cmClient:        cmClient,
-		apiKey:          apiKey,
-		maxConcurrent:   maxConcurrent,
-		allowedMCPHosts: allowedMCPHosts,
-		logger:          logger,
-		health:          health,
-		devMode:         devMode,
-		seenMCPHosts:    make(map[string]struct{}),
+		manager:           manager,
+		tracker:           tracker,
+		broadcaster:       broadcaster,
+		cmClient:          cmClient,
+		apiKey:            apiKey,
+		maxConcurrent:     maxConcurrent,
+		allowedMCPHosts:   allowedMCPHosts,
+		logger:            logger,
+		webhookReplaySkew: webhookReplaySkew,
+		health:            health,
+		devMode:           devMode,
+		seenMCPHosts:      make(map[string]struct{}),
 	}
 }
 
@@ -879,7 +890,13 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		sig := strings.TrimPrefix(sigHeader, "sha256=")
-		if !cmhmac.VerifySignatureWithTimestamp(h.apiKey, sig, tsHeader, body, cmhmac.DefaultMaxClockSkew) {
+
+		skew := h.webhookReplaySkew
+		if skew == 0 {
+			skew = cmhmac.DefaultMaxClockSkew
+		}
+
+		if !cmhmac.VerifySignatureWithTimestamp(h.apiKey, sig, tsHeader, body, skew) {
 			h.logWarn("webhook authentication failed", "remote_addr", r.RemoteAddr)
 			writeUnauthorized(w)
 

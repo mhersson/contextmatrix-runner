@@ -1077,3 +1077,77 @@ func TestValidate_AllowedImagesDigestPin(t *testing.T) {
 		assert.NoError(t, cfg.Validate())
 	})
 }
+
+// validConfigDev returns a YAML string for a dev-profile config that is
+// otherwise identical to validConfig. Tests that need the dev profile use
+// this instead of setting the env var after the fact.
+func validConfigDev(pemPath, claudeDir string) string {
+	return validConfig(pemPath, claudeDir) + "\ndeployment_profile: dev\n"
+}
+
+// TestLoad_DevDefaults_UnsetValues verifies that a dev-profile config
+// with no explicit skew or pull policy receives the dev defaults and that
+// AppliedDevDefaults records them both.
+func TestLoad_DevDefaults_UnsetValues(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfigDev(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 86400, cfg.WebhookReplaySkewSeconds, "dev mode: skew should default to 86400")
+	assert.Equal(t, PullIfNotPresent, cfg.ImagePullPolicy, "dev mode: pull policy should default to if-not-present")
+	assert.ElementsMatch(t, []string{"webhook_replay_skew_seconds=86400", "image_pull_policy=if-not-present"}, cfg.AppliedDevDefaults)
+}
+
+// TestLoad_DevDefaults_ExplicitSkew verifies that an explicitly-set
+// webhook_replay_skew_seconds is NOT overridden in dev mode and does NOT
+// appear in AppliedDevDefaults.
+func TestLoad_DevDefaults_ExplicitSkew(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfigDev(pemPath, dir) + "webhook_replay_skew_seconds: 60\n"
+	path := writeConfig(t, dir, yaml)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 60, cfg.WebhookReplaySkewSeconds, "explicit skew must not be overridden in dev mode")
+	assert.NotContains(t, cfg.AppliedDevDefaults, "webhook_replay_skew_seconds=86400")
+}
+
+// TestLoad_DevDefaults_ExplicitPullPolicy verifies that an explicitly-set
+// image_pull_policy is NOT overridden in dev mode.
+func TestLoad_DevDefaults_ExplicitPullPolicy(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfigDev(pemPath, dir) + "image_pull_policy: always\n"
+	path := writeConfig(t, dir, yaml)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, PullAlways, cfg.ImagePullPolicy, "explicit pull policy must not be overridden in dev mode")
+	assert.NotContains(t, cfg.AppliedDevDefaults, "image_pull_policy=if-not-present")
+}
+
+// TestLoad_ProductionDefaults_UnsetValues verifies that the production profile
+// (the default) yields 330 for skew and "never" for pull policy, and that
+// AppliedDevDefaults is empty.
+func TestLoad_ProductionDefaults_UnsetValues(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 330, cfg.WebhookReplaySkewSeconds, "production: skew must default to 330")
+	assert.Equal(t, PullNever, cfg.ImagePullPolicy, "production: pull policy must default to never")
+	assert.Empty(t, cfg.AppliedDevDefaults, "production mode must not populate AppliedDevDefaults")
+}

@@ -474,7 +474,7 @@ func (r *strictRunner) Kill(_, _ string) error {
 func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	tr := tracker.New()
 	// maxConcurrent=3 so concurrency limit never fires; tracker must remain empty.
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, nil, false)
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, 0, nil, false)
 
 	badPayload := TriggerPayload{
 		CardID:  "-rm -rf",
@@ -513,7 +513,7 @@ func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 
 func TestHandleTrigger_InvalidMCPHost_NoTrackerOrRun(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, nil, false)
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, 0, nil, false)
 
 	bad := TriggerPayload{
 		CardID:  "CARD-1",
@@ -544,7 +544,7 @@ func TestHandleTrigger_InvalidMCPHost_NoTrackerOrRun(t *testing.T) {
 func TestHandleTrigger_MCPHostsEmpty_RejectsAll(t *testing.T) {
 	// With an empty allowlist the handler must fail-closed on every mcp_url.
 	tr := tracker.New()
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, nil, nil, nil, false)
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, nil, nil, 0, nil, false)
 
 	p := TriggerPayload{
 		CardID:  "CARD-1",

@@ -25,7 +25,7 @@ import (
 // downstream handler.
 func TestHMACMiddleware_RejectsReplay(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil, false)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	h.SetReplayCache(NewReplayCache(5*time.Minute, 100))
 
 	var called int
@@ -70,7 +70,7 @@ func TestHMACMiddleware_RejectsReplay(t *testing.T) {
 // collide in the cache.
 func TestHMACMiddleware_DifferentSignaturesAllBypass_Replay(t *testing.T) {
 	tr := tracker.New()
-	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil, false)
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	h.SetReplayCache(NewReplayCache(5*time.Minute, 100))
 
 	handler := h.hmacAuth(func(w http.ResponseWriter, _ *http.Request) {
@@ -99,7 +99,7 @@ func TestHMACMiddleware_DifferentSignaturesAllBypass_Replay(t *testing.T) {
 func TestHandleMessage_DedupReturnsOriginalAck(t *testing.T) {
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil, false)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	h.SetMessageDedupCache(NewMessageDedupCache(10*time.Minute, 100))
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -161,7 +161,7 @@ func TestHandleMessage_DedupReturnsOriginalAck(t *testing.T) {
 func TestHandleMessage_DedupTTLExpires(t *testing.T) {
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil, false)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 
 	clock := &mockClock{now: time.Unix(1_700_000_000, 0)}
 	dedup := NewMessageDedupCache(5*time.Minute, 100, WithMessageDedupNow(clock.Now))
@@ -210,7 +210,7 @@ func TestHandleMessage_DedupTTLExpires(t *testing.T) {
 func TestHandleMessage_DedupDisabledNoOp(t *testing.T) {
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, nil, false)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts, nil, 0, nil, false)
 	// intentionally no dedup cache
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
