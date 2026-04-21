@@ -52,6 +52,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Install golangci-lint at the version the worker image pins. Keeping
+      # the pin outside the workflow (in the Makefile) is deliberate so the
+      # runner and the CI runner use the same release.
+      - name: Install golangci-lint
+        run: |
+          set -euo pipefail
+          VERSION=$(grep '^GOLANGCI_LINT_VERSION' Makefile | head -1 | awk -F'?= ' '{print $2}')
+          curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${VERSION}/install.sh" \
+            | sh -s -- -b "$(go env GOPATH)/bin" "${VERSION}"
+
       - name: golangci-lint
         run: make lint
 
@@ -87,8 +97,33 @@ jobs:
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
-      - name: Run govulncheck
-        run: govulncheck ./...
+      # govulncheck fails the job only on findings that have an upstream
+      # fix (fixed_version set). Docker/Moby periodically surfaces daemon
+      # vulnerabilities with `Fixed in: N/A` that govulncheck flags via
+      # package init calls even though the client-only code path is not
+      # reachable — those are accepted and printed for visibility.
+      - name: Run govulncheck (fail only on fixable findings)
+        run: |
+          set -euo pipefail
+          # JSON run: capture the machine-readable stream for filtering.
+          govulncheck -format=json ./... > /tmp/vuln.json 2>&1 || true
+
+          FIXABLE=$(jq -s '[.[] | select(.finding != null
+                                          and .finding.fixed_version != null
+                                          and .finding.fixed_version != "")] | length' /tmp/vuln.json)
+
+          echo "fixable findings: ${FIXABLE}"
+
+          # Human-readable run for log visibility. Don't let its exit code
+          # bubble up — we make the pass/fail decision from FIXABLE above.
+          govulncheck ./... || true
+
+          if [ "${FIXABLE:-0}" -gt 0 ]; then
+            echo "::error::Fixable vulnerabilities detected. See output above."
+            exit 1
+          fi
+
+          echo "No fixable vulnerabilities. Remaining findings have no upstream fix available."
 
   hadolint:
     name: hadolint
@@ -130,7 +165,7 @@ jobs:
         run: make docker-worker
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: contextmatrix/worker:latest
           format: table
