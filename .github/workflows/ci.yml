@@ -197,7 +197,7 @@ jobs:
         run: make docker-worker
 
       - name: Generate SBOM with syft
-        uses: anchore/sbom-action@v0.17.7
+        uses: anchore/sbom-action@v0.24.0
         with:
           image: contextmatrix/worker:latest
           format: spdx-json
