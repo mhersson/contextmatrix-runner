@@ -8,7 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -51,6 +53,12 @@ type Handler struct {
 	logger          *slog.Logger
 	metrics         *metrics.Metrics
 
+	// devMode relaxes empty-allowlist MCP URL enforcement and enables
+	// per-new-host INFO logging in /trigger. Set from cfg.IsDev().
+	devMode      bool
+	seenMCPHosts map[string]struct{}
+	seenMCPMu    sync.Mutex
+
 	// replayCache rejects previously-seen HMAC signatures; messageDedup
 	// returns the original ack for a repeated (project, card_id, message_id).
 	// Both are optional — if nil the corresponding protection is disabled,
@@ -64,6 +72,11 @@ type Handler struct {
 }
 
 // NewHandler creates a webhook handler.
+//
+// devMode enables dev-profile behaviour: relaxed empty-allowlist MCP URL
+// validation and per-new-host INFO logging in /trigger. Pass false (the zero
+// value) in tests that do not need dev-mode behaviour — the existing test
+// helpers compile unchanged.
 //
 // health is optional — pass nil in tests that do not exercise /readyz. In
 // production wiring (cmd/contextmatrix-runner/main.go), the same
@@ -80,6 +93,7 @@ func NewHandler(
 	allowedMCPHosts []string,
 	logger *slog.Logger,
 	health *HealthState,
+	devMode bool,
 ) *Handler {
 	return &Handler{
 		manager:         manager,
@@ -91,6 +105,8 @@ func NewHandler(
 		allowedMCPHosts: allowedMCPHosts,
 		logger:          logger,
 		health:          health,
+		devMode:         devMode,
+		seenMCPHosts:    make(map[string]struct{}),
 	}
 }
 
@@ -182,7 +198,26 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts); err != nil {
+	// In dev mode, log the first time we see each MCP host so operators can
+	// track which ephemeral endpoints are being used without configuring a
+	// fixed allowlist. We do this before ValidatePayload so the log fires even
+	// if the URL is later rejected for a different reason (e.g. bad scheme).
+	if h.devMode && payload.MCPURL != "" {
+		if u, err := url.Parse(payload.MCPURL); err == nil {
+			if host := u.Hostname(); host != "" {
+				h.seenMCPMu.Lock()
+				if _, seen := h.seenMCPHosts[host]; !seen {
+					h.seenMCPHosts[host] = struct{}{}
+					h.seenMCPMu.Unlock()
+					h.logInfo("dev profile: mcp host seen", "host", host)
+				} else {
+					h.seenMCPMu.Unlock()
+				}
+			}
+		}
+	}
+
+	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -270,7 +305,7 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts); err != nil {
+	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -311,7 +346,7 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts); err != nil {
+	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -413,7 +448,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts); err != nil {
+	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -540,7 +575,7 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts); err != nil {
+	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -651,7 +686,7 @@ func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts); err != nil {
+	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -946,6 +981,19 @@ func writeUnauthorized(w http.ResponseWriter) {
 // misconfigured CM.
 func writeUpstreamUnavailable(w http.ResponseWriter) {
 	writeError(w, http.StatusBadGateway, CodeUpstreamFailure, "upstream verification failed")
+}
+
+// logInfo emits an Info log via h.logger, falling back to slog.Default
+// when no logger was injected (the test-only code path). See logDebug for
+// the taint discussion.
+func (h *Handler) logInfo(msg string, args ...any) {
+	if h.logger != nil {
+		h.logger.Info(msg, args...)
+
+		return
+	}
+
+	slog.Info(msg, args...) //nolint:gosec // msg is always a literal at call sites
 }
 
 // logDebug emits a Debug log via h.logger, falling back to slog.Default

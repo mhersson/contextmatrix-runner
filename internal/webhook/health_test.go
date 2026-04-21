@@ -25,7 +25,7 @@ func newReadyzHandler(t *testing.T, state *HealthState) http.Handler {
 
 	// NewHandler accepts nil for everything the /readyz path does not
 	// touch — /readyz must be usable without CM/callback/manager/etc.
-	h := NewHandler(nil, tracker.New(), nil, nil, testAPIKey, 1, testAllowedMCPHosts, nil, state)
+	h := NewHandler(nil, tracker.New(), nil, nil, testAPIKey, 1, testAllowedMCPHosts, nil, state, false)
 
 	mux := http.NewServeMux()
 	h.Register(mux)

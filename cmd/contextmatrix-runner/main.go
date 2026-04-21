@@ -191,7 +191,7 @@ func main() {
 	go runMaintenanceLoop(monitorCtx, mgr, cfg.MaintenanceInterval, health, logger)
 
 	// Webhook handler.
-	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, cfg.AllowedMCPHosts, logger, health).WithMetrics(mx)
+	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, cfg.AllowedMCPHosts, logger, health, cfg.IsDev()).WithMetrics(mx)
 
 	// Signature-replay and /message idempotency caches. Both run
 	// eviction goroutines tied to the main process context so they

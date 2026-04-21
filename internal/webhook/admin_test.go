@@ -29,7 +29,7 @@ func TestAdminMetrics_RejectsUnauthenticated(t *testing.T) {
 	mx := metrics.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
 
-	h := webhook.NewHandler(nil, tracker.New(), b, nil, adminTestAPIKey, 3, nil, nil, nil).WithMetrics(mx)
+	h := webhook.NewHandler(nil, tracker.New(), b, nil, adminTestAPIKey, 3, nil, nil, nil, false).WithMetrics(mx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", h.AdminAuth(promhttp.HandlerFor(mx.Registry, promhttp.HandlerOpts{}).ServeHTTP))
