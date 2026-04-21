@@ -1120,19 +1120,36 @@ func TestLoad_DevDefaults_ExplicitSkew(t *testing.T) {
 }
 
 // TestLoad_DevDefaults_ExplicitPullPolicy verifies that an explicitly-set
-// image_pull_policy is NOT overridden in dev mode.
+// image_pull_policy is NOT overridden in dev mode. Covers both "always" (trivially
+// distinct from the dev default) and "never" (shares a value with the
+// production default and previously regressed — see git history).
 func TestLoad_DevDefaults_ExplicitPullPolicy(t *testing.T) {
-	dir := t.TempDir()
-	pemPath := writePEM(t, dir)
+	cases := []struct {
+		name   string
+		policy string
+	}{
+		{name: "always", policy: PullAlways},
+		{name: "never", policy: PullNever},
+		{name: "if-not-present", policy: PullIfNotPresent},
+	}
 
-	yaml := validConfigDev(pemPath, dir) + "image_pull_policy: always\n"
-	path := writeConfig(t, dir, yaml)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pemPath := writePEM(t, dir)
 
-	cfg, err := Load(path)
-	require.NoError(t, err)
+			yaml := validConfigDev(pemPath, dir) + "image_pull_policy: " + tc.policy + "\n"
+			path := writeConfig(t, dir, yaml)
 
-	assert.Equal(t, PullAlways, cfg.ImagePullPolicy, "explicit pull policy must not be overridden in dev mode")
-	assert.NotContains(t, cfg.AppliedDevDefaults, "image_pull_policy=if-not-present")
+			cfg, err := Load(path)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.policy, cfg.ImagePullPolicy,
+				"explicit pull policy %q must not be overridden in dev mode", tc.policy)
+			assert.NotContains(t, cfg.AppliedDevDefaults, "image_pull_policy=if-not-present",
+				"explicit pull policy must not appear in AppliedDevDefaults")
+		})
+	}
 }
 
 // TestLoad_ProductionDefaults_UnsetValues verifies that the production profile

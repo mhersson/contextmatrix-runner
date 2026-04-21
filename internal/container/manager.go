@@ -667,7 +667,7 @@ func secretsToEnvVars(secrets map[string]string) []string {
 	return vars
 }
 
-// shellSingleQuoteEscape returns s with every `'` replaced by `'\"` so the
+// shellSingleQuoteEscape returns s with every `'` replaced by `'\”` so the
 // result can be safely embedded inside a single-quoted shell string.
 func shellSingleQuoteEscape(s string) string {
 	return strings.ReplaceAll(s, `'`, `'\''`)

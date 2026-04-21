@@ -164,11 +164,12 @@ func Load(path string) (*Config, error) {
 
 	applyEnvOverrides(cfg)
 
-	// Apply production default for ImagePullPolicy when neither the YAML nor
-	// the env set it. Keeping this assignment here (rather than in the struct
-	// literal) lets the dev block below distinguish "user left it unset" from
-	// "user explicitly chose PullNever".
-	if cfg.ImagePullPolicy == "" {
+	// Capture whether the user explicitly set ImagePullPolicy before we fill
+	// in a default. "never" is a legitimate explicit choice, so after the
+	// default-assignment below we can no longer tell the two apart — the
+	// dev-profile override must gate on this sentinel, not on the final value.
+	explicitPullPolicy := cfg.ImagePullPolicy != ""
+	if !explicitPullPolicy {
 		cfg.ImagePullPolicy = PullNever
 	}
 
@@ -181,10 +182,7 @@ func Load(path string) (*Config, error) {
 			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "webhook_replay_skew_seconds=86400")
 		}
 
-		if cfg.ImagePullPolicy == PullNever {
-			// ImagePullPolicy was set to PullNever by the production-default
-			// branch above (user left it unset). Switch to if-not-present,
-			// which is more convenient in dev where images are built locally.
+		if !explicitPullPolicy {
 			cfg.ImagePullPolicy = PullIfNotPresent
 			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "image_pull_policy=if-not-present")
 		}
