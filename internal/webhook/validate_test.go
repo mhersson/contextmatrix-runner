@@ -18,8 +18,6 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
-var validateTestAllowed = []string{"cm.example.com"}
-
 // -----------------------------------------------------------------------------
 // card_id / project (identRE)
 // -----------------------------------------------------------------------------
@@ -175,77 +173,6 @@ func TestValidateRepoURL(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// mcp_url
-// -----------------------------------------------------------------------------
-
-func TestValidateMCPURL(t *testing.T) {
-	allowlist := []string{"cm.example.com", "Staging.ContextMatrix.io"}
-
-	cases := []struct {
-		name    string
-		val     string
-		allowed []string
-		devMode bool
-		wantErr bool
-	}{
-		// happy paths
-		{"https allowed exact", "https://cm.example.com/mcp", allowlist, false, false},
-		{"https with port allowed", "https://cm.example.com:8443/mcp", allowlist, false, false},
-		{"https case-insensitive match", "https://staging.contextmatrix.io/mcp", allowlist, false, false},
-
-		// scheme rejections
-		{"http not allowed", "http://cm.example.com/mcp", allowlist, false, true},
-		{"ws not allowed", "ws://cm.example.com/mcp", allowlist, false, true},
-		{"ssh not allowed", "ssh://cm.example.com/mcp", allowlist, false, true},
-		{"empty string", "", allowlist, false, true},
-
-		// host rejections
-		{"host not in allowlist", "https://evil.example.com/mcp", allowlist, false, true},
-		{"empty host", "https:///mcp", allowlist, false, true},
-		{"host with disallowed char", "https://ev\"il.example.com/mcp", allowlist, false, true},
-
-		// allowlist-empty fail-closed (production)
-		{"empty allowlist rejects all", "https://cm.example.com/mcp", nil, false, true},
-		{"nil allowlist rejects all", "https://cm.example.com/mcp", []string{}, false, true},
-
-		// control bytes
-		{"newline in raw", "https://cm.example.com\n/mcp", allowlist, false, true},
-		{"carriage return in raw", "https://cm.example.com\r/mcp", allowlist, false, true},
-		{"NUL byte in raw", "https://cm.example.com\x00/mcp", allowlist, false, true},
-
-		// dev mode: empty allowlist is relaxed
-		{"dev+empty allowlist accepts valid url", "https://example.com/mcp", nil, true, false},
-		{"dev+empty allowlist accepts valid url (slice)", "https://example.com/mcp", []string{}, true, false},
-
-		// dev mode: http scheme is accepted
-		{"dev+http scheme accepted", "http://localhost:8080/mcp", nil, true, false},
-		{"dev+http scheme accepted with allowlist", "http://cm.example.com/mcp", allowlist, true, false},
-
-		// production: http scheme still rejected
-		{"prod+http rejected with allowlist", "http://cm.example.com/mcp", allowlist, false, true},
-
-		// dev mode: non-empty allowlist still enforces membership
-		{"dev+nonempty allowlist rejects unknown host", "https://evil.example.com/mcp", allowlist, true, true},
-		{"dev+nonempty allowlist accepts known host", "https://cm.example.com/mcp", allowlist, true, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateMCPURL(tc.val, tc.allowed, tc.devMode)
-			if tc.wantErr {
-				require.Error(t, err, "expected error for %q", tc.val)
-
-				var ve *ValidationError
-
-				require.ErrorAs(t, err, &ve)
-				assert.Equal(t, "mcp_url", ve.Field)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
-// -----------------------------------------------------------------------------
 // content (MessagePayload)
 // -----------------------------------------------------------------------------
 
@@ -330,10 +257,9 @@ func TestValidatePayload_TriggerHappy(t *testing.T) {
 		CardID:     "CARD-001",
 		Project:    "proj",
 		RepoURL:    "https://github.com/org/repo.git",
-		MCPURL:     "https://cm.example.com/mcp",
 		BaseBranch: "main",
 	}
-	require.NoError(t, ValidatePayload(p, validateTestAllowed, false))
+	require.NoError(t, ValidatePayload(p))
 }
 
 func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
@@ -342,7 +268,6 @@ func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
 			CardID:  "CARD-001",
 			Project: "proj",
 			RepoURL: "https://github.com/org/repo.git",
-			MCPURL:  "https://cm.example.com/mcp",
 		}
 	}
 
@@ -354,7 +279,6 @@ func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
 		{"bad card_id", func(p *TriggerPayload) { p.CardID = "a b" }, "card_id"},
 		{"bad project", func(p *TriggerPayload) { p.Project = "-evil" }, "project"},
 		{"bad repo_url", func(p *TriggerPayload) { p.RepoURL = "http://example.com/" }, "repo_url"},
-		{"bad mcp_url", func(p *TriggerPayload) { p.MCPURL = "https://evil.example.com/" }, "mcp_url"},
 		{"bad base_branch", func(p *TriggerPayload) { p.BaseBranch = "main\n" }, "base_branch"},
 	}
 
@@ -363,7 +287,7 @@ func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
 			p := mk()
 			tc.mutate(p)
 
-			err := ValidatePayload(p, validateTestAllowed, false)
+			err := ValidatePayload(p)
 			require.Error(t, err)
 
 			var ve *ValidationError
@@ -375,9 +299,9 @@ func TestValidatePayload_TriggerRejectsEachField(t *testing.T) {
 }
 
 func TestValidatePayload_Kill(t *testing.T) {
-	require.NoError(t, ValidatePayload(&KillPayload{CardID: "C-1", Project: "p"}, nil, false))
+	require.NoError(t, ValidatePayload(&KillPayload{CardID: "C-1", Project: "p"}))
 
-	err := ValidatePayload(&KillPayload{CardID: "-evil", Project: "p"}, nil, false)
+	err := ValidatePayload(&KillPayload{CardID: "-evil", Project: "p"})
 	require.Error(t, err)
 
 	var ve *ValidationError
@@ -388,13 +312,13 @@ func TestValidatePayload_Kill(t *testing.T) {
 
 func TestValidatePayload_StopAll(t *testing.T) {
 	// Empty project allowed
-	require.NoError(t, ValidatePayload(&StopAllPayload{}, nil, false))
+	require.NoError(t, ValidatePayload(&StopAllPayload{}))
 
 	// Valid project allowed
-	require.NoError(t, ValidatePayload(&StopAllPayload{Project: "proj"}, nil, false))
+	require.NoError(t, ValidatePayload(&StopAllPayload{Project: "proj"}))
 
 	// Bad project rejected
-	err := ValidatePayload(&StopAllPayload{Project: "a b"}, nil, false)
+	err := ValidatePayload(&StopAllPayload{Project: "a b"})
 	require.Error(t, err)
 }
 
@@ -405,12 +329,12 @@ func TestValidatePayload_Message(t *testing.T) {
 		Content:   "hello",
 		MessageID: "msg-1",
 	}
-	require.NoError(t, ValidatePayload(p, nil, false))
+	require.NoError(t, ValidatePayload(p))
 
 	// Empty content
 	p2 := *p
 	p2.Content = ""
-	err := ValidatePayload(&p2, nil, false)
+	err := ValidatePayload(&p2)
 	require.Error(t, err)
 
 	var ve *ValidationError
@@ -421,37 +345,37 @@ func TestValidatePayload_Message(t *testing.T) {
 	// Bad message_id
 	p3 := *p
 	p3.MessageID = "msg id with space"
-	err = ValidatePayload(&p3, nil, false)
+	err = ValidatePayload(&p3)
 	require.Error(t, err)
 	require.ErrorAs(t, err, &ve)
 	assert.Equal(t, "message_id", ve.Field)
 }
 
 func TestValidatePayload_Promote(t *testing.T) {
-	require.NoError(t, ValidatePayload(&PromotePayload{CardID: "C-1", Project: "p"}, nil, false))
-	require.Error(t, ValidatePayload(&PromotePayload{CardID: "", Project: "p"}, nil, false))
+	require.NoError(t, ValidatePayload(&PromotePayload{CardID: "C-1", Project: "p"}))
+	require.Error(t, ValidatePayload(&PromotePayload{CardID: "", Project: "p"}))
 }
 
 func TestValidatePayload_EndSession(t *testing.T) {
-	require.NoError(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "p"}, nil, false))
-	require.Error(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "-bad"}, nil, false))
+	require.NoError(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "p"}))
+	require.Error(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "-bad"}))
 }
 
 func TestValidatePayload_ByValue(t *testing.T) {
 	// Pass-by-value should work as well as pass-by-pointer.
-	require.NoError(t, ValidatePayload(KillPayload{CardID: "C-1", Project: "p"}, nil, false))
-	require.NoError(t, ValidatePayload(StopAllPayload{}, nil, false))
-	require.NoError(t, ValidatePayload(PromotePayload{CardID: "C-1", Project: "p"}, nil, false))
-	require.NoError(t, ValidatePayload(EndSessionPayload{CardID: "C-1", Project: "p"}, nil, false))
+	require.NoError(t, ValidatePayload(KillPayload{CardID: "C-1", Project: "p"}))
+	require.NoError(t, ValidatePayload(StopAllPayload{}))
+	require.NoError(t, ValidatePayload(PromotePayload{CardID: "C-1", Project: "p"}))
+	require.NoError(t, ValidatePayload(EndSessionPayload{CardID: "C-1", Project: "p"}))
 	require.NoError(t, ValidatePayload(
-		MessagePayload{CardID: "C-1", Project: "p", Content: "hi"}, nil, false,
+		MessagePayload{CardID: "C-1", Project: "p", Content: "hi"},
 	))
 }
 
 func TestValidatePayload_UnknownTypeNoop(t *testing.T) {
 	// Unknown payload type returns nil (handlers only pass known types).
-	require.NoError(t, ValidatePayload(struct{ X int }{X: 1}, nil, false))
-	require.NoError(t, ValidatePayload(nil, nil, false))
+	require.NoError(t, ValidatePayload(struct{ X int }{X: 1}))
+	require.NoError(t, ValidatePayload(nil))
 }
 
 func TestValidationError_Message(t *testing.T) {
@@ -481,13 +405,12 @@ func (r *strictRunner) Kill(_, _ string) error {
 func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	tr := tracker.New()
 	// maxConcurrent=3 so concurrency limit never fires; tracker must remain empty.
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, 0, nil, false)
+	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
 
 	badPayload := TriggerPayload{
 		CardID:  "-rm -rf",
 		Project: "proj",
 		RepoURL: "https://github.com/org/repo.git",
-		MCPURL:  "https://cm.example.com/mcp",
 	}
 
 	body, err := json.Marshal(badPayload)
@@ -516,70 +439,4 @@ func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	// Message should identify the rejected field but NOT echo the raw value.
 	assert.Contains(t, resp.Message, "card_id")
 	assert.NotContains(t, resp.Message, "-rm -rf")
-}
-
-func TestHandleTrigger_InvalidMCPHost_NoTrackerOrRun(t *testing.T) {
-	tr := tracker.New()
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, validateTestAllowed, nil, 0, nil, false)
-
-	bad := TriggerPayload{
-		CardID:  "CARD-1",
-		Project: "proj",
-		RepoURL: "https://github.com/org/repo.git",
-		MCPURL:  "https://evil.example.com/mcp",
-	}
-
-	body, err := json.Marshal(bad)
-	require.NoError(t, err)
-
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
-
-	req := httptest.NewRequestWithContext(
-		context.Background(), http.MethodPost, "/trigger", strings.NewReader(string(body)),
-	)
-	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-	req.Header.Set(cmhmac.TimestampHeader, ts)
-
-	w := httptest.NewRecorder()
-	h.hmacAuth(h.handleTrigger)(w, req)
-
-	require.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Equal(t, 0, tr.Count(), "MCP host mismatch must not land in tracker")
-}
-
-func TestHandleTrigger_MCPHostsEmpty_RejectsAll(t *testing.T) {
-	// With an empty allowlist the handler must fail-closed on every mcp_url.
-	tr := tracker.New()
-	h := NewHandler(&strictRunner{t: t}, tr, nil, nil, testAPIKey, 3, nil, nil, 0, nil, false)
-
-	p := TriggerPayload{
-		CardID:  "CARD-1",
-		Project: "proj",
-		RepoURL: "https://github.com/org/repo.git",
-		MCPURL:  "https://cm.example.com/mcp",
-	}
-
-	body, err := json.Marshal(p)
-	require.NoError(t, err)
-
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
-
-	req := httptest.NewRequestWithContext(
-		context.Background(), http.MethodPost, "/trigger", strings.NewReader(string(body)),
-	)
-	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-	req.Header.Set(cmhmac.TimestampHeader, ts)
-
-	w := httptest.NewRecorder()
-	h.hmacAuth(h.handleTrigger)(w, req)
-
-	require.Equal(t, http.StatusBadRequest, w.Code)
-
-	var resp ErrorResponse
-
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
-	assert.Equal(t, CodeInvalidField, resp.Code)
-	assert.Contains(t, resp.Message, "mcp_url")
 }

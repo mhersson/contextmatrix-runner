@@ -154,8 +154,8 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 
 			tr := tracker.New()
 			b := logbroadcast.NewBroadcaster(nil, nil)
-			h := NewHandler(&noopRunner{}, tr, b, nil, testAPIKey, 3, testAllowedMCPHosts,
-				slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
+			h := NewHandler(&noopRunner{}, tr, b, nil, testAPIKey, 3, testMCPURL,
+				slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 			require.NoError(t, tr.Add(&tracker.ContainerInfo{
 				CardID:  card,
 				Project: project,
@@ -179,8 +179,8 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 
 		tr := tracker.New()
 		h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
-			testAPIKey, 3, testAllowedMCPHosts,
-			slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
+			testAPIKey, 3, testMCPURL,
+			slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 		return h, nil, ""
 	}
@@ -210,7 +210,6 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 			setup:      blank,
 			path:       "/trigger",
 			handler:    func(h *Handler) http.HandlerFunc { return h.handleTrigger },
-			payload:    TriggerPayload{Project: "proj", RepoURL: "https://github.com/o/r.git", MCPURL: "https://cm.example.com/mcp"},
 			wantStatus: http.StatusBadRequest,
 			wantCode:   CodeInvalidField,
 		},
@@ -221,8 +220,8 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 
 				tr := tracker.New()
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
-					testAPIKey, 3, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
+					testAPIKey, 3, testMCPURL,
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 				require.NoError(t, tr.Add(&tracker.ContainerInfo{
 					CardID: "DUPE-1", Project: "proj",
 				}))
@@ -231,9 +230,9 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 			},
 			path:       "/trigger",
 			handler:    func(h *Handler) http.HandlerFunc { return h.handleTrigger },
-			payload:    TriggerPayload{CardID: "DUPE-1", Project: "proj", RepoURL: "https://github.com/o/r.git", MCPURL: "https://cm.example.com/mcp"},
 			wantStatus: http.StatusConflict,
 			wantCode:   CodeConflict,
+			payload:    TriggerPayload{CardID: "DUPE-1", Project: "proj", RepoURL: "https://github.com/o/r.git"},
 		},
 		{
 			name: "trigger: over concurrency limit -> 429 limit_reached",
@@ -242,8 +241,8 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 
 				tr := tracker.New()
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
-					testAPIKey, 1, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
+					testAPIKey, 1, testMCPURL,
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 				require.NoError(t, tr.Add(&tracker.ContainerInfo{
 					CardID: "BUSY-1", Project: "proj",
 				}))
@@ -252,9 +251,9 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 			},
 			path:       "/trigger",
 			handler:    func(h *Handler) http.HandlerFunc { return h.handleTrigger },
-			payload:    TriggerPayload{CardID: "NEW-1", Project: "proj", RepoURL: "https://github.com/o/r.git", MCPURL: "https://cm.example.com/mcp"},
 			wantStatus: http.StatusTooManyRequests,
 			wantCode:   CodeLimitReached,
+			payload:    TriggerPayload{CardID: "NEW-1", Project: "proj", RepoURL: "https://github.com/o/r.git"},
 		},
 		{
 			name: "trigger: draining -> 503 draining",
@@ -265,14 +264,13 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 				hs := NewHealthState()
 				hs.Draining.Store(true)
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
-					testAPIKey, 3, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, hs, false)
+					testAPIKey, 3, testMCPURL,
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, hs)
 
 				return h, nil, ""
 			},
 			path:       "/trigger",
 			handler:    func(h *Handler) http.HandlerFunc { return h.handleTrigger },
-			payload:    TriggerPayload{CardID: "C-1", Project: "proj", RepoURL: "https://github.com/o/r.git", MCPURL: "https://cm.example.com/mcp"},
 			wantStatus: http.StatusServiceUnavailable,
 			wantCode:   CodeDraining,
 		},
@@ -361,8 +359,8 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 				hs := NewHealthState()
 				hs.Draining.Store(true)
 				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
-					testAPIKey, 3, testAllowedMCPHosts,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, hs, false)
+					testAPIKey, 3, testMCPURL,
+					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, hs)
 
 				return h, nil, ""
 			},
@@ -492,8 +490,8 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 func TestNoRawErrLeakIntoResponseBody(t *testing.T) {
 	tr := tracker.New()
 	h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
-		testAPIKey, 3, testAllowedMCPHosts,
-		slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil, false)
+		testAPIKey, 3, testMCPURL,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 	// An unmarshal on this produces an error with byte offset; the old code
 	// echoed err.Error() which surfaced internal implementation details

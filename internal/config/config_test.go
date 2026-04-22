@@ -167,6 +167,122 @@ func TestValidate_MissingContextMatrixURL(t *testing.T) {
 	assert.ErrorContains(t, err, "contextmatrix_url is required")
 }
 
+func TestValidate_ContainerContextMatrixURL_DefaultsToContextMatrixURL(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := &Config{
+		ContextMatrixURL: "http://cm.lan:8080",
+		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:        testDigestImage,
+		ImagePullPolicy:  PullAlways,
+		MaxConcurrent:    1,
+		ContainerTimeout: "1h",
+		AnthropicAPIKey:  "sk-ant-test",
+		GitHubApp: GitHubApp{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+	require.NoError(t, cfg.Validate())
+	assert.Equal(t, "http://cm.lan:8080", cfg.ContainerContextMatrixURL)
+}
+
+func TestValidate_ContainerContextMatrixURL_ExplicitValuePreserved(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := &Config{
+		ContextMatrixURL:          "http://cm.lan:8080",
+		ContainerContextMatrixURL: "http://host.docker.internal:8080",
+		APIKey:                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:                 testDigestImage,
+		ImagePullPolicy:           PullAlways,
+		MaxConcurrent:             1,
+		ContainerTimeout:          "1h",
+		AnthropicAPIKey:           "sk-ant-test",
+		GitHubApp: GitHubApp{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+	require.NoError(t, cfg.Validate())
+	assert.Equal(t, "http://host.docker.internal:8080", cfg.ContainerContextMatrixURL)
+}
+
+func TestValidate_ServiceURLValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr string
+	}{
+		{"valid https", "https://cm.example.com:8080", ""},
+		{"valid http", "http://localhost:8080", ""},
+		{"valid http no port", "http://cm.lan", ""},
+		{"missing scheme", "cm.example.com:8080", "scheme must be http or https"},
+		{"ftp scheme", "ftp://cm.example.com", "scheme must be http or https"},
+		{"file scheme", "file:///etc/passwd", "scheme must be http or https"},
+		{"empty host", "http://", "host is required"},
+		{"unparseable", "://bad", "invalid URL"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pemPath := writePEM(t, dir)
+
+			cfg := &Config{
+				ContextMatrixURL: tt.url,
+				APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				BaseImage:        testDigestImage,
+				ImagePullPolicy:  PullAlways,
+				MaxConcurrent:    1,
+				ContainerTimeout: "1h",
+				AnthropicAPIKey:  "sk-ant-test",
+				GitHubApp: GitHubApp{
+					AppID:          1,
+					InstallationID: 1,
+					PrivateKeyPath: pemPath,
+				},
+			}
+
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_ContainerContextMatrixURL_InvalidExplicitValue(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := &Config{
+		ContextMatrixURL:          "http://cm.lan:8080",
+		ContainerContextMatrixURL: "not-a-url",
+		APIKey:                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:                 testDigestImage,
+		ImagePullPolicy:           PullAlways,
+		MaxConcurrent:             1,
+		ContainerTimeout:          "1h",
+		AnthropicAPIKey:           "sk-ant-test",
+		GitHubApp: GitHubApp{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "container_contextmatrix_url")
+}
+
 func TestValidate_APIKeyTooShort(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",

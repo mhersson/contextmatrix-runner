@@ -8,9 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -43,21 +41,15 @@ type ContainerRunner interface {
 
 // Handler processes incoming webhooks from ContextMatrix.
 type Handler struct {
-	manager         ContainerRunner
-	tracker         *tracker.Tracker
-	broadcaster     *logbroadcast.Broadcaster
-	cmClient        *callback.Client // contextmatrix callback client for promote API call
-	apiKey          string
-	maxConcurrent   int
-	allowedMCPHosts []string
-	logger          *slog.Logger
-	metrics         *metrics.Metrics
-
-	// devMode relaxes empty-allowlist MCP URL enforcement and enables
-	// per-new-host INFO logging in /trigger. Set from cfg.IsDev().
-	devMode      bool
-	seenMCPHosts map[string]struct{}
-	seenMCPMu    sync.Mutex
+	manager       ContainerRunner
+	tracker       *tracker.Tracker
+	broadcaster   *logbroadcast.Broadcaster
+	cmClient      *callback.Client // contextmatrix callback client for promote API call
+	apiKey        string
+	mcpURL        string // derived from contextmatrix_url + "/mcp" at startup
+	maxConcurrent int
+	logger        *slog.Logger
+	metrics       *metrics.Metrics
 
 	// webhookReplaySkew is the maximum allowed age for webhook timestamps.
 	// Defaults to cmhmac.DefaultMaxClockSkew when zero (for backward
@@ -78,9 +70,9 @@ type Handler struct {
 
 // NewHandler creates a webhook handler.
 //
-// devMode enables dev-profile behaviour: relaxed empty-allowlist MCP URL
-// validation and per-new-host INFO logging in /trigger. Pass false (the zero
-// value) in tests that do not need dev-mode behaviour.
+// mcpURL is the MCP endpoint URL derived from contextmatrix_url at startup
+// (e.g. "http://contextmatrix:8080/mcp"). It is injected into every container
+// as CM_MCP_URL so Claude Code can reach the MCP server.
 //
 // webhookReplaySkew is the maximum allowed age for incoming webhook timestamps.
 // Pass time.Duration(cfg.WebhookReplaySkewSeconds)*time.Second from main; in
@@ -99,11 +91,10 @@ func NewHandler(
 	cmClient *callback.Client,
 	apiKey string,
 	maxConcurrent int,
-	allowedMCPHosts []string,
+	mcpURL string,
 	logger *slog.Logger,
 	webhookReplaySkew time.Duration,
 	health *HealthState,
-	devMode bool,
 ) *Handler {
 	return &Handler{
 		manager:           manager,
@@ -111,13 +102,11 @@ func NewHandler(
 		broadcaster:       broadcaster,
 		cmClient:          cmClient,
 		apiKey:            apiKey,
+		mcpURL:            mcpURL,
 		maxConcurrent:     maxConcurrent,
-		allowedMCPHosts:   allowedMCPHosts,
 		logger:            logger,
 		webhookReplaySkew: webhookReplaySkew,
 		health:            health,
-		devMode:           devMode,
-		seenMCPHosts:      make(map[string]struct{}),
 	}
 }
 
@@ -209,26 +198,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// In dev mode, log the first time we see each MCP host so operators can
-	// track which ephemeral endpoints are being used without configuring a
-	// fixed allowlist. We do this before ValidatePayload so the log fires even
-	// if the URL is later rejected for a different reason (e.g. bad scheme).
-	if h.devMode && payload.MCPURL != "" {
-		if u, err := url.Parse(payload.MCPURL); err == nil {
-			if host := u.Hostname(); host != "" {
-				h.seenMCPMu.Lock()
-				if _, seen := h.seenMCPHosts[host]; !seen {
-					h.seenMCPHosts[host] = struct{}{}
-					h.seenMCPMu.Unlock()
-					h.logInfo("dev profile: mcp host seen", "host", host)
-				} else {
-					h.seenMCPMu.Unlock()
-				}
-			}
-		}
-	}
-
-	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
+	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -293,7 +263,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		CardID:        payload.CardID,
 		Project:       payload.Project,
 		RepoURL:       payload.RepoURL,
-		MCPURL:        payload.MCPURL,
+		MCPURL:        h.mcpURL,
 		MCPAPIKey:     payload.MCPAPIKey,
 		BaseBranch:    payload.BaseBranch,
 		RunnerImage:   payload.RunnerImage,
@@ -316,7 +286,7 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
+	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -357,7 +327,7 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
+	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -459,7 +429,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
+	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -586,7 +556,7 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
+	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -697,7 +667,7 @@ func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidatePayload(&payload, h.allowedMCPHosts, h.devMode); err != nil {
+	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
 
 		return
@@ -1001,19 +971,6 @@ func writeUnauthorized(w http.ResponseWriter) {
 // misconfigured CM.
 func writeUpstreamUnavailable(w http.ResponseWriter) {
 	writeError(w, http.StatusBadGateway, CodeUpstreamFailure, "upstream verification failed")
-}
-
-// logInfo emits an Info log via h.logger, falling back to slog.Default
-// when no logger was injected (the test-only code path). See logDebug for
-// the taint discussion.
-func (h *Handler) logInfo(msg string, args ...any) {
-	if h.logger != nil {
-		h.logger.Info(msg, args...)
-
-		return
-	}
-
-	slog.Info(msg, args...) //nolint:gosec // msg is always a literal at call sites
 }
 
 // logDebug emits a Debug log via h.logger, falling back to slog.Default

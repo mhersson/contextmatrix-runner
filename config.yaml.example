@@ -38,9 +38,16 @@ log_format: "text"
 
 # ----- ContextMatrix Connection -----
 
-# Base URL of the ContextMatrix instance. Used for status callbacks.
+# Base URL of the ContextMatrix instance. Used for status callbacks and
+# verify-autonomous checks from the runner process itself.
 # Env: CMR_CONTEXTMATRIX_URL
 contextmatrix_url: "http://localhost:8080"
+
+# URL that spawned containers use to reach ContextMatrix. Injected as CM_MCP_URL.
+# Defaults to contextmatrix_url when unset. Override when the runner runs on the
+# host but containers need a different address (e.g. host.docker.internal).
+# Env: CMR_CONTAINER_CONTEXTMATRIX_URL
+# container_contextmatrix_url: "http://host.docker.internal:8080"
 
 # Shared HMAC-SHA256 secret for webhook signing (both directions).
 # Must be at least 32 characters. Must match runner.api_key in ContextMatrix.
@@ -65,17 +72,6 @@ base_image: "contextmatrix/worker@sha256:000000000000000000000000000000000000000
 # Every entry MUST be @sha256:... pinned for the same reason as base_image.
 # No env var override (list type).
 allowed_images: []
-
-# Allowlist of permitted MCP hosts (exact-host, case-insensitive) used by the
-# webhook payload validator (see CTXRUN-039). Every /trigger request's mcp_url
-# must parse as https:// and its host must appear in this list. An empty list
-# fail-closes: every mcp_url is rejected. Set this to the hostname(s) of your
-# ContextMatrix instance(s). No env var override (list type).
-# Example:
-#   allowed_mcp_hosts:
-#     - cm.example.com
-#     - cm-staging.example.com
-allowed_mcp_hosts: []
 
 # When to pull the container image: always, never, if-not-present.
 # Use "never" or "if-not-present" for locally-built images.

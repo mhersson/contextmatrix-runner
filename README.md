@@ -216,6 +216,12 @@ port: 9090
 # Env: CMR_CONTEXTMATRIX_URL
 contextmatrix_url: "http://localhost:8080"
 
+# URL that spawned containers use to reach ContextMatrix. Injected as CM_MCP_URL.
+# Defaults to contextmatrix_url when unset. Override when containers need a
+# different address (e.g. host.docker.internal).
+# Env: CMR_CONTAINER_CONTEXTMATRIX_URL
+# container_contextmatrix_url: "http://host.docker.internal:8080"
+
 # Shared HMAC-SHA256 secret. Must match runner.api_key in ContextMatrix config.
 # At least 32 characters.
 # Env: CMR_API_KEY
@@ -316,22 +322,17 @@ pre-feature behaviour.
    logs on startup:
    `level=WARN msg="dev profile: accepting unpinned image reference" field=base_image image=...`
 
-2. **Empty `allowed_mcp_hosts` is allow-any** — instead of fail-closing every
-   `/trigger`, any well-formed `https://` MCP host is accepted. The first
-   request for each unique host logs:
-   `level=INFO msg="dev profile: mcp host seen" host=...`
-
-3. **Wider HMAC replay window** — `webhook_replay_skew_seconds` defaults to
+2. **Wider HMAC replay window** — `webhook_replay_skew_seconds` defaults to
    86400 (24 h) instead of 330 s, so a laptop that slept still processes
    webhooks. `image_pull_policy` defaults to `if-not-present` instead of
    `never`. Applied defaults are listed at startup:
    `level=INFO msg="dev profile: applied defaults" defaults=[webhook_replay_skew_seconds=86400 image_pull_policy=if-not-present]`
 
-4. **Configurable HMAC skew** — the skew from `webhook_replay_skew_seconds` is
+3. **Configurable HMAC skew** — the skew from `webhook_replay_skew_seconds` is
    now threaded into HMAC verification (previously hardcoded to 5 min), so the
    wider dev-mode window actually takes effect.
 
-5. **`secrets_dir` env-var fallback** — if the runner cannot write to
+4. **`secrets_dir` env-var fallback** — if the runner cannot write to
    `secrets_dir` (e.g. a `systemctl --user` service on a read-only `/var/run`),
    it falls back to delivering secrets as container env vars instead of a bind
    mount, with a WARN:
@@ -372,7 +373,6 @@ runner:
   enabled: true
   url: "http://localhost:9090" # Runner's address
   api_key: "same-shared-secret-as-runner" # Must match runner's api_key
-  public_url: "http://your-host:8080" # URL containers use to reach CM
 ```
 
 Per-project overrides in `.board.yaml`:
@@ -466,11 +466,11 @@ non-zero exit), `completed` (clean exit).
 | `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                     |
 | `project`      | string | yes      | Project name                                                                             |
 | `repo_url`     | string | yes      | Repository URL. HTTPS and SCP-style SSH (`git@github.com:org/repo`) are both supported. |
-| `mcp_url`      | string | yes      | ContextMatrix MCP endpoint URL                                                           |
 | `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                      |
 | `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted. |
 | `runner_image`  | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.          |
 | `interactive`   | bool   | no       | When `true`, runs Claude in stream-json HITL mode and attaches to container stdin. Use `/message` and `/promote` to interact. |
+| `model`         | string | no       | Model ID for the orchestrator (e.g. `claude-sonnet-4-6`). Passed through to the container environment.                        |
 
 ## API Endpoints
 
@@ -607,8 +607,8 @@ Every container is launched with the following restrictions:
 
 - The runner automatically adds a `host.docker.internal` mapping to all
   containers, so this hostname works on both Docker Desktop and Linux
-- Verify `runner.public_url` in ContextMatrix config uses `host.docker.internal`
-  or the host's LAN IP — not `localhost`
+- Verify `container_contextmatrix_url` in the runner config uses
+  `host.docker.internal` or the host's LAN IP — not `localhost`
 - If it still fails, check Docker networking and firewall rules
 
 ### Files in workspace owned by wrong user after container exits

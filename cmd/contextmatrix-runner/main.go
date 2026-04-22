@@ -196,7 +196,7 @@ func main() {
 
 	// Webhook handler.
 	webhookSkew := time.Duration(cfg.WebhookReplaySkewSeconds) * time.Second
-	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, cfg.AllowedMCPHosts, logger, webhookSkew, health, cfg.IsDev()).WithMetrics(mx)
+	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, cfg.ContainerContextMatrixURL+"/mcp", logger, webhookSkew, health).WithMetrics(mx)
 
 	// Signature-replay and /message idempotency caches. Both run
 	// eviction goroutines tied to the main process context so they

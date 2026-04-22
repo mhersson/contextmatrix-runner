@@ -131,7 +131,7 @@ func TestShutdown_WedgedContainer(t *testing.T) {
 	// before the nil manager is touched.
 	apiKey := strings.Repeat("k", 40)
 
-	wh := webhook.NewHandler(nil, trk, nil, nil, apiKey, 1, nil, nil, 0, health, false)
+	wh := webhook.NewHandler(nil, trk, nil, nil, apiKey, 1, "", nil, 0, health)
 
 	mux := http.NewServeMux()
 	wh.Register(mux)
@@ -219,7 +219,6 @@ func TestShutdown_WedgedContainer(t *testing.T) {
 		"card_id":  "PROJ-100",
 		"project":  "test-project",
 		"repo_url": "https://github.com/org/repo.git",
-		"mcp_url":  "https://cm.example.com/mcp",
 	}
 
 	body, _ := json.Marshal(payload)

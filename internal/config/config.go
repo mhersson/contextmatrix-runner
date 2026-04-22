@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -40,26 +41,26 @@ type UnpinnedImageRef struct {
 
 // Config holds all runner configuration.
 type Config struct {
-	Port                 int       `yaml:"port"`
-	AdminPort            int       `yaml:"admin_port"`
-	ContextMatrixURL     string    `yaml:"contextmatrix_url"`
-	APIKey               string    `yaml:"api_key"`
-	BaseImage            string    `yaml:"base_image"`
-	AllowedImages        []string  `yaml:"allowed_images"`
-	AllowedMCPHosts      []string  `yaml:"allowed_mcp_hosts"`
-	ImagePullPolicy      string    `yaml:"image_pull_policy"`
-	MaxConcurrent        int       `yaml:"max_concurrent"`
-	ContainerTimeout     string    `yaml:"container_timeout"`
-	ContainerMemoryLimit int64     `yaml:"container_memory_limit"`
-	ContainerPidsLimit   int64     `yaml:"container_pids_limit"`
-	ClaudeAuthDir        string    `yaml:"claude_auth_dir"`
-	ClaudeOAuthToken     string    `yaml:"claude_oauth_token"`
-	AnthropicAPIKey      string    `yaml:"anthropic_api_key"`
-	ClaudeSettings       string    `yaml:"claude_settings"`
-	GitHubApp            GitHubApp `yaml:"github_app"`
-	GitHubPAT            GitHubPAT `yaml:"github_pat"`
-	LogLevel             string    `yaml:"log_level"`
-	LogFormat            string    `yaml:"log_format"`
+	Port                      int       `yaml:"port"`
+	AdminPort                 int       `yaml:"admin_port"`
+	ContextMatrixURL          string    `yaml:"contextmatrix_url"`
+	ContainerContextMatrixURL string    `yaml:"container_contextmatrix_url"`
+	APIKey                    string    `yaml:"api_key"`
+	BaseImage                 string    `yaml:"base_image"`
+	AllowedImages             []string  `yaml:"allowed_images"`
+	ImagePullPolicy           string    `yaml:"image_pull_policy"`
+	MaxConcurrent             int       `yaml:"max_concurrent"`
+	ContainerTimeout          string    `yaml:"container_timeout"`
+	ContainerMemoryLimit      int64     `yaml:"container_memory_limit"`
+	ContainerPidsLimit        int64     `yaml:"container_pids_limit"`
+	ClaudeAuthDir             string    `yaml:"claude_auth_dir"`
+	ClaudeOAuthToken          string    `yaml:"claude_oauth_token"`
+	AnthropicAPIKey           string    `yaml:"anthropic_api_key"`
+	ClaudeSettings            string    `yaml:"claude_settings"`
+	GitHubApp                 GitHubApp `yaml:"github_app"`
+	GitHubPAT                 GitHubPAT `yaml:"github_pat"`
+	LogLevel                  string    `yaml:"log_level"`
+	LogFormat                 string    `yaml:"log_format"`
 	// SecretsDir is the host directory where per-container secrets files
 	// are written. Each file is bind-mounted read-only into its container
 	// at /run/cm-secrets/env so the values never appear in HostConfig.Env
@@ -225,10 +226,40 @@ func (c *Config) LogLevelSlog() slog.Level {
 // Dev mode loosens certain validators for local single-box setups.
 func (c *Config) IsDev() bool { return c.DeploymentProfile == ProfileDev }
 
+func validateServiceURL(field, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("%s: invalid URL: %w", field, err)
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("%s: scheme must be http or https", field)
+	}
+
+	if u.Hostname() == "" {
+		return fmt.Errorf("%s: host is required", field)
+	}
+
+	return nil
+}
+
 // Validate checks that all required fields are present and valid.
 func (c *Config) Validate() error {
 	if c.ContextMatrixURL == "" {
 		return fmt.Errorf("contextmatrix_url is required")
+	}
+
+	if c.ContainerContextMatrixURL == "" {
+		c.ContainerContextMatrixURL = c.ContextMatrixURL
+	}
+
+	if err := validateServiceURL("contextmatrix_url", c.ContextMatrixURL); err != nil {
+		return err
+	}
+
+	if err := validateServiceURL("container_contextmatrix_url", c.ContainerContextMatrixURL); err != nil {
+		return err
 	}
 
 	if c.APIKey == "" {
@@ -452,6 +483,10 @@ func applyEnvOverrides(cfg *Config) {
 
 	if v := os.Getenv("CMR_CONTEXTMATRIX_URL"); v != "" {
 		cfg.ContextMatrixURL = v
+	}
+
+	if v := os.Getenv("CMR_CONTAINER_CONTEXTMATRIX_URL"); v != "" {
+		cfg.ContainerContextMatrixURL = v
 	}
 
 	if v := os.Getenv("CMR_API_KEY"); v != "" {
