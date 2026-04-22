@@ -217,6 +217,13 @@ func TestValidateMCPURL(t *testing.T) {
 		{"dev+empty allowlist accepts valid url", "https://example.com/mcp", nil, true, false},
 		{"dev+empty allowlist accepts valid url (slice)", "https://example.com/mcp", []string{}, true, false},
 
+		// dev mode: http scheme is accepted
+		{"dev+http scheme accepted", "http://localhost:8080/mcp", nil, true, false},
+		{"dev+http scheme accepted with allowlist", "http://cm.example.com/mcp", allowlist, true, false},
+
+		// production: http scheme still rejected
+		{"prod+http rejected with allowlist", "http://cm.example.com/mcp", allowlist, false, true},
+
 		// dev mode: non-empty allowlist still enforces membership
 		{"dev+nonempty allowlist rejects unknown host", "https://evil.example.com/mcp", allowlist, true, true},
 		{"dev+nonempty allowlist accepts known host", "https://cm.example.com/mcp", allowlist, true, false},

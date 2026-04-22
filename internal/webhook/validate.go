@@ -127,8 +127,9 @@ func validateRepoURL(v string) error {
 	return nil
 }
 
-// validateMCPURL parses the mcp_url and enforces https scheme, non-empty host,
-// absence of control bytes, and exact-host membership in the allowlist.
+// validateMCPURL parses the mcp_url and enforces https scheme (http also
+// accepted in dev mode), non-empty host, absence of control bytes, and
+// exact-host membership in the allowlist.
 // An empty allowlist is fail-closed in production — every mcp_url is rejected.
 // In dev mode (devMode==true) an empty allowlist is relaxed to allow any host,
 // so local / ephemeral MCP endpoints can be used without configuring a fixed
@@ -148,7 +149,8 @@ func validateMCPURL(v string, allowedHosts []string, devMode bool) error {
 		return &ValidationError{Field: "mcp_url", Reason: "unparseable"}
 	}
 
-	if strings.ToLower(u.Scheme) != "https" {
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "https" && (!devMode || scheme != "http") {
 		return &ValidationError{Field: "mcp_url", Reason: "scheme must be https"}
 	}
 
