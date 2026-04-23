@@ -63,9 +63,18 @@ type DockerClient interface {
 }
 
 // DockerContainer is a simplified container info struct used by ContainerList.
+//
+// State / Created / Names are populated by RealDockerClient.ContainerList and
+// consumed by the /containers webhook endpoint so CM's reconcile sweep can
+// cross-reference live Docker state against the card store without relying on
+// the runner's in-memory tracker (which can diverge from Docker on a cleanup
+// failure — the exact class of bug the Docker-authoritative sweep fixes).
 type DockerContainer struct {
-	ID     string
-	Labels map[string]string
+	ID      string
+	Names   []string
+	State   string
+	Created int64 // Unix seconds; matches the Docker SDK's types.Container.Created
+	Labels  map[string]string
 }
 
 // RealDockerClient wraps the Docker SDK client.
@@ -138,7 +147,13 @@ func (c *RealDockerClient) ContainerList(ctx context.Context, options container.
 
 	result := make([]DockerContainer, len(containers))
 	for i, ctr := range containers {
-		result[i] = DockerContainer{ID: ctr.ID, Labels: ctr.Labels}
+		result[i] = DockerContainer{
+			ID:      ctr.ID,
+			Names:   ctr.Names,
+			State:   ctr.State,
+			Created: ctr.Created,
+			Labels:  ctr.Labels,
+		}
 	}
 
 	return result, nil

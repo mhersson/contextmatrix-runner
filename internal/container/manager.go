@@ -1281,6 +1281,139 @@ func (m *Manager) Kill(project, cardID string) error {
 	return nil
 }
 
+// ManagedContainer describes a Docker container labeled as runner-managed. It
+// is the ground-truth unit consumed by CM's reconcile sweep: a container is
+// listed here iff docker ps says so, regardless of whether the runner's
+// in-memory tracker still knows about it. That divergence is the failure mode
+// the Docker-authoritative sweep is designed to catch.
+type ManagedContainer struct {
+	ContainerID   string
+	ContainerName string
+	CardID        string
+	Project       string
+	State         string
+	StartedAt     time.Time
+	Tracked       bool
+}
+
+// ListManaged returns every Docker container labeled LabelRunner=true,
+// regardless of running/exited state. Tracked reflects whether the in-memory
+// tracker currently has a matching entry; consumers can use the field to
+// detect tracker/Docker divergence without needing a second round-trip.
+//
+// Containers missing the card_id or project label are skipped — they are
+// neither reachable via /kill (which routes by labels) nor the sweep's
+// responsibility (the sweep correlates against CM cards, not arbitrary
+// docker containers). Such containers still exist in Docker and are caught
+// by CleanupOrphans on the next maintenance tick.
+func (m *Manager) ListManaged(ctx context.Context) ([]ManagedContainer, error) {
+	containers, err := m.docker.ContainerList(ctx, container.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", LabelRunner+"=true")),
+		All:     true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list managed containers: %w", err)
+	}
+
+	result := make([]ManagedContainer, 0, len(containers))
+
+	for _, ctr := range containers {
+		project := ctr.Labels[LabelProject]
+		cardID := ctr.Labels[LabelCardID]
+
+		if project == "" || cardID == "" {
+			continue
+		}
+
+		name := ""
+		if len(ctr.Names) > 0 {
+			// Docker prefixes container names with "/"; strip it so the
+			// wire shape matches what `docker ps` prints.
+			name = strings.TrimPrefix(ctr.Names[0], "/")
+		}
+
+		result = append(result, ManagedContainer{
+			ContainerID:   ctr.ID,
+			ContainerName: name,
+			CardID:        cardID,
+			Project:       project,
+			State:         ctr.State,
+			StartedAt:     time.Unix(ctr.Created, 0).UTC(),
+			Tracked:       m.tracker != nil && m.tracker.Has(project, cardID),
+		})
+	}
+
+	return result, nil
+}
+
+// ForceRemoveByLabels is the /kill fallback path: when the tracker has no
+// entry for (project, cardID) but Docker still holds a labeled container, we
+// bypass the tracker-driven cancel flow entirely and go straight to
+// docker rm -f. The only sane way to get here is tracker/Docker divergence
+// (a prior cleanup returned early with a logged warning before removal
+// succeeded) — in which case every additional layer that "properly" cancels
+// the missing tracker entry is a no-op, and the container leaks to the 2h
+// container_timeout unless we reach past them.
+//
+// Returns the number of containers removed. An error from any single removal
+// is joined into the final error but does not stop the sweep over the rest
+// of the matches — removing as many as possible still beats leaving them all
+// running.
+func (m *Manager) ForceRemoveByLabels(ctx context.Context, project, cardID string) (int, error) {
+	if project == "" || cardID == "" {
+		return 0, fmt.Errorf("force-remove: project and card_id are both required")
+	}
+
+	args := filters.NewArgs()
+	args.Add("label", LabelRunner+"=true")
+	args.Add("label", LabelProject+"="+project)
+	args.Add("label", LabelCardID+"="+cardID)
+
+	containers, err := m.docker.ContainerList(ctx, container.ListOptions{
+		Filters: args,
+		All:     true,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list containers by label: %w", err)
+	}
+
+	removed := 0
+
+	var errs []error
+
+	for _, ctr := range containers {
+		idShort := truncateID(ctr.ID)
+
+		m.logger.Info("force-removing container by label",
+			"container_id", idShort,
+			"card_id", cardID,
+			"project", project,
+		)
+
+		rmCtx, cancel := withDockerCleanupTimeout(ctx)
+		if err := m.docker.ContainerRemove(rmCtx, ctr.ID, container.RemoveOptions{Force: true}); err != nil {
+			m.logger.Warn("force-remove by label failed",
+				"container_id", idShort,
+				"card_id", cardID,
+				"project", project,
+				"error", err,
+			)
+
+			errs = append(errs, fmt.Errorf("remove %s: %w", idShort, err))
+
+			cancel()
+
+			continue
+		}
+
+		cancel()
+
+		removed++
+	}
+
+	return removed, errors.Join(errs...)
+}
+
 // CleanupOrphans removes any leftover containers from a previous runner crash.
 // A container is "orphan" iff it is labeled LabelRunner=true in Docker AND
 // has no corresponding entry in the in-memory tracker — i.e. the current

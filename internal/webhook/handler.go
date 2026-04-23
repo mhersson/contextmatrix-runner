@@ -37,6 +37,8 @@ type bodyKey struct{}
 type ContainerRunner interface {
 	Run(ctx context.Context, payload container.RunConfig)
 	Kill(project, cardID string) error
+	ListManaged(ctx context.Context) ([]container.ManagedContainer, error)
+	ForceRemoveByLabels(ctx context.Context, project, cardID string) (int, error)
 }
 
 // Handler processes incoming webhooks from ContextMatrix.
@@ -168,6 +170,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.Handle("POST /promote", wrap(h.handlePromote, true))
 	mux.Handle("POST /end-session", wrap(h.handleEndSession, true))
 	mux.Handle("GET /logs", wrap(h.handleLogs, true))
+	mux.Handle("GET /containers", wrap(h.handleListContainers, true))
 	mux.Handle("GET /health", wrap(h.handleHealth, false))
 	// /readyz is deliberately unauthenticated: it is a readiness probe
 	// consumed by orchestrators / load balancers, not by CM. It returns
@@ -292,12 +295,36 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /kill is idempotent: a Kill call on a container that is already stopped
-	// (or never existed) is a no-op. M8-era callers fingerprinted the
-	// "not found" reason on a 404; we now return 200 with a stable message
-	// so CM can retry cleanly and distinguish success from error on status
-	// alone.
+	// /kill is idempotent. Three cases:
+	//
+	//  1. Tracker has the entry → normal cancel path (manager.Kill).
+	//  2. Tracker is empty but Docker still has a labeled container for
+	//     (project, card_id) → tracker/Docker divergence. Go past the
+	//     tracker with ForceRemoveByLabels; returning 200 no-op here would
+	//     leak the container to container_timeout (2h). This is the class
+	//     of leak the Docker-authoritative cleanup is designed to fix.
+	//  3. Tracker empty AND no matching Docker container → actual no-op.
 	if !h.tracker.Has(payload.Project, payload.CardID) {
+		removed, err := h.manager.ForceRemoveByLabels(r.Context(), payload.Project, payload.CardID)
+		if err != nil {
+			// Errors here are per-container removal failures collected via
+			// errors.Join; log and still surface 500 so CM sees the failure
+			// and the next sweep can retry.
+			h.logWarn("kill: force-remove by labels failed",
+				"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
+			writeError(w, http.StatusInternalServerError, CodeInternal, "kill failed")
+
+			return
+		}
+
+		if removed > 0 {
+			h.logInfo("kill: force-removed untracked container(s)",
+				"card_id", payload.CardID, "project", payload.Project, "removed", removed)
+			writeSuccess(w, http.StatusOK, "force-removed")
+
+			return
+		}
+
 		h.logDebug("kill: container not tracked (idempotent no-op)",
 			"card_id", payload.CardID, "project", payload.Project)
 		writeSuccess(w, http.StatusOK, "no-op (already stopped)")
@@ -314,6 +341,37 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeSuccess(w, http.StatusOK, "container killed")
+}
+
+// handleListContainers returns every Docker container labeled as
+// runner-managed, regardless of running/exited state. The response is CM's
+// ground truth for "what containers exist on this runner" — the reconcile
+// sweep correlates each entry against CM's card store and kills anything
+// whose card should not be running. Authoritative from Docker, not from the
+// in-memory tracker, so tracker/Docker divergence is visible.
+func (h *Handler) handleListContainers(w http.ResponseWriter, r *http.Request) {
+	containers, err := h.manager.ListManaged(r.Context())
+	if err != nil {
+		h.logWarn("list-containers: ListManaged failed", "error", err.Error())
+		writeError(w, http.StatusBadGateway, CodeUpstreamFailure, "docker list failed")
+
+		return
+	}
+
+	items := make([]ContainerListItem, 0, len(containers))
+	for _, c := range containers {
+		items = append(items, ContainerListItem{
+			ContainerID:   c.ContainerID,
+			ContainerName: c.ContainerName,
+			CardID:        c.CardID,
+			Project:       c.Project,
+			State:         c.State,
+			StartedAt:     c.StartedAt.UTC().Format(time.RFC3339),
+			Tracked:       c.Tracked,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, ListContainersResponse{OK: true, Containers: items})
 }
 
 func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
@@ -998,6 +1056,18 @@ func (h *Handler) logWarn(msg string, args ...any) {
 	}
 
 	slog.Warn(msg, args...) //nolint:gosec // msg is always a literal at call sites
+}
+
+// logInfo emits an Info log via h.logger, falling back to slog.Default when
+// no logger was injected. See logDebug for the taint discussion.
+func (h *Handler) logInfo(msg string, args ...any) {
+	if h.logger != nil {
+		h.logger.Info(msg, args...)
+
+		return
+	}
+
+	slog.Info(msg, args...) //nolint:gosec // msg is always a literal at call sites
 }
 
 // logVerifyAutonomousFailure emits a Warn log with the short (body-free)

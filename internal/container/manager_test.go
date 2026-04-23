@@ -3184,3 +3184,159 @@ func TestWaitAndCleanup_LogDone_HangingReader_StillRemovesContainer(t *testing.T
 	// Tracker entry must be gone.
 	assert.False(t, tr.Has(payload.Project, payload.CardID), "tracker entry must be removed after Kill")
 }
+
+// TestListManaged_ReportsTrackerDivergence is the core guarantee CM's
+// Docker-authoritative sweep relies on: for any container labeled as
+// runner-managed, ListManaged returns a row whose Tracked flag reflects the
+// tracker state at response time. A running container absent from the tracker
+// (Tracked=false, State="running") is the signature of the divergence bug the
+// sweep is designed to catch.
+func TestListManaged_ReportsTrackerDivergence(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, opts container.ListOptions) ([]DockerContainer, error) {
+		// The handler is expected to pass the LabelRunner=true filter and All=true.
+		assert.True(t, opts.All, "ListManaged must list all containers, including exited ones")
+		assert.True(t, opts.Filters.Match("label", LabelRunner+"=true"),
+			"ListManaged must filter on the runner-managed label")
+
+		return []DockerContainer{
+			{
+				ID:      "tracked-abc",
+				Names:   []string{"/cmr-proj-a-001"},
+				State:   "running",
+				Created: time.Now().Add(-10 * time.Minute).Unix(),
+				Labels: map[string]string{
+					LabelRunner:  "true",
+					LabelProject: "proj",
+					LabelCardID:  "A-001",
+				},
+			},
+			{
+				ID:      "orphan-def",
+				Names:   []string{"/cmr-proj-a-002"},
+				State:   "running",
+				Created: time.Now().Add(-30 * time.Minute).Unix(),
+				Labels: map[string]string{
+					LabelRunner:  "true",
+					LabelProject: "proj",
+					LabelCardID:  "A-002",
+				},
+			},
+			{
+				// Missing card_id label — must be skipped.
+				ID:      "mislabeled-ghi",
+				Labels:  map[string]string{LabelRunner: "true", LabelProject: "proj"},
+				State:   "running",
+				Created: time.Now().Unix(),
+			},
+		}, nil
+	}
+
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		Project: "proj", CardID: "A-001", ContainerID: "tracked-abc",
+	}))
+
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	got, err := mgr.ListManaged(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 2, "mislabeled container must be skipped; the other two must be listed")
+
+	byCard := make(map[string]ManagedContainer, len(got))
+	for _, c := range got {
+		byCard[c.CardID] = c
+	}
+
+	require.Contains(t, byCard, "A-001")
+	assert.True(t, byCard["A-001"].Tracked, "tracked container must report Tracked=true")
+	assert.Equal(t, "cmr-proj-a-001", byCard["A-001"].ContainerName, "Docker's leading / on Names must be stripped")
+
+	require.Contains(t, byCard, "A-002")
+	assert.False(t, byCard["A-002"].Tracked, "untracked container (the divergence case) must report Tracked=false")
+	assert.Equal(t, "running", byCard["A-002"].State)
+}
+
+// TestListManaged_DockerError surfaces the underlying Docker error so the
+// webhook handler can translate it into a 502, telling CM "I couldn't ask
+// Docker" instead of "I have nothing to report".
+func TestListManaged_DockerError(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return nil, fmt.Errorf("docker unreachable")
+	}
+
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+
+	_, err := mgr.ListManaged(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list managed containers")
+}
+
+// TestForceRemoveByLabels_RemovesEveryMatch is the guarantee the /kill
+// fallback relies on: when the tracker has no entry but Docker still holds a
+// labeled container, ForceRemoveByLabels force-removes it without going
+// through the tracker-driven cancel flow. Without this, the container would
+// leak to the runner's 2h container_timeout — the exact fail mode the
+// Docker-authoritative kill path is closing.
+func TestForceRemoveByLabels_RemovesEveryMatch(t *testing.T) {
+	var removed []string
+
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, opts container.ListOptions) ([]DockerContainer, error) {
+		assert.True(t, opts.All, "force-remove-by-labels must consider non-running containers too")
+		// Verify all three label filters are applied so we never scoop up
+		// a container belonging to a different project / card.
+		assert.True(t, opts.Filters.Match("label", LabelRunner+"=true"))
+		assert.True(t, opts.Filters.Match("label", LabelProject+"=proj"))
+		assert.True(t, opts.Filters.Match("label", LabelCardID+"=A-001"))
+
+		return []DockerContainer{
+			{ID: "abc-123", Labels: map[string]string{LabelCardID: "A-001", LabelProject: "proj"}},
+		}, nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, opts container.RemoveOptions) error {
+		assert.True(t, opts.Force, "force-remove must use Force: true")
+
+		removed = append(removed, id)
+
+		return nil
+	}
+
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+
+	n, err := mgr.ForceRemoveByLabels(context.Background(), "proj", "A-001")
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, []string{"abc-123"}, removed)
+}
+
+// TestForceRemoveByLabels_NoMatchReturnsZero is the idempotent path consumed
+// by /kill: when neither tracker nor Docker knows the card, the handler
+// returns 200 no-op.
+func TestForceRemoveByLabels_NoMatchReturnsZero(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return nil, nil
+	}
+
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+
+	n, err := mgr.ForceRemoveByLabels(context.Background(), "proj", "A-001")
+	require.NoError(t, err)
+	assert.Zero(t, n)
+}
+
+// TestForceRemoveByLabels_RequiresProjectAndCard guards against an empty
+// call that would otherwise list every runner-managed container and remove
+// them all — which would happen if the label filter were silently ignored
+// by Docker when the value is empty.
+func TestForceRemoveByLabels_RequiresProjectAndCard(t *testing.T) {
+	mgr := NewManager(nil, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+
+	_, err := mgr.ForceRemoveByLabels(context.Background(), "", "A-001")
+	require.Error(t, err)
+
+	_, err = mgr.ForceRemoveByLabels(context.Background(), "proj", "")
+	require.Error(t, err)
+}

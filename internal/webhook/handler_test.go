@@ -275,12 +275,14 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 }
 
 // TestHandleKill_IdempotentWhenAlreadyStopped verifies that /kill on a card
-// with no tracked container returns 200 OK (CTXRUN-056 / C8). The old
-// behaviour was 404, which made retry logic in CM harder (a legitimate
-// not-yet-started tracker miss was indistinguishable from a hard failure).
+// with no tracked container and no matching labeled Docker container returns
+// 200 OK (CTXRUN-056 / C8). The old behaviour was 404, which made retry logic
+// in CM harder (a legitimate not-yet-started tracker miss was indistinguishable
+// from a hard failure). ForceRemoveByLabels returns 0 for this case so the
+// handler falls through to the no-op branch.
 func TestHandleKill_IdempotentWhenAlreadyStopped(t *testing.T) {
-	tr := tracker.New()
-	h := NewHandler(testManager(tr), tr, nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	fake := &reconcileFakeRunner{forceRet: 0}
+	h := NewHandler(fake, tracker.New(), nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
 
 	w := httptest.NewRecorder()
 	req := signedRequest(t, "/kill", KillPayload{
@@ -295,6 +297,169 @@ func TestHandleKill_IdempotentWhenAlreadyStopped(t *testing.T) {
 
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.True(t, resp.OK)
+	assert.Contains(t, resp.Message, "no-op")
+}
+
+// reconcileFakeRunner is a ContainerRunner double that records
+// ForceRemoveByLabels calls and returns a configurable ListManaged response.
+// Used by the /containers and /kill-fallback tests where neither Run nor Kill
+// should fire.
+type reconcileFakeRunner struct {
+	mu sync.Mutex
+
+	listed    []container.ManagedContainer
+	listErr   error
+	forceCh   chan struct{ project, cardID string }
+	forceRet  int
+	forceErr  error
+	forceCard string
+}
+
+func (f *reconcileFakeRunner) Run(_ context.Context, _ container.RunConfig) {
+	panic("reconcileFakeRunner.Run must not be called")
+}
+
+func (f *reconcileFakeRunner) Kill(_, _ string) error {
+	panic("reconcileFakeRunner.Kill must not be called")
+}
+
+func (f *reconcileFakeRunner) ListManaged(_ context.Context) ([]container.ManagedContainer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+
+	out := make([]container.ManagedContainer, len(f.listed))
+	copy(out, f.listed)
+
+	return out, nil
+}
+
+func (f *reconcileFakeRunner) ForceRemoveByLabels(_ context.Context, project, cardID string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.forceCard = project + "/" + cardID
+
+	if f.forceCh != nil {
+		f.forceCh <- struct{ project, cardID string }{project, cardID}
+	}
+
+	return f.forceRet, f.forceErr
+}
+
+// TestHandleListContainers_ReturnsDockerAuthoritativeList confirms that the
+// endpoint surfaces every ManagedContainer returned by the manager, including
+// the tracked/untracked split. The tracker state is reflected on each entry so
+// CM's sweep can see tracker/Docker divergence in a single round-trip.
+func TestHandleListContainers_ReturnsDockerAuthoritativeList(t *testing.T) {
+	tr := tracker.New()
+
+	started := time.Now().Add(-45 * time.Minute).UTC().Truncate(time.Second)
+	fake := &reconcileFakeRunner{
+		listed: []container.ManagedContainer{
+			{
+				ContainerID:   "abc123",
+				ContainerName: "cmr-contextmatrix-ctxmax-436",
+				CardID:        "ctxmax-436",
+				Project:       "contextmatrix",
+				State:         "running",
+				StartedAt:     started,
+				Tracked:       false,
+			},
+			{
+				ContainerID:   "def456",
+				ContainerName: "cmr-proj-alpha-001",
+				CardID:        "alpha-001",
+				Project:       "proj",
+				State:         "exited",
+				StartedAt:     started,
+				Tracked:       true,
+			},
+		},
+	}
+
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedGETRequest(t, "/containers")
+	h.hmacAuth(h.handleListContainers)(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp ListContainersResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+	require.Len(t, resp.Containers, 2)
+
+	assert.Equal(t, "ctxmax-436", resp.Containers[0].CardID)
+	assert.Equal(t, "contextmatrix", resp.Containers[0].Project)
+	assert.Equal(t, "running", resp.Containers[0].State)
+	assert.False(t, resp.Containers[0].Tracked)
+	assert.Equal(t, started.Format(time.RFC3339), resp.Containers[0].StartedAt)
+
+	assert.Equal(t, "alpha-001", resp.Containers[1].CardID)
+	assert.True(t, resp.Containers[1].Tracked)
+}
+
+// TestHandleListContainers_DockerError returns 502 so CM distinguishes a
+// runner misbehaving upstream from a legitimate empty list.
+func TestHandleListContainers_DockerError(t *testing.T) {
+	fake := &reconcileFakeRunner{listErr: fmt.Errorf("docker daemon unreachable")}
+	h := NewHandler(fake, tracker.New(), nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedGETRequest(t, "/containers")
+	h.hmacAuth(h.handleListContainers)(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+}
+
+// TestHandleKill_ForceRemoveFallbackOnTrackerMiss confirms the class of leak
+// fix: tracker has no entry for (project, card_id) but Docker still holds a
+// labeled container — the /kill handler must reach past the tracker via
+// ForceRemoveByLabels and return 200 with "force-removed" rather than the
+// old 200 "no-op" that let the container leak to the 2h timer.
+func TestHandleKill_ForceRemoveFallbackOnTrackerMiss(t *testing.T) {
+	fake := &reconcileFakeRunner{forceRet: 1}
+	h := NewHandler(fake, tracker.New(), nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/kill", KillPayload{
+		CardID:  "ctxmax-436",
+		Project: "contextmatrix",
+	})
+	h.hmacAuth(h.handleKill)(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp SuccessResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+	assert.Equal(t, "force-removed", resp.Message)
+	assert.Equal(t, "contextmatrix/ctxmax-436", fake.forceCard)
+}
+
+// TestHandleKill_NoOpWhenNeitherTrackerNorDockerHasContainer keeps the
+// idempotent branch: if neither the tracker nor Docker has the card, /kill
+// still returns 200 OK with a no-op message so CM's retry loop stays simple.
+func TestHandleKill_NoOpWhenNeitherTrackerNorDockerHasContainer(t *testing.T) {
+	fake := &reconcileFakeRunner{forceRet: 0}
+	h := NewHandler(fake, tracker.New(), nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/kill", KillPayload{
+		CardID:  "UNKNOWN-001",
+		Project: "proj",
+	})
+	h.hmacAuth(h.handleKill)(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp SuccessResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.Contains(t, resp.Message, "no-op")
 }
 
@@ -371,6 +536,14 @@ func (f *fakeRunner) Run(_ context.Context, cfg container.RunConfig) {
 }
 
 func (f *fakeRunner) Kill(_, _ string) error { return nil }
+
+func (f *fakeRunner) ListManaged(_ context.Context) ([]container.ManagedContainer, error) {
+	return nil, nil
+}
+
+func (f *fakeRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int, error) {
+	return 0, nil
+}
 
 // TestHandleTrigger_InteractivePropagated verifies that the Interactive field from the
 // JSON trigger body is correctly propagated into the RunConfig passed to the manager.
@@ -1566,6 +1739,14 @@ func (s *stopAllFakeRunner) Kill(project, cardID string) error {
 	s.killed = append(s.killed, project+"/"+cardID)
 
 	return nil
+}
+
+func (s *stopAllFakeRunner) ListManaged(_ context.Context) ([]container.ManagedContainer, error) {
+	return nil, nil
+}
+
+func (s *stopAllFakeRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int, error) {
+	return 0, nil
 }
 
 func (s *stopAllFakeRunner) killedIDs() []string {

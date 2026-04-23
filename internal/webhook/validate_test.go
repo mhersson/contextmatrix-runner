@@ -402,6 +402,18 @@ func (r *strictRunner) Kill(_, _ string) error {
 	return nil
 }
 
+func (r *strictRunner) ListManaged(_ context.Context) ([]container.ManagedContainer, error) {
+	r.t.Fatalf("manager.ListManaged must not be called on invalid payload")
+
+	return nil, nil
+}
+
+func (r *strictRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int, error) {
+	r.t.Fatalf("manager.ForceRemoveByLabels must not be called on invalid payload")
+
+	return 0, nil
+}
+
 func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	tr := tracker.New()
 	// maxConcurrent=3 so concurrency limit never fires; tracker must remain empty.

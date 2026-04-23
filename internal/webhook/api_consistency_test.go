@@ -541,3 +541,10 @@ type noopRunner struct{}
 
 func (n *noopRunner) Run(_ context.Context, _ container.RunConfig) {}
 func (n *noopRunner) Kill(_, _ string) error                       { return nil }
+func (n *noopRunner) ListManaged(_ context.Context) ([]container.ManagedContainer, error) {
+	return nil, nil
+}
+
+func (n *noopRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int, error) {
+	return 0, nil
+}

@@ -77,6 +77,30 @@ type CardKillResult struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// ContainerListItem is one entry in a ListContainersResponse. StartedAt is an
+// RFC3339 timestamp derived from Docker's container Created field so CM can
+// age-cap runaway containers without a second round-trip. Tracked reflects the
+// runner's in-memory tracker state at response time; divergence (Tracked=false
+// while State="running") is how the sweep detects containers the tracker has
+// orphaned.
+type ContainerListItem struct {
+	ContainerID   string `json:"container_id"`
+	ContainerName string `json:"container_name,omitempty"`
+	CardID        string `json:"card_id"`
+	Project       string `json:"project"`
+	State         string `json:"state"`
+	StartedAt     string `json:"started_at"`
+	Tracked       bool   `json:"tracked"`
+}
+
+// ListContainersResponse is the body returned by GET /containers. OK is always
+// true on success (a Docker list error surfaces as a 502 ErrorResponse with
+// the upstream-failure code, not a partial success here).
+type ListContainersResponse struct {
+	OK         bool                `json:"ok"`
+	Containers []ContainerListItem `json:"containers"`
+}
+
 // StopAllResponse is the body returned by POST /stop-all. `OK` is true iff
 // every per-card Kill succeeded; on any failure the status code flips to 207
 // and `OK` is false so a single field tells the caller whether they need to
