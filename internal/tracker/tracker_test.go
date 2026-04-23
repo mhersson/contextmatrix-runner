@@ -585,6 +585,64 @@ type fakeWriteCloserSimple struct{}
 func (f *fakeWriteCloserSimple) Write(p []byte) (int, error) { return len(p), nil }
 func (f *fakeWriteCloserSimple) Close() error                { return nil }
 
+// TestRemove_BlockingStdinClose_DoesNotBlockReturn verifies that Remove returns
+// within stdinCloseTimeout even when stdin.Close() blocks indefinitely. This
+// guards against the HITL 2h leak hypothesis: a wedged hijacked socket in
+// Close would previously stall Remove and starve the removeSecretsFile /
+// removeContainer defers that follow it in waitAndCleanup.
+func TestRemove_BlockingStdinClose_DoesNotBlockReturn(t *testing.T) {
+	// Shrink the timeout so the test is fast.
+	origTimeout := stdinCloseTimeout
+	stdinCloseTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { stdinCloseTimeout = origTimeout })
+
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	// blockClose is held open until t.Cleanup releases it, simulating a
+	// wedged hijacked TCP connection that never returns from Close.
+	blockClose := make(chan struct{})
+
+	t.Cleanup(func() { close(blockClose) })
+
+	blocking := &blockingWriteCloser{block: blockClose}
+	tr.SetStdin("proj", "PROJ-001", blocking, nil)
+
+	// Remove must return within stdinCloseTimeout + generous buffer (500ms).
+	removeDone := make(chan struct{})
+
+	go func() {
+		defer close(removeDone)
+
+		tr.Remove("proj", "PROJ-001")
+	}()
+
+	deadline := stdinCloseTimeout + 500*time.Millisecond
+	select {
+	case <-removeDone:
+		// good — Remove returned within the deadline
+	case <-time.After(deadline):
+		t.Fatalf("Remove blocked for more than %v; stdinCloseTimeout watchdog did not fire", deadline)
+	}
+
+	// The tracker entry must be gone regardless of whether Close completed.
+	assert.False(t, tr.Has("proj", "PROJ-001"), "tracker entry must be removed even if stdin Close blocks")
+}
+
+// blockingWriteCloser is a WriteCloser whose Close blocks until the provided
+// channel is closed. Used to simulate a wedged hijacked TCP connection.
+type blockingWriteCloser struct {
+	block <-chan struct{}
+}
+
+func (b *blockingWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (b *blockingWriteCloser) Close() error {
+	<-b.block
+
+	return nil
+}
+
 // TestAddIfUnderLimit_Concurrent verifies that under concurrent callers racing
 // to reserve a slot against a tight limit, exactly `limit` goroutines succeed
 // and every other caller receives the limit-reached error. This exercises the

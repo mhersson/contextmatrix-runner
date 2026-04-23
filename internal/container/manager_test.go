@@ -2876,6 +2876,166 @@ func TestRun_RunningCallbackAsync(t *testing.T) {
 		"running callback must eventually fire on its own goroutine")
 }
 
+// slowCloseWriteCloser is a WriteCloser whose Close() blocks for a fixed
+// duration before returning. Used to simulate a hijacked stdin conn that takes
+// a little while to close — proving the cleanup path still runs end-to-end
+// without a hard wedge.
+type slowCloseWriteCloser struct {
+	delay time.Duration
+}
+
+func (s *slowCloseWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (s *slowCloseWriteCloser) Close() error {
+	<-time.After(s.delay)
+
+	return nil
+}
+
+// TestKill_InteractiveContainer_RemovesContainer verifies the end-to-end kill
+// path for an interactive container: Manager.Kill cancels the context, which
+// causes waitAndCleanup to take the ctx.Done() branch, which runs deferred
+// cleanup including tracker.Remove and ContainerRemove(Force:true).
+func TestKill_InteractiveContainer_RemovesContainer(t *testing.T) {
+	var (
+		removeCalledWith container.RemoveOptions
+		removeCalled     atomic.Bool
+	)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	// ContainerWait never resolves — the only exit is ctx.Done().
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		return make(chan container.WaitResponse), make(chan error)
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, opts container.RemoveOptions) error {
+		removeCalledWith = opts
+
+		removeCalled.Store(true)
+
+		return nil
+	}
+	mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+		return &HijackedResponse{Conn: nopWriteCloser{}}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	payload.CardID = "PROJ-911"
+	payload.Interactive = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // satisfies gosec G118; Kill triggers cancel via tracker.Cancel
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+
+	// Wait until the tracker entry has a container ID — confirms startContainer
+	// has returned and waitAndCleanup's defers are installed.
+	require.Eventually(t, func() bool {
+		snap, ok := tr.Snapshot(payload.Project, payload.CardID)
+
+		return ok && snap.ContainerID != ""
+	}, 5*time.Second, 10*time.Millisecond, "tracker must have container ID before Kill")
+
+	require.NoError(t, mgr.Kill(payload.Project, payload.CardID))
+	mgr.Wait()
+
+	// ContainerRemove must have been called with Force: true.
+	assert.True(t, removeCalled.Load(), "ContainerRemove must be invoked")
+	assert.True(t, removeCalledWith.Force, "ContainerRemove must use Force: true")
+
+	// Tracker entry must be gone.
+	assert.False(t, tr.Has(payload.Project, payload.CardID), "tracker entry must be removed after Kill")
+}
+
+// TestKill_InteractiveContainer_SlowStdinClose_StillRemoves is a companion to
+// TestKill_InteractiveContainer_RemovesContainer. It uses a WriteCloser whose
+// Close() blocks for 500ms — simulating a hijacked-conn that is slow but not
+// wedged — and asserts that cleanup still completes: ContainerRemove(Force:true)
+// is called and the tracker entry is gone.
+func TestKill_InteractiveContainer_SlowStdinClose_StillRemoves(t *testing.T) {
+	var (
+		removeCalledWith container.RemoveOptions
+		removeCalled     atomic.Bool
+	)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	// ContainerWait never resolves — the only exit is ctx.Done().
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		return make(chan container.WaitResponse), make(chan error)
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, opts container.RemoveOptions) error {
+		removeCalledWith = opts
+
+		removeCalled.Store(true)
+
+		return nil
+	}
+	// Attach returns a conn whose Close() blocks 500ms before returning.
+	mock.ContainerAttachFn = func(_ context.Context, _ string, _ container.AttachOptions) (*HijackedResponse, error) {
+		return &HijackedResponse{Conn: &slowCloseWriteCloser{delay: 500 * time.Millisecond}}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	payload.CardID = "PROJ-912"
+	payload.Interactive = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // satisfies gosec G118; Kill triggers cancel via tracker.Cancel
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+
+	// Wait until startContainer has set the container ID in the tracker.
+	require.Eventually(t, func() bool {
+		snap, ok := tr.Snapshot(payload.Project, payload.CardID)
+
+		return ok && snap.ContainerID != ""
+	}, 5*time.Second, 10*time.Millisecond, "tracker must have container ID before Kill")
+
+	require.NoError(t, mgr.Kill(payload.Project, payload.CardID))
+	mgr.Wait()
+
+	// Even with a 500ms stdin-close delay, removal must still happen.
+	assert.True(t, removeCalled.Load(), "ContainerRemove must be invoked despite slow stdin close")
+	assert.True(t, removeCalledWith.Force, "ContainerRemove must use Force: true")
+
+	// Tracker entry must be gone.
+	assert.False(t, tr.Has(payload.Project, payload.CardID), "tracker entry must be removed after Kill")
+}
+
 // TestDNSCache_PutGet exercises the cache primitives directly: a put/get
 // pair must hit, and an expired entry must miss.
 func TestDNSCache_PutGet(t *testing.T) {
@@ -2912,4 +3072,115 @@ func TestDNSCache_Capacity(t *testing.T) {
 
 	_, ok = c.get("c")
 	assert.True(t, ok)
+}
+
+// blockingReadCloser is an io.ReadCloser whose Read() blocks forever on a
+// never-closed channel and whose Close() is a no-op. Used to simulate a
+// container log stream that never unblocks (wedged docker daemon, stuck
+// hijacked socket, or stdcopy/scanner stall).
+type blockingReadCloser struct {
+	block chan struct{}
+}
+
+func newBlockingReadCloser() *blockingReadCloser {
+	return &blockingReadCloser{block: make(chan struct{})}
+}
+
+func (b *blockingReadCloser) Read(_ []byte) (int, error) {
+	<-b.block // blocks until the channel is closed; Close() never closes it
+
+	return 0, io.EOF
+}
+
+func (b *blockingReadCloser) Close() error { return nil }
+
+// TestWaitAndCleanup_LogDone_HangingReader_StillRemovesContainer verifies that
+// the cancel path of waitAndCleanup proceeds through cleanup even when the
+// log-streaming goroutine never unblocks. The root cause of the HITL container
+// leak: a wedged ContainerLogs reader stalls <-logDone indefinitely, preventing
+// the tracker.Remove and ContainerRemove defers from running.
+func TestWaitAndCleanup_LogDone_HangingReader_StillRemovesContainer(t *testing.T) {
+	// Shrink logDrainTimeout so the test runs in ~1s wall time instead of 5s.
+	orig := logDrainTimeout
+	logDrainTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { logDrainTimeout = orig })
+
+	var (
+		removeCalledWith container.RemoveOptions
+		removeCalled     atomic.Bool
+	)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+
+	// ContainerLogs returns a reader that blocks forever in Read() and whose
+	// Close() is a no-op — the log-streaming goroutine will never unblock.
+	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+		return newBlockingReadCloser(), nil
+	}
+
+	// ContainerWait never resolves — the only exit from waitAndCleanup is
+	// the <-ctx.Done() branch (triggered by Manager.Kill).
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		return make(chan container.WaitResponse), make(chan error)
+	}
+
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, opts container.RemoveOptions) error {
+		removeCalledWith = opts
+
+		removeCalled.Store(true)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	payload := testPayload()
+	payload.CardID = "PROJ-426"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // gosec G118; Kill triggers cancel via tracker.Cancel
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+
+	// Wait until startContainer has registered the container ID in the tracker
+	// so we know waitAndCleanup's defers are installed.
+	require.Eventually(t, func() bool {
+		snap, ok := tr.Snapshot(payload.Project, payload.CardID)
+
+		return ok && snap.ContainerID != ""
+	}, 5*time.Second, 10*time.Millisecond, "tracker must have container ID before Kill")
+
+	require.NoError(t, mgr.Kill(payload.Project, payload.CardID))
+
+	// Allow logDrainTimeout + dockerCleanupTimeout + 2s slack for the full
+	// cleanup sequence to complete despite the hung log reader.
+	deadline := logDrainTimeout + dockerCleanupTimeout + 2*time.Second
+
+	mgr.Wait()
+
+	// ContainerRemove must have been called with Force: true even though the
+	// log reader never unblocked.
+	require.Eventually(t, removeCalled.Load, deadline, 10*time.Millisecond, "ContainerRemove must be invoked despite hung log reader")
+
+	assert.True(t, removeCalledWith.Force, "ContainerRemove must use Force: true")
+
+	// Tracker entry must be gone.
+	assert.False(t, tr.Has(payload.Project, payload.CardID), "tracker entry must be removed after Kill")
 }

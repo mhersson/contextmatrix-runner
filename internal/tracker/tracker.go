@@ -6,9 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 )
+
+// stdinCloseTimeout is the maximum time Remove waits for a synchronous
+// stdin.Close + onClose to complete before backgrounding the work. Declared
+// as a var so tests can shrink it without a real 2-second wait.
+var stdinCloseTimeout = 2 * time.Second
 
 // ErrNoStdinAttached is returned by WriteStdin when the container is tracked
 // but has no interactive stdin handle attached (i.e. non-interactive mode).
@@ -329,18 +335,39 @@ func (t *Tracker) Remove(project, cardID string) {
 	t.mu.Unlock()
 
 	if ok && info.stdin != nil {
-		info.stdin.mu.Lock()
-		if info.stdin.stdin != nil {
-			_ = info.stdin.stdin.Close()
-			info.stdin.stdin = nil
-		}
+		// Close stdin and invoke onClose under a bounded watchdog. Both
+		// operations act on a hijacked TCP connection and can block if the
+		// socket is wedged. Running them in a goroutine and selecting on a
+		// timeout keeps Remove from starving the subsequent removeSecretsFile
+		// and removeContainer defers in waitAndCleanup (H21 ordering).
+		//
+		// Lock ordering holds: tracker.mu was released above; stdin.mu is
+		// acquired inside the goroutine with no other lock held.
+		done := make(chan struct{})
 
-		onClose := info.stdin.onClose
-		info.stdin.onClose = nil
-		info.stdin.mu.Unlock()
+		go func() {
+			defer close(done)
 
-		if onClose != nil {
-			onClose()
+			info.stdin.mu.Lock()
+			if info.stdin.stdin != nil {
+				_ = info.stdin.stdin.Close()
+				info.stdin.stdin = nil
+			}
+
+			onClose := info.stdin.onClose
+			info.stdin.onClose = nil
+			info.stdin.mu.Unlock()
+
+			if onClose != nil {
+				onClose()
+			}
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(stdinCloseTimeout):
+			slog.Warn("stdin close timed out in tracker.Remove; backgrounding",
+				"project", project, "card_id", cardID, "timeout", stdinCloseTimeout)
 		}
 	}
 }

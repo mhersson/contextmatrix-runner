@@ -93,6 +93,15 @@ var primingWriteTimeout = 5 * time.Second
 // per synthetic idle scenario.
 var idleWatchdogCheckInterval = 30 * time.Second
 
+// logDrainTimeout bounds the <-logDone wait on the cancel, timeout, and
+// error branches of waitAndCleanup. A hung log-streaming goroutine (wedged
+// docker daemon, stuck hijacked socket, or stdcopy/scanner stall) used to
+// stall those branches indefinitely, preventing the cleanup defers from
+// running and leaking the container until container_timeout (2h default).
+// Declared as a package var so tests can shrink it without waiting 5s of
+// wall time per synthetic-wedge scenario.
+var logDrainTimeout = 5 * time.Second
+
 // imagePruneMaxAge is the "until" filter passed to ImagesPrune so the
 // maintenance loop only reclaims images older than this. Keeping it at 24h
 // means freshly-pulled worker images are never a prune target mid-run.
@@ -776,7 +785,16 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, delive
 			m.killContainer(killCtx, containerID, log)
 			killCancel()
 
-			<-logDone
+			select {
+			case <-logDone:
+			case <-time.After(logDrainTimeout):
+				log.Warn("log drain timed out during cleanup",
+					"container_id", truncateID(containerID),
+					"card_id", payload.CardID,
+					"project", payload.Project,
+					"timeout", logDrainTimeout)
+			}
+
 			m.emitSystem(payload, "container failed: "+msg)
 
 			cbCtx, cbCancel := withCleanupTimeout(ctx)
@@ -793,7 +811,16 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, delive
 		m.killContainer(killCtx, containerID, log)
 		killCancel()
 
-		<-logDone
+		select {
+		case <-logDone:
+		case <-time.After(logDrainTimeout):
+			log.Warn("log drain timed out during cleanup",
+				"container_id", truncateID(containerID),
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"timeout", logDrainTimeout)
+		}
+
 		m.emitSystem(payload, "container failed: "+msg)
 
 		cbCtx, cbCancel := withCleanupTimeout(ctx)
@@ -810,7 +837,16 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, delive
 		m.killContainer(killCtx, containerID, log)
 		killCancel()
 
-		<-logDone
+		select {
+		case <-logDone:
+		case <-time.After(logDrainTimeout):
+			log.Warn("log drain timed out during cleanup",
+				"container_id", truncateID(containerID),
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"timeout", logDrainTimeout)
+		}
+
 		m.emitSystem(payload, "container canceled")
 
 		// Report failure to CM via a detached context: the parent ctx is
