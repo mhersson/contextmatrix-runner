@@ -429,7 +429,7 @@ func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	require.NoError(t, err)
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/trigger", body, ts)
 
 	req := httptest.NewRequestWithContext(
 		context.Background(), http.MethodPost, "/trigger", strings.NewReader(string(body)),

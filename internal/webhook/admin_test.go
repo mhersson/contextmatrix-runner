@@ -54,7 +54,7 @@ func TestAdminMetrics_RejectsUnauthenticated(t *testing.T) {
 	// Correctly signed GET: should be accepted.
 	{
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		sig := cmhmac.SignPayloadWithTimestamp(adminTestAPIKey, []byte{}, ts)
+		sig := cmhmac.SignPayloadWithTimestamp(adminTestAPIKey, http.MethodGet, "/metrics", []byte{}, ts)
 
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/metrics", http.NoBody)
 		require.NoError(t, err)

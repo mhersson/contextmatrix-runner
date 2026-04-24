@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,16 +42,16 @@ const testAPIKey = "test-api-key-that-is-at-least-32-chars"
 
 const testMCPURL = "https://cm.example.com/mcp"
 
-func signedRequest(t *testing.T, url string, payload any) *http.Request {
+func signedRequest(t *testing.T, path string, payload any) *http.Request {
 	t.Helper()
 
 	body, err := json.Marshal(payload)
 	require.NoError(t, err)
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, path, body, ts)
 
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, url, strings.NewReader(string(body)))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -113,7 +114,7 @@ func TestHmacAuth_ValidSignature(t *testing.T) {
 
 	body := []byte(`{"test":true}`)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/test", body, ts)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader(string(body)))
@@ -143,7 +144,7 @@ func TestHmacAuth_SkewWindow_Accepts(t *testing.T) {
 	// Timestamp 8 minutes in the past.
 	oldTS := time.Now().Add(-8 * time.Minute).Unix()
 	ts := strconv.FormatInt(oldTS, 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/test", body, ts)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader(string(body)))
@@ -170,7 +171,7 @@ func TestHmacAuth_SkewWindow_Rejects(t *testing.T) {
 	// Timestamp 8 minutes in the past.
 	oldTS := time.Now().Add(-8 * time.Minute).Unix()
 	ts := strconv.FormatInt(oldTS, 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/test", body, ts)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", strings.NewReader(string(body)))
@@ -482,14 +483,17 @@ func TestHandleHealth(t *testing.T) {
 }
 
 // signedGETRequest builds a signed GET request with an empty body.
-// The HMAC is computed over timestamp + "." + "" (empty body).
-func signedGETRequest(t *testing.T, url string) *http.Request {
+// The HMAC is computed over method+path+timestamp with an empty body.
+func signedGETRequest(t *testing.T, rawURL string) *http.Request {
 	t.Helper()
 
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
+	parsed, err := neturl.Parse(rawURL)
+	require.NoError(t, err)
 
-	req := httptest.NewRequestWithContext(context.Background(), "GET", url, nil)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, parsed.Path, []byte{}, ts)
+
+	req := httptest.NewRequestWithContext(context.Background(), "GET", rawURL, nil)
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
 
@@ -633,7 +637,7 @@ func TestHandleLogs_EventStreamed(t *testing.T) {
 	defer srv.Close()
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs", []byte{}, ts)
 
 	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs", nil)
 	require.NoError(t, err)
@@ -708,7 +712,7 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 	defer srv.Close()
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs", []byte{}, ts)
 
 	// Subscribe only to "alpha" project.
 	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs?project=alpha", nil)
@@ -772,7 +776,7 @@ func TestHandleLogs_ClientDisconnect(t *testing.T) {
 	defer srv.Close()
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, []byte{}, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs", []byte{}, ts)
 
 	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs", nil)
 	require.NoError(t, err)
@@ -919,7 +923,7 @@ func TestHandleMessage_400_MissingFields(t *testing.T) {
 				// Invalid JSON — sign a raw string body.
 				body := []byte(s)
 				ts := strconv.FormatInt(time.Now().Unix(), 10)
-				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/message", body, ts)
 				req = httptest.NewRequestWithContext(context.Background(), "POST", "/message", strings.NewReader(s))
 				req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 				req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -1101,7 +1105,7 @@ func TestHandlePromote_400_MissingFields(t *testing.T) {
 			if s, ok := tc.payload.(string); ok {
 				body := []byte(s)
 				ts := strconv.FormatInt(time.Now().Unix(), 10)
-				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/promote", body, ts)
 				req = httptest.NewRequestWithContext(context.Background(), "POST", "/promote", strings.NewReader(s))
 				req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 				req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -1599,7 +1603,7 @@ func TestHandleEndSession_400_MissingFields(t *testing.T) {
 			if s, ok := tc.payload.(string); ok {
 				body := []byte(s)
 				ts := strconv.FormatInt(time.Now().Unix(), 10)
-				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/end-session", body, ts)
 				req = httptest.NewRequestWithContext(context.Background(), "POST", "/end-session", strings.NewReader(s))
 				req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 				req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -1880,7 +1884,7 @@ func TestHandleStopAll_InvalidJSON(t *testing.T) {
 
 	body := []byte("not-json")
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/stop-all", body, ts)
 	req := httptest.NewRequestWithContext(context.Background(), "POST", "/stop-all", strings.NewReader(string(body)))
 	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
 	req.Header.Set(cmhmac.TimestampHeader, ts)
@@ -1941,7 +1945,7 @@ func TestHandleMessage_ConcurrentNoWriteInterleave(t *testing.T) {
 			}
 
 			ts := strconv.FormatInt(time.Now().Unix(), 10)
-			sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, body, ts)
+			sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/message", body, ts)
 
 			req, err := http.NewRequestWithContext(context.Background(), "POST", srv.URL+"/message", strings.NewReader(string(body)))
 			if err != nil {

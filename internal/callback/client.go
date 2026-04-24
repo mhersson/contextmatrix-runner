@@ -103,9 +103,14 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 
 	var lastErr error
 
+	statusPath, err := callbackStatusPath(c.contextMatrixURL)
+	if err != nil {
+		return err
+	}
+
 	for attempt := range maxRetries {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, body, ts)
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusPath, body, ts)
 
 		lastErr = c.doRequest(ctx, body, signature, ts)
 		if lastErr == nil {
@@ -232,11 +237,18 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 	}
 
 	if c.useHMACForVerifyAutonomous {
-		// HMAC over `timestamp + "." + ""` — body is empty for a GET, but
-		// the timestamp still gets bound to the request so a captured
-		// signature can't be replayed outside the clock-skew window.
+		// HMAC bound to method+path with an empty body. Binding the path
+		// prevents a captured signature from being replayed against a
+		// different endpoint, and binding the timestamp prevents replay
+		// outside the clock-skew window.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, nil, ts)
+
+		path, perr := verifyAutonomousPath(reqURL)
+		if perr != nil {
+			return false, perr
+		}
+
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodGet, path, nil, ts)
 		req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
 		req.Header.Set(cmhmac.TimestampHeader, ts)
 	} else {
@@ -300,6 +312,34 @@ func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts strin
 	}
 
 	return nil
+}
+
+// callbackStatusPath returns the path component of the CM status-callback
+// URL. Sender and receiver must agree on the signed path — any intermediate
+// proxy that rewrites paths would break HMAC auth, so this is derived from
+// the configured contextMatrixURL to keep both sides consistent even if the
+// base URL includes a trailing slash or a path prefix.
+func callbackStatusPath(contextMatrixURL string) (string, error) {
+	return derivePath(contextMatrixURL + "/api/runner/status")
+}
+
+// verifyAutonomousPath returns the path component of the constructed
+// /autonomous verify URL.
+func verifyAutonomousPath(reqURL string) (string, error) {
+	return derivePath(reqURL)
+}
+
+func derivePath(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse url %q: %w", rawURL, err)
+	}
+
+	if u.Path == "" {
+		return "/", nil
+	}
+
+	return u.Path, nil
 }
 
 // maxDetailBytes caps the upstream body retained on *Error for

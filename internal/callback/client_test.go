@@ -40,7 +40,7 @@ func TestReportStatus_Success(t *testing.T) {
 
 		// Verify HMAC
 		sig := strings.TrimPrefix(sigHeader, "sha256=")
-		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, sig, tsHeader, body, cmhmac.DefaultMaxClockSkew))
+		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.Path, sig, tsHeader, body, cmhmac.DefaultMaxClockSkew))
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -127,7 +127,7 @@ func TestReportStatus_HMACFormat(t *testing.T) {
 		// Verify the signature is valid
 		body, _ := io.ReadAll(r.Body)
 		hexSig := strings.TrimPrefix(sig, "sha256=")
-		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, hexSig, ts, body, cmhmac.DefaultMaxClockSkew))
+		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.Path, hexSig, ts, body, cmhmac.DefaultMaxClockSkew))
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -215,12 +215,15 @@ func TestVerifyAutonomous_HMACSigned(t *testing.T) {
 
 	var (
 		sigHeader, tsHeader, authHeader string
+		receivedMethod, receivedPath    string
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sigHeader = r.Header.Get(cmhmac.SignatureHeader)
 		tsHeader = r.Header.Get(cmhmac.TimestampHeader)
 		authHeader = r.Header.Get("Authorization")
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true,"autonomous":true}`))
@@ -239,7 +242,7 @@ func TestVerifyAutonomous_HMACSigned(t *testing.T) {
 
 	// Signature must verify against an empty body (GET carries no body).
 	hexSig := strings.TrimPrefix(sigHeader, "sha256=")
-	assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, hexSig, tsHeader, nil, cmhmac.DefaultMaxClockSkew))
+	assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, receivedMethod, receivedPath, hexSig, tsHeader, nil, cmhmac.DefaultMaxClockSkew))
 }
 
 // TestVerifyAutonomous_HMACSigned_RejectsMissingHeaders ensures that a

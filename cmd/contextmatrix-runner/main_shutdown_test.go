@@ -223,7 +223,7 @@ func TestShutdown_WedgedContainer(t *testing.T) {
 
 	body, _ := json.Marshal(payload)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(apiKey, body, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(apiKey, http.MethodPost, "/trigger", body, ts)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/trigger", strings.NewReader(string(body)))
 	require.NoError(t, err)
