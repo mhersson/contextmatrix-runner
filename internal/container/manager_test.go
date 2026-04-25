@@ -27,9 +27,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	githubauth "github.com/mhersson/contextmatrix-githubauth"
+
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
-	"github.com/mhersson/contextmatrix-runner/internal/github"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
@@ -75,8 +76,8 @@ func testConfig() *config.Config {
 	return cfg
 }
 
-// testTokenProvider creates a mock GitHub token server and TokenProvider.
-func testTokenProvider(t *testing.T) github.TokenGenerator {
+// testTokenProvider creates a mock GitHub token server and AppProvider.
+func testTokenProvider(t *testing.T) githubauth.TokenGenerator {
 	t.Helper()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -88,16 +89,16 @@ func testTokenProvider(t *testing.T) github.TokenGenerator {
 	}))
 	t.Cleanup(srv.Close)
 
-	tp, err := github.NewTokenProviderWithKey(12345, 67890, testRSAKey(), srv.URL)
+	tp, err := githubauth.NewAppProviderWithKey(12345, 67890, testRSAKey(), srv.URL)
 	require.NoError(t, err)
 
 	return tp
 }
 
-func testPATProvider(t *testing.T) github.TokenGenerator {
+func testPATProvider(t *testing.T) githubauth.TokenGenerator {
 	t.Helper()
 
-	p, err := github.NewPATProvider("ghp_test_pat")
+	p, err := githubauth.NewPATProvider("ghp_test_pat")
 	require.NoError(t, err)
 
 	return p

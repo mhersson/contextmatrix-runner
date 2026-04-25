@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -15,18 +16,22 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	githubauth "github.com/mhersson/contextmatrix-githubauth"
+
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	ctr "github.com/mhersson/contextmatrix-runner/internal/container"
 )
 
-// stubToken is a minimal github.TokenGenerator used by buildProbes tests.
+// stubToken is a minimal githubauth.TokenGenerator used by buildProbes tests.
 type stubToken struct {
 	err error
 }
 
-func (s stubToken) GenerateToken(_ context.Context) (string, error) {
-	return "tok", s.err
+var _ githubauth.TokenGenerator = stubToken{}
+
+func (s stubToken) GenerateToken(_ context.Context) (string, time.Time, error) {
+	return "tok", time.Now().Add(time.Hour), s.err
 }
 
 // fakeDocker implements ctr.DockerClient. Only the methods called by
