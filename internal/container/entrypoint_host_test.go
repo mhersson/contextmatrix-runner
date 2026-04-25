@@ -284,3 +284,135 @@ func TestEntrypointInteractiveContent(t *testing.T) {
 	assert.Contains(t, src, "else",
 		"entrypoint.sh must have an else clause separating the two branches")
 }
+
+// skillsScriptPath returns the absolute path to docker/entrypoint-skills.sh.
+func skillsScriptPath(t *testing.T) string {
+	t.Helper()
+
+	_, filename, _, ok := runtime.Caller(0)
+	require.True(t, ok, "runtime.Caller failed")
+	root := filepath.Join(filepath.Dir(filename), "..", "..")
+
+	return filepath.Join(root, "docker", "entrypoint-skills.sh")
+}
+
+// runSkillsScript sources entrypoint-skills.sh in a sandboxed environment and
+// returns the combined stderr output.  The fake HOME is always set to fakeHome
+// so the caller can inspect $HOME/.claude/skills/ afterwards.
+func runSkillsScript(t *testing.T, fakeHome, fakeHostSkills string, extraEnv []string) (string, error) {
+	t.Helper()
+
+	scriptPath := skillsScriptPath(t)
+
+	// We source the script inside bash -c so we can set HOME and other vars.
+	script := `. ` + scriptPath
+
+	cmd := exec.CommandContext(context.Background(), "bash", "-c", script)
+	// Build a clean env: inherit PATH only, then add our vars.
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + fakeHome,
+		"CM_HOST_SKILLS_DIR=" + fakeHostSkills,
+	}
+	env = append(env, extraEnv...)
+	cmd.Env = env
+
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// makeFakeSkillDir creates a skill directory with a dummy SKILL.md inside.
+func makeFakeSkillDir(t *testing.T, parent, name string) {
+	t.Helper()
+
+	dir := filepath.Join(parent, name)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# "+name), 0o644))
+}
+
+func TestEntrypoint_TaskSkillsCopy(t *testing.T) {
+	t.Run("CM_TASK_SKILLS_SET=1 with names copies only those", func(t *testing.T) {
+		hostSkills := t.TempDir()
+		makeFakeSkillDir(t, hostSkills, "go-development")
+		makeFakeSkillDir(t, hostSkills, "typescript-react")
+		makeFakeSkillDir(t, hostSkills, "python-development")
+
+		fakeHome := t.TempDir()
+		stderr, err := runSkillsScript(t, fakeHome, hostSkills, []string{
+			"CM_TASK_SKILLS_SET=1",
+			"CM_TASK_SKILLS=go-development,documentation",
+		})
+		require.NoError(t, err, "script exited non-zero: %s", stderr)
+
+		// go-development was requested and present — must be copied.
+		assert.DirExists(t, filepath.Join(fakeHome, ".claude", "skills", "go-development"))
+		// typescript-react was not in the list — must NOT be copied.
+		assert.NoDirExists(t, filepath.Join(fakeHome, ".claude", "skills", "typescript-react"))
+		// documentation was requested but missing — must warn.
+		assert.Contains(t, stderr, "documentation", "missing skill should produce a warning")
+	})
+
+	t.Run("CM_TASK_SKILLS_SET unset copies full set", func(t *testing.T) {
+		hostSkills := t.TempDir()
+		makeFakeSkillDir(t, hostSkills, "go-development")
+		makeFakeSkillDir(t, hostSkills, "typescript-react")
+
+		fakeHome := t.TempDir()
+		stderr, err := runSkillsScript(t, fakeHome, hostSkills, nil)
+		require.NoError(t, err, "script exited non-zero: %s", stderr)
+
+		assert.DirExists(t, filepath.Join(fakeHome, ".claude", "skills", "go-development"))
+		assert.DirExists(t, filepath.Join(fakeHome, ".claude", "skills", "typescript-react"))
+	})
+
+	t.Run("CM_TASK_SKILLS_SET=1 with empty CM_TASK_SKILLS copies nothing", func(t *testing.T) {
+		hostSkills := t.TempDir()
+		makeFakeSkillDir(t, hostSkills, "go-development")
+
+		fakeHome := t.TempDir()
+		stderr, err := runSkillsScript(t, fakeHome, hostSkills, []string{
+			"CM_TASK_SKILLS_SET=1",
+			"CM_TASK_SKILLS=",
+		})
+		require.NoError(t, err, "script exited non-zero: %s", stderr)
+
+		// Skills dir created but empty.
+		skillsDir := filepath.Join(fakeHome, ".claude", "skills")
+		assert.DirExists(t, skillsDir)
+		entries, err := os.ReadDir(skillsDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "skills dir should be empty when CM_TASK_SKILLS is empty")
+	})
+
+	t.Run("bad skill name (path traversal) is rejected", func(t *testing.T) {
+		hostSkills := t.TempDir()
+		// Create a subdir that would be reached by a traversal (simulated by a
+		// dir one level up — the actual "../etc" is not a dir here, so nothing
+		// is copied and the script must not error).
+		fakeHome := t.TempDir()
+		stderr, err := runSkillsScript(t, fakeHome, hostSkills, []string{
+			"CM_TASK_SKILLS_SET=1",
+			"CM_TASK_SKILLS=../etc/passwd",
+		})
+		require.NoError(t, err, "script must not abort on bad name: %s", stderr)
+
+		skillsDir := filepath.Join(fakeHome, ".claude", "skills")
+		entries, err := os.ReadDir(skillsDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "path traversal attempt should result in nothing copied")
+	})
+
+	t.Run("missing /host-skills is a no-op", func(t *testing.T) {
+		fakeHome := t.TempDir()
+		nonExistent := filepath.Join(t.TempDir(), "does-not-exist")
+
+		stderr, err := runSkillsScript(t, fakeHome, nonExistent, nil)
+		require.NoError(t, err, "script must not abort on missing host-skills: %s", stderr)
+
+		skillsDir := filepath.Join(fakeHome, ".claude", "skills")
+		assert.DirExists(t, skillsDir, "skills dir should still be created")
+		entries, err := os.ReadDir(skillsDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "skills dir should be empty when host-skills is absent")
+	})
+}

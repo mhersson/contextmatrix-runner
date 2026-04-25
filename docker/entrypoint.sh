@@ -313,6 +313,10 @@ fi
 # the env-fallback path.
 unset CM_GIT_TOKEN CM_MCP_API_KEY
 
+# ----- Task skills (filesystem-mounted Claude Code skills) -----
+# shellcheck source=docker/entrypoint-skills.sh
+. "$(dirname "$0")/entrypoint-skills.sh"
+
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
 # Space-separated allowlist passed via a single --allowed-tools flag, per
 # `claude --help`: "--allowedTools, --allowed-tools <tools...>  Comma or
