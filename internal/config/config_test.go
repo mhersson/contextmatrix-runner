@@ -1299,7 +1299,7 @@ github_app:
   installation_id: 67890
   private_key_path: "`+pemPath+`"
 task_skills_dir: /var/lib/contextmatrix/task-skills
-`), 0644))
+`), 0o600))
 
 	cfg, err := Load(configPath)
 	require.NoError(t, err)
@@ -1319,7 +1319,7 @@ github_app:
   app_id: 12345
   installation_id: 67890
   private_key_path: "`+pemPath+`"
-`), 0644))
+`), 0o600))
 
 	cfg, err := Load(configPath)
 	require.NoError(t, err)

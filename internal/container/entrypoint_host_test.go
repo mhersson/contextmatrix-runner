@@ -291,6 +291,7 @@ func skillsScriptPath(t *testing.T) string {
 
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok, "runtime.Caller failed")
+
 	root := filepath.Join(filepath.Dir(filename), "..", "..")
 
 	return filepath.Join(root, "docker", "entrypoint-skills.sh")
@@ -318,6 +319,7 @@ func runSkillsScript(t *testing.T, fakeHome, fakeHostSkills string, extraEnv []s
 	cmd.Env = env
 
 	out, err := cmd.CombinedOutput()
+
 	return string(out), err
 }
 
@@ -326,8 +328,8 @@ func makeFakeSkillDir(t *testing.T, parent, name string) {
 	t.Helper()
 
 	dir := filepath.Join(parent, name)
-	require.NoError(t, os.MkdirAll(dir, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# "+name), 0o644))
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# "+name), 0o600))
 }
 
 func TestEntrypoint_TaskSkillsCopy(t *testing.T) {
