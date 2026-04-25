@@ -53,6 +53,7 @@ ALLOWED_TOOLS_COMMON=(
     "Read"
     "Edit"
     "Write"
+    "Skill"
     "MultiEdit"
     "NotebookEdit"
     "Glob"
