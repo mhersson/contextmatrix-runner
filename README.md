@@ -152,27 +152,35 @@ GitHub UI — no runner configuration changes needed.
 Add the App credentials to your `config.yaml`:
 
 ```yaml
-github_app:
-  app_id: 123456
-  installation_id: 78901234
-  private_key_path: "/home/you/.config/contextmatrix-runner/app.pem"
+github:
+  auth_mode: "app"
+  app:
+    app_id: 123456
+    installation_id: 78901234
+    private_key_path: "/home/you/.config/contextmatrix-runner/app.pem"
   # For GitHub Enterprise Cloud with Data Residency (GHEC-DR) or GHES:
+  # host: "acme.ghe.com"           # Env: CMR_GITHUB_HOST
   # api_base_url: "https://api.acme.ghe.com"  # Env: CMR_GITHUB_API_BASE_URL
 ```
 
-For GitHub Enterprise, `api_base_url` must point to the enterprise API endpoint
-(e.g. `https://api.acme.ghe.com`). Leave it empty for standard `github.com`.
+For GitHub Enterprise, `github.host` and optionally `github.api_base_url` must
+point to the enterprise instance. Leave both empty for standard `github.com`.
 The git host inside containers is derived automatically from the repo URL, so no
 extra git configuration is required. Set the matching `github.host` (or
 `github.api_base_url`) in ContextMatrix so both sides target the same enterprise
 instance.
+
+For end-to-end setup of a GitHub App or PAT covering both the runner
+and the contextmatrix server, see
+[contextmatrix's topology guide](https://github.com/mhersson/contextmatrix/blob/main/docs/github-auth-recommended-topologies.md).
 
 ## GitHub PAT Setup
 
 Use a fine-grained personal access token when you cannot create a GitHub App
 (common in GitHub Enterprise environments with restricted App creation).
 
-**Note:** PAT is mutually exclusive with `github_app` — configure exactly one.
+**Note:** PAT is mutually exclusive with `github.app.*` — configure exactly one
+via `github.auth_mode`.
 
 ### Step 1: Create a Fine-Grained PAT
 
@@ -190,17 +198,20 @@ Use a fine-grained personal access token when you cannot create a GitHub App
 Add the token to your `config.yaml`:
 
 ```yaml
-github_pat:
-  token: "github_pat_..."  # Env: CMR_GITHUB_PAT_TOKEN
+github:
+  auth_mode: "pat"
+  pat:
+    token: "github_pat_..."  # Env: CMR_GITHUB_PAT_TOKEN
 ```
 
-Or set it via environment variable:
+Or set it via environment variables:
 
 ```bash
+export CMR_GITHUB_AUTH_MODE="pat"
 export CMR_GITHUB_PAT_TOKEN="github_pat_..."
 ```
 
-Remove or leave blank the entire `github_app` block when using a PAT.
+Leave the `github.app.*` fields at their defaults (zero/empty) when using a PAT.
 
 ## Configuration
 
@@ -283,18 +294,21 @@ anthropic_api_key: ""
 # Env: CMR_CLAUDE_SETTINGS
 # claude_settings: '{"includeCoAuthoredBy":false}'
 
-# GitHub credentials — configure exactly one of github_app or github_pat.
+# GitHub authentication. Configure auth_mode and the matching sub-block.
+github:
+  auth_mode: "app" # CMR_GITHUB_AUTH_MODE — "app" (recommended) or "pat"
+  host: ""         # CMR_GITHUB_HOST — GHE/GHEC-DR hostname; empty for github.com
+  api_base_url: "" # CMR_GITHUB_API_BASE_URL — override for non-standard enterprise URLs
 
-# GitHub App (recommended): short-lived, repo-scoped tokens.
-github_app:
-  app_id: 0 # CMR_GITHUB_APP_ID
-  installation_id: 0 # CMR_GITHUB_INSTALLATION_ID
-  private_key_path: "" # CMR_GITHUB_PRIVATE_KEY_PATH
-  # api_base_url: "https://api.acme.ghe.com"  # CMR_GITHUB_API_BASE_URL (GHEC-DR/GHES only)
+  # GitHub App credentials (required when auth_mode is "app").
+  app:
+    app_id: 0           # CMR_GITHUB_APP_ID
+    installation_id: 0  # CMR_GITHUB_INSTALLATION_ID
+    private_key_path: "" # CMR_GITHUB_PRIVATE_KEY_PATH
 
-# Fine-grained PAT (alternative — use when GitHub App creation is not possible).
-# github_pat:
-#   token: ""  # CMR_GITHUB_PAT_TOKEN
+  # Fine-grained PAT (required when auth_mode is "pat").
+  pat:
+    token: "" # CMR_GITHUB_PAT_TOKEN
 
 # Log level: debug, info, warn, error.
 # Env: CMR_LOG_LEVEL
@@ -380,10 +394,12 @@ base_image: "contextmatrix/worker:latest"
 
 anthropic_api_key: "sk-ant-..."   # or claude_auth_dir / claude_oauth_token
 
-github_app:
-  app_id: 123456
-  installation_id: 78901234
-  private_key_path: "/path/to/app.pem"
+github:
+  auth_mode: "app"
+  app:
+    app_id: 123456
+    installation_id: 78901234
+    private_key_path: "/path/to/app.pem"
 ```
 
 ## ContextMatrix Configuration
@@ -598,15 +614,15 @@ Every container is launched with the following restrictions:
 
 ### Container fails with "generate git token" error
 
-**GitHub App:**
+**GitHub App (`auth_mode: "app"`):**
 
-- Verify `github_app.private_key_path` points to a valid PEM file
-- Verify `github_app.app_id` and `installation_id` are correct
+- Verify `github.app.private_key_path` points to a valid PEM file
+- Verify `github.app.app_id` and `github.app.installation_id` are correct
 - Check that the GitHub App is installed on the target repositories
 
-**PAT:**
+**PAT (`auth_mode: "pat"`):**
 
-- Verify `github_pat.token` (or `CMR_GITHUB_PAT_TOKEN`) is set and non-empty
+- Verify `github.pat.token` (or `CMR_GITHUB_PAT_TOKEN`) is set and non-empty
 - Check the token has not expired and has `Contents: Read & Write` and
   `Pull requests: Read & Write` permissions on the target repositories
 
