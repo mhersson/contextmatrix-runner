@@ -53,6 +53,11 @@ type RunConfig struct {
 	Interactive   bool
 	Model         string
 	CorrelationID string
+	// TaskSkills is the optional set of skill names to activate in the container.
+	// nil means "no constraint" (all skills); non-nil (even empty) means the
+	// set is explicit. The entrypoint uses CM_TASK_SKILLS_SET to distinguish
+	// the two cases.
+	TaskSkills *[]string
 }
 
 const (
@@ -433,6 +438,11 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		env = append(env, "CM_CLAUDE_SETTINGS="+m.cfg.ClaudeSettings)
 	}
 
+	if m.cfg.TaskSkillsDir != "" && payload.TaskSkills != nil {
+		env = append(env, "CM_TASK_SKILLS_SET=1")
+		env = append(env, "CM_TASK_SKILLS="+strings.Join(*payload.TaskSkills, ","))
+	}
+
 	// Apply highest-priority Claude auth method only.
 	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
 	var mounts []mount.Mount
@@ -450,6 +460,15 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		secrets["CLAUDE_CODE_OAUTH_TOKEN"] = m.cfg.ClaudeOAuthToken
 	case m.cfg.AnthropicAPIKey != "":
 		secrets["ANTHROPIC_API_KEY"] = m.cfg.AnthropicAPIKey
+	}
+
+	if m.cfg.TaskSkillsDir != "" {
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   m.cfg.TaskSkillsDir,
+			Target:   "/host-skills",
+			ReadOnly: true,
+		})
 	}
 
 	// Collect secret values (deterministic order, sorted by key) for the
