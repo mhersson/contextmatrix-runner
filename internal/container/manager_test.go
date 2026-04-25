@@ -3481,10 +3481,12 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		t.Helper()
 
 		orig := pullSkillsRepo
+
 		t.Cleanup(func() { pullSkillsRepo = orig })
 
 		pullSkillsRepo = func(ctx context.Context, dir string) error {
 			calls = append(calls, dir)
+
 			return stub(ctx, dir)
 		}
 
@@ -3538,6 +3540,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		var containerCreated bool
 
 		orig := pullSkillsRepo
+
 		t.Cleanup(func() { pullSkillsRepo = orig })
 
 		pullSkillsRepo = func(_ context.Context, _ string) error {
@@ -3547,6 +3550,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		mock := successfulMock()
 		mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 			containerCreated = true
+
 			return container.CreateResponse{ID: "pull-fail-ctr"}, nil
 		}
 

@@ -181,6 +181,7 @@ func ValidateTaskSkills(skills []string) error {
 			return fmt.Errorf("invalid task skill name: %q", s)
 		}
 	}
+
 	return nil
 }
 

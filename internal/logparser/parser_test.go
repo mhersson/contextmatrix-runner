@@ -712,9 +712,11 @@ func TestParser_DetectsSkillEngagement(t *testing.T) {
 	events := parseAllToCollect(t, streamJSON)
 
 	var found *SkillEngagedEvent
+
 	for _, e := range events {
 		if se, ok := e.(*SkillEngagedEvent); ok {
 			found = se
+
 			break
 		}
 	}
@@ -730,9 +732,11 @@ func TestParser_DetectsSkillEngagement_NameKey(t *testing.T) {
 	events := parseAllToCollect(t, streamJSON)
 
 	var found *SkillEngagedEvent
+
 	for _, e := range events {
 		if se, ok := e.(*SkillEngagedEvent); ok {
 			found = se
+
 			break
 		}
 	}

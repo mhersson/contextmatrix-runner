@@ -122,8 +122,8 @@ var pullSkillsRepo = func(ctx context.Context, dir string) error {
 	}
 
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "pull", "--ff-only")
-	out, err := cmd.CombinedOutput()
 
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git pull: %w (output: %s)", err, out)
 	}
