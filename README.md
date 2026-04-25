@@ -322,7 +322,7 @@ The runner can mount a curated set of Claude Code skills (Go, TypeScript/React, 
 ### One-time setup
 
 ```bash
-# On the runner host (e.g. bumblebee):
+# On the runner host:
 sudo mkdir -p /var/lib/contextmatrix/task-skills
 sudo chown <runner-user>:<runner-user> /var/lib/contextmatrix/task-skills
 git clone <upstream-skills-repo> /var/lib/contextmatrix/task-skills
