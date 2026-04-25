@@ -2,14 +2,15 @@ package webhook
 
 // TriggerPayload is received from ContextMatrix to start a task.
 type TriggerPayload struct {
-	CardID      string `json:"card_id"`
-	Project     string `json:"project"`
-	RepoURL     string `json:"repo_url"`
-	MCPAPIKey   string `json:"mcp_api_key,omitempty"`
-	BaseBranch  string `json:"base_branch,omitempty"`
-	RunnerImage string `json:"runner_image,omitempty"`
-	Interactive bool   `json:"interactive,omitempty"`
-	Model       string `json:"model,omitempty"`
+	CardID      string    `json:"card_id"`
+	Project     string    `json:"project"`
+	RepoURL     string    `json:"repo_url"`
+	MCPAPIKey   string    `json:"mcp_api_key,omitempty"`
+	BaseBranch  string    `json:"base_branch,omitempty"`
+	RunnerImage string    `json:"runner_image,omitempty"`
+	Interactive bool      `json:"interactive,omitempty"`
+	Model       string    `json:"model,omitempty"`
+	TaskSkills  *[]string `json:"task_skills,omitempty"`
 }
 
 // KillPayload is received from ContextMatrix to stop a specific task.

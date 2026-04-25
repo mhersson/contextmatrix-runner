@@ -107,7 +107,8 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 # 1000 (Debian slim has no default user at this UID). Combined into one
 # RUN so hadolint DL3059 does not flag consecutive instructions.
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod 755 /entrypoint.sh \
+COPY entrypoint-skills.sh /entrypoint-skills.sh
+RUN chmod 755 /entrypoint.sh /entrypoint-skills.sh \
     && useradd -m -u 1000 -s /bin/bash user
 USER user
 WORKDIR /home/user

@@ -3340,3 +3340,261 @@ func TestForceRemoveByLabels_RequiresProjectAndCard(t *testing.T) {
 	_, err = mgr.ForceRemoveByLabels(context.Background(), "proj", "")
 	require.Error(t, err)
 }
+
+func TestContainerCreate_TaskSkillsMount(t *testing.T) {
+	// helper builds a manager with the given config, runs a single container
+	// creation, and returns the captured mounts and env from ContainerCreate.
+	captureCreateArgs := func(t *testing.T, cfg *config.Config, payload RunConfig) ([]mount.Mount, []string) {
+		t.Helper()
+
+		var (
+			capturedMounts []mount.Mount
+			capturedEnv    []string
+		)
+
+		mock := successfulMock()
+		mock.ContainerCreateFn = func(_ context.Context, ccfg *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			capturedMounts = hc.Mounts
+			capturedEnv = ccfg.Env
+
+			return container.CreateResponse{ID: "skills-test-ctr"}, nil
+		}
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		t.Cleanup(cbSrv.Close)
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		return capturedMounts, capturedEnv
+	}
+
+	t.Run("mount added when task_skills_dir configured", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TaskSkillsDir = "/var/lib/cm/task-skills"
+
+		payload := testPayload()
+		// TaskSkills nil — only mount should be added, no env vars.
+
+		mounts, env := captureCreateArgs(t, cfg, payload)
+
+		var found bool
+
+		for _, m := range mounts {
+			if m.Target == "/host-skills" {
+				found = true
+
+				assert.Equal(t, "/var/lib/cm/task-skills", m.Source)
+				assert.Equal(t, mount.TypeBind, m.Type)
+				assert.True(t, m.ReadOnly)
+			}
+		}
+
+		assert.True(t, found, "expected /host-skills mount to be present")
+
+		for _, e := range env {
+			assert.False(t, strings.HasPrefix(e, "CM_TASK_SKILLS_SET="), "CM_TASK_SKILLS_SET must not be set when TaskSkills is nil")
+		}
+	})
+
+	t.Run("no mount when task_skills_dir empty", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TaskSkillsDir = ""
+
+		payload := testPayload()
+		skills := []string{"go-development"}
+		payload.TaskSkills = &skills
+
+		mounts, env := captureCreateArgs(t, cfg, payload)
+
+		for _, m := range mounts {
+			assert.NotEqual(t, "/host-skills", m.Target, "no /host-skills mount expected when TaskSkillsDir is empty")
+		}
+
+		for _, e := range env {
+			assert.False(t, strings.HasPrefix(e, "CM_TASK_SKILLS_SET="), "CM_TASK_SKILLS_SET must not be set when TaskSkillsDir is empty")
+		}
+	})
+
+	t.Run("env vars emitted for non-nil TaskSkills", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TaskSkillsDir = "/x"
+
+		payload := testPayload()
+		skills := []string{"go-development", "docs"}
+		payload.TaskSkills = &skills
+
+		_, env := captureCreateArgs(t, cfg, payload)
+
+		assert.Contains(t, env, "CM_TASK_SKILLS_SET=1")
+		assert.Contains(t, env, "CM_TASK_SKILLS=go-development,docs")
+	})
+
+	t.Run("empty list still emits SET=1 with empty value", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TaskSkillsDir = "/x"
+
+		payload := testPayload()
+		skills := []string{}
+		payload.TaskSkills = &skills
+
+		_, env := captureCreateArgs(t, cfg, payload)
+
+		assert.Contains(t, env, "CM_TASK_SKILLS_SET=1")
+		assert.Contains(t, env, "CM_TASK_SKILLS=")
+	})
+
+	t.Run("nil TaskSkills emits no env vars even with mount", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TaskSkillsDir = "/x"
+
+		payload := testPayload()
+		// payload.TaskSkills is nil by default.
+
+		_, env := captureCreateArgs(t, cfg, payload)
+
+		for _, e := range env {
+			assert.False(t, strings.HasPrefix(e, "CM_TASK_SKILLS_SET="), "CM_TASK_SKILLS_SET must not be set when TaskSkills is nil")
+			assert.False(t, strings.HasPrefix(e, "CM_TASK_SKILLS="), "CM_TASK_SKILLS must not be set when TaskSkills is nil")
+		}
+	})
+}
+
+func TestContainerCreate_TaskSkillsPull(t *testing.T) {
+	// runWithPullStub builds a manager, swaps pullSkillsRepo with stub, runs
+	// one container creation, and returns whatever stub recorded.
+	runWithPullStub := func(t *testing.T, cfg *config.Config, payload RunConfig, stub func(context.Context, string) error) (calls []string) {
+		t.Helper()
+
+		orig := pullSkillsRepo
+
+		t.Cleanup(func() { pullSkillsRepo = orig })
+
+		pullSkillsRepo = func(ctx context.Context, dir string) error {
+			calls = append(calls, dir)
+
+			return stub(ctx, dir)
+		}
+
+		mock := successfulMock()
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		t.Cleanup(cbSrv.Close)
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		return calls
+	}
+
+	t.Run("pull invoked when task_skills_dir configured", func(t *testing.T) {
+		dir := t.TempDir()
+		// Create a fake .git directory so pullSkillsRepo is not short-circuited
+		// by the real implementation (tests stub it, but the dir check is in
+		// the stub for this test to exercise the wiring path).
+		cfg := testConfig()
+		cfg.TaskSkillsDir = dir
+
+		calls := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _ string) error {
+			return nil
+		})
+
+		require.Len(t, calls, 1, "pull must be called exactly once")
+		assert.Equal(t, dir, calls[0])
+	})
+
+	t.Run("pull failure does not abort container creation", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := testConfig()
+		cfg.TaskSkillsDir = dir
+
+		// Stub returns an error; container creation must still complete.
+		var containerCreated bool
+
+		orig := pullSkillsRepo
+
+		t.Cleanup(func() { pullSkillsRepo = orig })
+
+		pullSkillsRepo = func(_ context.Context, _ string) error {
+			return fmt.Errorf("git pull: exit status 1")
+		}
+
+		mock := successfulMock()
+		mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			containerCreated = true
+
+			return container.CreateResponse{ID: "pull-fail-ctr"}, nil
+		}
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		t.Cleanup(cbSrv.Close)
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+
+		payload := testPayload()
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		assert.True(t, containerCreated, "container must still be created even when pull fails")
+	})
+
+	t.Run("no pull when task_skills_dir empty", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TaskSkillsDir = ""
+
+		calls := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _ string) error {
+			return nil
+		})
+
+		assert.Empty(t, calls, "pull must not be called when TaskSkillsDir is empty")
+	})
+
+	t.Run("no pull when dir is not a git repo", func(t *testing.T) {
+		// Use the real pullSkillsRepo (not a stub) against a real dir that has
+		// no .git entry — the implementation must return nil silently.
+		dir := t.TempDir() // exists, but no .git inside
+
+		err := pullSkillsRepo(context.Background(), dir)
+		assert.NoError(t, err, "pullSkillsRepo must return nil when dir is not a git repo")
+	})
+}

@@ -301,6 +301,34 @@ github_app:
 log_level: "info"
 ```
 
+## Task skills
+
+The runner can mount a curated set of Claude Code skills (Go, TypeScript/React, etc.) into worker containers. ContextMatrix server resolves which skills apply per card and sends the list in the `/trigger` payload; the runner copies the resolved subset into `~/.claude/skills/` for Claude Code to discover.
+
+### One-time setup
+
+```bash
+# On the runner host (e.g. bumblebee):
+sudo mkdir -p /var/lib/contextmatrix/task-skills
+sudo chown <runner-user>:<runner-user> /var/lib/contextmatrix/task-skills
+git clone <upstream-skills-repo> /var/lib/contextmatrix/task-skills
+```
+
+### Config
+
+```yaml
+# config.yaml
+task_skills_dir: /var/lib/contextmatrix/task-skills
+```
+
+### Sync model
+
+The runner runs `git pull --ff-only` on `task_skills_dir` before each `/trigger`. No cron. Pull failures log and continue with the existing local clone — the trigger never aborts because of a sync issue.
+
+### Local-dev / single-host setup
+
+When the runner and the CM server share a host, both `task_skills_dir` configs can point at the same path. No upstream remote needed; edit in place.
+
 ## Deployment profiles
 
 The runner operates in one of two modes, set via `deployment_profile` in

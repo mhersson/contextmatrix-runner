@@ -53,6 +53,7 @@ ALLOWED_TOOLS_COMMON=(
     "Read"
     "Edit"
     "Write"
+    "Skill"
     "MultiEdit"
     "NotebookEdit"
     "Glob"
@@ -94,6 +95,7 @@ ALLOWED_TOOLS_COMMON=(
     "Bash(tail:*)"
     "Bash(wc:*)"
     "Bash(echo:*)"
+    "Bash(printenv:*)"
     "Bash(sed:*)"
     "Bash(awk:*)"
     "Bash(grep:*)"
@@ -311,6 +313,10 @@ fi
 # the Claude CLI reads them at startup, and removing them here breaks auth in
 # the env-fallback path.
 unset CM_GIT_TOKEN CM_MCP_API_KEY
+
+# ----- Task skills (filesystem-mounted Claude Code skills) -----
+# shellcheck source=docker/entrypoint-skills.sh
+. "$(dirname "$0")/entrypoint-skills.sh"
 
 echo "Starting Claude Code for card ${CM_CARD_ID}..."
 # Space-separated allowlist passed via a single --allowed-tools flag, per

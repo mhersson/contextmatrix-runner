@@ -495,3 +495,25 @@ func TestRetryLoop_TimerStopOnCtx(t *testing.T) {
 	assert.Less(t, after-baseline, 10,
 		"goroutine count should not grow with cancelled iterations; baseline=%d after=%d", baseline, after)
 }
+
+func TestClient_ReportSkillEngaged(t *testing.T) {
+	var receivedBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/runner/skill-engaged", r.URL.Path)
+		assert.NotEmpty(t, r.Header.Get(cmhmac.SignatureHeader))
+
+		receivedBody, _ = io.ReadAll(r.Body)
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "at-least-thirty-two-characters-long-key", slog.Default())
+	require.NoError(t, c.ReportSkillEngaged(context.Background(), "ALPHA-001", "alpha", "go-development"))
+
+	assert.Contains(t, string(receivedBody), `"card_id":"ALPHA-001"`)
+	assert.Contains(t, string(receivedBody), `"skill_name":"go-development"`)
+}

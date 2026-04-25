@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 )
@@ -434,7 +435,7 @@ func TestProcessStreamWithRedactor_LiteralSecrets(t *testing.T) {
 	r := NewRedactor([]string{liveToken})
 	ProcessStreamWithRedactor(strings.NewReader(input), logger, r, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
-	})
+	}, nil)
 
 	assert.Len(t, *records, 1)
 	assert.NotContains(t, attr((*records)[0], "claude_text"), liveToken)
@@ -678,4 +679,79 @@ func TestProcessStream_ToolUseRedactsSecrets(t *testing.T) {
 	assert.Len(t, emitted, 1)
 	assert.NotContains(t, emitted[0].Content, secret, "emitted content must not contain the raw secret")
 	assert.Contains(t, emitted[0].Content, "[REDACTED]", "emitted content must contain [REDACTED]")
+}
+
+// parseAllToCollect is a test helper that runs ProcessStreamWithRedactor on
+// the given stream-json input and collects all emitted events into a []any
+// slice. Both logbroadcast.LogEntry values and *SkillEngagedEvent values are
+// included so callers can type-assert against whichever they need.
+func parseAllToCollect(t *testing.T, input string) []any {
+	t.Helper()
+
+	logger, _ := newTestLogger()
+
+	var events []any
+
+	emitLog := func(e logbroadcast.LogEntry) {
+		events = append(events, e)
+	}
+
+	emitSkill := func(e *SkillEngagedEvent) {
+		events = append(events, e)
+	}
+
+	ProcessStreamWithRedactor(strings.NewReader(input), logger, nil, emitLog, emitSkill)
+
+	return events
+}
+
+func TestParser_DetectsSkillEngagement(t *testing.T) {
+	// stream-json fragment with Skill tool_use using the "skill" input key.
+	streamJSON := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"abc","name":"Skill","input":{"skill":"go-development"}}]}}` + "\n"
+
+	events := parseAllToCollect(t, streamJSON)
+
+	var found *SkillEngagedEvent
+
+	for _, e := range events {
+		if se, ok := e.(*SkillEngagedEvent); ok {
+			found = se
+
+			break
+		}
+	}
+
+	require.NotNil(t, found, "expected a SkillEngagedEvent for Skill tool_use")
+	assert.Equal(t, "go-development", found.SkillName)
+}
+
+func TestParser_DetectsSkillEngagement_NameKey(t *testing.T) {
+	// Fallback: CC may use "name" instead of "skill" as the input key.
+	streamJSON := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"abc","name":"Skill","input":{"name":"go-development"}}]}}` + "\n"
+
+	events := parseAllToCollect(t, streamJSON)
+
+	var found *SkillEngagedEvent
+
+	for _, e := range events {
+		if se, ok := e.(*SkillEngagedEvent); ok {
+			found = se
+
+			break
+		}
+	}
+
+	require.NotNil(t, found, "expected a SkillEngagedEvent when using 'name' input key")
+	assert.Equal(t, "go-development", found.SkillName)
+}
+
+func TestParser_IgnoresOtherToolUseEvents(t *testing.T) {
+	streamJSON := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Edit","input":{}}]}}` + "\n"
+
+	events := parseAllToCollect(t, streamJSON)
+
+	for _, e := range events {
+		_, isSkill := e.(*SkillEngagedEvent)
+		assert.False(t, isSkill, "non-Skill tool_use must not produce SkillEngagedEvent")
+	}
 }

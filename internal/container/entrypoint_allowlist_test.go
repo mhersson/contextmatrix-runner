@@ -45,6 +45,7 @@ func TestEntrypointAllowlist(t *testing.T) {
 		`"Read"`,
 		`"Edit"`,
 		`"Write"`,
+		`"Skill"`,
 		`"Bash(git:*)"`,
 		// Text-processing utilities Claude uses in pipelines.
 		`"Bash(sed:*)"`,
@@ -54,6 +55,7 @@ func TestEntrypointAllowlist(t *testing.T) {
 		`"Bash(sort:*)"`,
 		`"Bash(diff:*)"`,
 		`"Bash(xargs:*)"`,
+		`"Bash(printenv:*)"`,
 		`"mcp__contextmatrix__transition_card"`,
 	}
 	for _, tool := range mustHave {

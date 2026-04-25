@@ -34,6 +34,13 @@ type statusRequest struct {
 	Message      string `json:"message,omitempty"`
 }
 
+// skillEngagedRequest is the JSON body sent when the agent engages a skill.
+type skillEngagedRequest struct {
+	CardID    string `json:"card_id"`
+	Project   string `json:"project"`
+	SkillName string `json:"skill_name"`
+}
+
 // Client sends signed status callbacks to ContextMatrix.
 //
 // NOTE on apiKey usage: apiKey is the shared HMAC-SHA256 secret used for
@@ -159,6 +166,92 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 	}
 
 	return fmt.Errorf("callback failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// ReportSkillEngaged sends a skill-engagement notification to ContextMatrix.
+// The notification is HMAC-signed in the same scheme as ReportStatus and is
+// retried up to maxRetries times on server errors.
+func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillName string) error {
+	body, err := json.Marshal(skillEngagedRequest{
+		CardID:    cardID,
+		Project:   project,
+		SkillName: skillName,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal skill-engaged callback: %w", err)
+	}
+
+	skillPath, err := callbackSkillEngagedPath(c.contextMatrixURL)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+
+	for attempt := range maxRetries {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillPath, body, ts)
+
+		reqURL := c.contextMatrixURL + "/api/runner/skill-engaged"
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create skill-engaged request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
+		req.Header.Set(cmhmac.TimestampHeader, ts)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("send skill-engaged request: %w", err)
+		} else {
+			func() {
+				defer func() { _ = resp.Body.Close() }()
+
+				respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				if readErr != nil {
+					lastErr = fmt.Errorf("read skill-engaged response: %w", readErr)
+
+					return
+				}
+
+				if resp.StatusCode >= 400 {
+					lastErr = newError(reqURL, resp.StatusCode, respBody)
+				} else {
+					lastErr = nil
+				}
+			}()
+		}
+
+		if lastErr == nil {
+			return nil
+		}
+
+		if isClientError(lastErr) {
+			return lastErr
+		}
+
+		c.logger.Warn("skill-engaged callback failed, retrying",
+			"attempt", attempt+1,
+			"card_id", cardID,
+			"error", lastErr.Error(),
+		)
+
+		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		timer := time.NewTimer(backoff)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("skill-engaged callback failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 // Ping checks that ContextMatrix is reachable at the configured URL via a
@@ -321,6 +414,12 @@ func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts strin
 // base URL includes a trailing slash or a path prefix.
 func callbackStatusPath(contextMatrixURL string) (string, error) {
 	return derivePath(contextMatrixURL + "/api/runner/status")
+}
+
+// callbackSkillEngagedPath returns the path component of the CM
+// skill-engaged callback URL.
+func callbackSkillEngagedPath(contextMatrixURL string) (string, error) {
+	return derivePath(contextMatrixURL + "/api/runner/skill-engaged")
 }
 
 // verifyAutonomousPath returns the path component of the constructed

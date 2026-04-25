@@ -66,6 +66,11 @@ type Config struct {
 	// at /run/cm-secrets/env so the values never appear in HostConfig.Env
 	// (and therefore not in `docker inspect`). Should be on tmpfs.
 	SecretsDir string `yaml:"secrets_dir"`
+	// TaskSkillsDir is the host path to the curated task skills repo, bind-mounted
+	// read-only into worker containers at /host-skills. The entrypoint copies the
+	// resolved subset (per CM_TASK_SKILLS env var) into ~/.claude/skills. Empty
+	// disables the feature.
+	TaskSkillsDir string `yaml:"task_skills_dir"`
 
 	// Webhook replay-protection tunables. See CTXRUN-047.
 	WebhookReplayCacheSize   int `yaml:"webhook_replay_cache_size"`

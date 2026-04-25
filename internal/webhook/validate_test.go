@@ -378,6 +378,42 @@ func TestValidatePayload_UnknownTypeNoop(t *testing.T) {
 	require.NoError(t, ValidatePayload(nil))
 }
 
+// -----------------------------------------------------------------------------
+// task_skills
+// -----------------------------------------------------------------------------
+
+func TestValidateTaskSkills(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   []string
+		wantErr bool
+	}{
+		{"empty list ok", []string{}, false},
+		{"single valid", []string{"go-development"}, false},
+		{"multiple valid", []string{"go-development", "typescript-react", "code-review"}, false},
+		{"alphanumeric ok", []string{"abc123"}, false},
+		{"underscore ok", []string{"go_development"}, false},
+		{"dot ok", []string{"v1.0"}, false},
+		{"empty string rejected", []string{""}, true},
+		{"leading dash rejected", []string{"-go-development"}, true},
+		{"leading dot rejected", []string{".secret"}, true},
+		{"slash rejected (path traversal)", []string{"a/b"}, true},
+		{"dotdot rejected", []string{".."}, true},
+		{"space rejected", []string{"go development"}, true},
+		{"uppercase rejected", []string{"Go-Development"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := ValidateTaskSkills(c.input)
+			if c.wantErr {
+				assert.Error(t, err, "input %v", c.input)
+			} else {
+				assert.NoError(t, err, "input %v", c.input)
+			}
+		})
+	}
+}
+
 func TestValidationError_Message(t *testing.T) {
 	e := &ValidationError{Field: "card_id", Reason: "required"}
 	assert.Equal(t, "invalid card_id: required", e.Error())
