@@ -95,6 +95,7 @@ ALLOWED_TOOLS_COMMON=(
     "Bash(tail:*)"
     "Bash(wc:*)"
     "Bash(echo:*)"
+    "Bash(printenv:*)"
     "Bash(sed:*)"
     "Bash(awk:*)"
     "Bash(grep:*)"

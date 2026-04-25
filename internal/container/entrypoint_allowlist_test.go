@@ -55,6 +55,7 @@ func TestEntrypointAllowlist(t *testing.T) {
 		`"Bash(sort:*)"`,
 		`"Bash(diff:*)"`,
 		`"Bash(xargs:*)"`,
+		`"Bash(printenv:*)"`,
 		`"mcp__contextmatrix__transition_card"`,
 	}
 	for _, tool := range mustHave {
