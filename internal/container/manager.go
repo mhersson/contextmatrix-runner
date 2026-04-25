@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -106,6 +107,29 @@ var idleWatchdogCheckInterval = 30 * time.Second
 // Declared as a package var so tests can shrink it without waiting 5s of
 // wall time per synthetic-wedge scenario.
 var logDrainTimeout = 5 * time.Second
+
+// pullSkillsRepo runs `git pull --ff-only` in dir. Returns nil if dir is
+// not a git repo (caller may have a non-tracked local clone). Returns the
+// git error otherwise — caller should log and continue, not abort.
+var pullSkillsRepo = func(ctx context.Context, dir string) error {
+	gitDir := filepath.Join(dir, ".git")
+	if _, err := os.Stat(gitDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil // not tracked; skip
+		}
+
+		return fmt.Errorf("stat %s: %w", gitDir, err)
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "pull", "--ff-only")
+	out, err := cmd.CombinedOutput()
+
+	if err != nil {
+		return fmt.Errorf("git pull: %w (output: %s)", err, out)
+	}
+
+	return nil
+}
 
 // imagePruneMaxAge is the "until" filter passed to ImagesPrune so the
 // maintenance loop only reclaims images older than this. Keeping it at 24h
@@ -463,6 +487,13 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	}
 
 	if m.cfg.TaskSkillsDir != "" {
+		if err := pullSkillsRepo(ctx, m.cfg.TaskSkillsDir); err != nil {
+			slog.Warn("task skills pull failed; using existing local clone",
+				"task_skills_dir", m.cfg.TaskSkillsDir,
+				"error", err,
+			)
+		}
+
 		mounts = append(mounts, mount.Mount{
 			Type:     mount.TypeBind,
 			Source:   m.cfg.TaskSkillsDir,

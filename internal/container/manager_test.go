@@ -3473,3 +3473,124 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 		}
 	})
 }
+
+func TestContainerCreate_TaskSkillsPull(t *testing.T) {
+	// runWithPullStub builds a manager, swaps pullSkillsRepo with stub, runs
+	// one container creation, and returns whatever stub recorded.
+	runWithPullStub := func(t *testing.T, cfg *config.Config, payload RunConfig, stub func(context.Context, string) error) (calls []string) {
+		t.Helper()
+
+		orig := pullSkillsRepo
+		t.Cleanup(func() { pullSkillsRepo = orig })
+
+		pullSkillsRepo = func(ctx context.Context, dir string) error {
+			calls = append(calls, dir)
+			return stub(ctx, dir)
+		}
+
+		mock := successfulMock()
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		t.Cleanup(cbSrv.Close)
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		return calls
+	}
+
+	t.Run("pull invoked when task_skills_dir configured", func(t *testing.T) {
+		dir := t.TempDir()
+		// Create a fake .git directory so pullSkillsRepo is not short-circuited
+		// by the real implementation (tests stub it, but the dir check is in
+		// the stub for this test to exercise the wiring path).
+		cfg := testConfig()
+		cfg.TaskSkillsDir = dir
+
+		calls := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _ string) error {
+			return nil
+		})
+
+		require.Len(t, calls, 1, "pull must be called exactly once")
+		assert.Equal(t, dir, calls[0])
+	})
+
+	t.Run("pull failure does not abort container creation", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := testConfig()
+		cfg.TaskSkillsDir = dir
+
+		// Stub returns an error; container creation must still complete.
+		var containerCreated bool
+
+		orig := pullSkillsRepo
+		t.Cleanup(func() { pullSkillsRepo = orig })
+
+		pullSkillsRepo = func(_ context.Context, _ string) error {
+			return fmt.Errorf("git pull: exit status 1")
+		}
+
+		mock := successfulMock()
+		mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			containerCreated = true
+			return container.CreateResponse{ID: "pull-fail-ctr"}, nil
+		}
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		t.Cleanup(cbSrv.Close)
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+
+		payload := testPayload()
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		assert.True(t, containerCreated, "container must still be created even when pull fails")
+	})
+
+	t.Run("no pull when task_skills_dir empty", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TaskSkillsDir = ""
+
+		calls := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _ string) error {
+			return nil
+		})
+
+		assert.Empty(t, calls, "pull must not be called when TaskSkillsDir is empty")
+	})
+
+	t.Run("no pull when dir is not a git repo", func(t *testing.T) {
+		// Use the real pullSkillsRepo (not a stub) against a real dir that has
+		// no .git entry — the implementation must return nil silently.
+		dir := t.TempDir() // exists, but no .git inside
+
+		err := pullSkillsRepo(context.Background(), dir)
+		assert.NoError(t, err, "pullSkillsRepo must return nil when dir is not a git repo")
+	})
+}
