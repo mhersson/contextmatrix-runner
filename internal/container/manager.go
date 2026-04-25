@@ -1109,7 +1109,18 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 			m.broadcaster.Publish(e)
 		}
 
-		logparser.ProcessStreamWithRedactor(stdoutPr, log, redactor, emit, nil)
+		onSkillEngaged := func(evt *logparser.SkillEngagedEvent) {
+			go func() {
+				cbCtx, cancel := context.WithTimeout(context.Background(), callbackTimeout)
+				defer cancel()
+
+				if err := m.callback.ReportSkillEngaged(cbCtx, payload.CardID, payload.Project, evt.SkillName); err != nil {
+					log.Warn("skill-engaged callback failed", "skill", evt.SkillName, "error", err)
+				}
+			}()
+		}
+
+		logparser.ProcessStreamWithRedactor(stdoutPr, log, redactor, emit, onSkillEngaged)
 	}()
 
 	return done
