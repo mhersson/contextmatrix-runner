@@ -17,10 +17,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	githubauth "github.com/mhersson/contextmatrix-githubauth"
+
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
-	"github.com/mhersson/contextmatrix-runner/internal/github"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 	"github.com/mhersson/contextmatrix-runner/internal/preflight"
@@ -101,35 +102,38 @@ func main() {
 	}
 
 	// Select GitHub auth provider based on config.
-	var tokenProvider github.TokenGenerator
+	var tokenProvider githubauth.TokenGenerator
 
-	switch {
-	case cfg.GitHubPAT.Token != "":
-		tp, err := github.NewPATProvider(cfg.GitHubPAT.Token)
-		if err != nil {
-			logger.Error("failed to create GitHub PAT provider", "error", err)
-			os.Exit(1)
-		}
-
-		tokenProvider = tp
-
-		logger.Info("github auth mode", "mode", "pat")
-	default:
-		tp, err := github.NewTokenProvider(
-			cfg.GitHubApp.AppID,
-			cfg.GitHubApp.InstallationID,
-			cfg.GitHubApp.PrivateKeyPath,
-			github.WithAPIBaseURL(cfg.GitHubApp.APIBaseURL),
+	switch cfg.GitHub.AuthMode {
+	case "app":
+		tp, err := githubauth.NewAppProvider(
+			cfg.GitHub.App.AppID,
+			cfg.GitHub.App.InstallationID,
+			cfg.GitHub.App.PrivateKeyPath,
+			githubauth.WithAPIBaseURL(cfg.GitHub.APIBaseURL),
 		)
 		if err != nil {
-			logger.Error("failed to create GitHub token provider", "error", err)
+			slog.Error("failed to construct GitHub App provider", "error", err)
 			os.Exit(1)
 		}
 
 		tokenProvider = tp
+	case "pat":
+		tp, err := githubauth.NewPATProvider(cfg.GitHub.PAT.Token)
+		if err != nil {
+			slog.Error("failed to construct GitHub PAT provider", "error", err)
+			os.Exit(1)
+		}
 
-		logger.Info("github auth mode", "mode", "app")
+		tokenProvider = tp
+	default:
+		slog.Error("unreachable: invalid auth_mode after Validate()", "value", cfg.GitHub.AuthMode)
+		os.Exit(1)
 	}
+
+	slog.Info("github token provider initialized", "auth_mode", cfg.GitHub.AuthMode)
+	// NOTE: NOT wrapped in CachingProvider — runner mints fresh per spawn
+	// (tokens hand off to long-lived worker containers; freshness at delivery matters).
 
 	// Core components.
 	defer func() { _ = docker.Close() }()
@@ -533,11 +537,11 @@ func runMaintenanceTick(ctx context.Context, mgr maintenanceTarget, logger *slog
 // dependencies. Kept as a small helper so the preflight package stays
 // decoupled from config / client types, and so TestMain-style tests can
 // substitute their own Probes struct without going through this helper.
-func buildProbes(cfg *config.Config, docker container.DockerClient, tokenProvider github.TokenGenerator, cb *callback.Client) preflight.Probes {
+func buildProbes(cfg *config.Config, docker container.DockerClient, tokenProvider githubauth.TokenGenerator, cb *callback.Client) preflight.Probes {
 	probes := preflight.Probes{
 		DockerPing: docker.Ping,
 		GitHubToken: func(ctx context.Context) error {
-			_, err := tokenProvider.GenerateToken(ctx)
+			_, _, err := tokenProvider.GenerateToken(ctx)
 
 			return err
 		},

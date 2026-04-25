@@ -141,38 +141,36 @@ anthropic_api_key: ""
 # Env: CMR_CLAUDE_SETTINGS
 # claude_settings: '{"includeCoAuthoredBy":false,"enabledPlugins":{"gopls-lsp@claude-plugins-official":true,"typescript-lsp@claude-plugins-official":true}}'
 
-# ----- GitHub App (Git Credentials) -----
-# The runner uses a GitHub App to generate short-lived installation tokens
-# for git clone/push operations. See README.md for setup instructions.
+# GitHub authentication. Used to clone project repositories into worker
+# containers and (via the bind-mounted credential helper) for any git or
+# `gh` CLI operations the worker performs.
+github:
+  # Auth method. Allowed values: "app" (recommended) | "pat"
+  # Env: CMR_GITHUB_AUTH_MODE
+  auth_mode: "app"
 
-github_app:
-  # GitHub App ID (shown on the App's settings page).
-  # Env: CMR_GITHUB_APP_ID
-  app_id: 0
+  # GitHub Enterprise hostname. Leave empty for github.com.
+  # Env: CMR_GITHUB_HOST
+  host: ""
 
-  # Installation ID (visible in the URL after installing the App).
-  # Env: CMR_GITHUB_INSTALLATION_ID
-  installation_id: 0
-
-  # Path to the App's PEM private key file.
-  # Env: CMR_GITHUB_PRIVATE_KEY_PATH
-  private_key_path: ""
-
-  # GitHub API base URL. Leave empty for github.com (https://api.github.com).
-  # Set for GitHub Enterprise Cloud with Data Residency (GHEC-DR) or GHES.
+  # GitHub API base URL. When empty, derived from host.
   # Env: CMR_GITHUB_API_BASE_URL
-  # api_base_url: "https://api.acme.ghe.com"  # GHEC-DR or GHES API endpoint (optional)
+  api_base_url: ""
 
-# ----- GitHub PAT (alternative to GitHub App) -----
-# Use a fine-grained personal access token instead of a GitHub App.
-# Useful in enterprise environments where GitHub App creation is restricted.
-# MUTUALLY EXCLUSIVE with github_app — configure exactly one.
-# Required fine-grained PAT scopes: contents: write, pull_requests: write.
+  # GitHub App credentials. Required when auth_mode is "app".
+  app:
+    # Env: CMR_GITHUB_APP_ID
+    app_id: 0
+    # Env: CMR_GITHUB_INSTALLATION_ID
+    installation_id: 0
+    # Env: CMR_GITHUB_PRIVATE_KEY_PATH
+    private_key_path: ""
 
-# github_pat:
-#   # Fine-grained personal access token.
-#   # Env: CMR_GITHUB_PAT_TOKEN
-#   token: ""
+  # Fine-grained PAT (alternative to GitHub App).
+  # Mutually exclusive with app.*.
+  pat:
+    # Env: CMR_GITHUB_PAT_TOKEN
+    token: ""
 
 # ----- Webhook replay protection (CTXRUN-047) -----
 

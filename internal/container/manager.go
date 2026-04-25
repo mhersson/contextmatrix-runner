@@ -31,9 +31,10 @@ import (
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/pkg/stdcopy"
 
+	githubauth "github.com/mhersson/contextmatrix-githubauth"
+
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
-	"github.com/mhersson/contextmatrix-runner/internal/github"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/logparser"
 	"github.com/mhersson/contextmatrix-runner/internal/metrics"
@@ -170,7 +171,7 @@ type Manager struct {
 	docker      DockerClient
 	tracker     *tracker.Tracker
 	callback    *callback.Client
-	token       github.TokenGenerator
+	token       githubauth.TokenGenerator
 	broadcaster *logbroadcast.Broadcaster
 	cfg         *config.Config
 	logger      *slog.Logger
@@ -205,7 +206,7 @@ func NewManager(
 	docker DockerClient,
 	tracker *tracker.Tracker,
 	cb *callback.Client,
-	token github.TokenGenerator,
+	token githubauth.TokenGenerator,
 	broadcaster *logbroadcast.Broadcaster,
 	cfg *config.Config,
 	logger *slog.Logger,
@@ -413,8 +414,9 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		return "", secretDelivery{}, nil, err
 	}
 
-	// Generate GitHub App token.
-	gitToken, err := m.token.GenerateToken(ctx)
+	// Generate GitHub App token. Expiry is discarded for now — the runner
+	// mints fresh per spawn and hands the token off to the container.
+	gitToken, _, err := m.token.GenerateToken(ctx)
 	if err != nil {
 		return "", secretDelivery{}, nil, fmt.Errorf("generate git token: %w", err)
 	}

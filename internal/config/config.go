@@ -41,26 +41,25 @@ type UnpinnedImageRef struct {
 
 // Config holds all runner configuration.
 type Config struct {
-	Port                      int       `yaml:"port"`
-	AdminPort                 int       `yaml:"admin_port"`
-	ContextMatrixURL          string    `yaml:"contextmatrix_url"`
-	ContainerContextMatrixURL string    `yaml:"container_contextmatrix_url"`
-	APIKey                    string    `yaml:"api_key"`
-	BaseImage                 string    `yaml:"base_image"`
-	AllowedImages             []string  `yaml:"allowed_images"`
-	ImagePullPolicy           string    `yaml:"image_pull_policy"`
-	MaxConcurrent             int       `yaml:"max_concurrent"`
-	ContainerTimeout          string    `yaml:"container_timeout"`
-	ContainerMemoryLimit      int64     `yaml:"container_memory_limit"`
-	ContainerPidsLimit        int64     `yaml:"container_pids_limit"`
-	ClaudeAuthDir             string    `yaml:"claude_auth_dir"`
-	ClaudeOAuthToken          string    `yaml:"claude_oauth_token"`
-	AnthropicAPIKey           string    `yaml:"anthropic_api_key"`
-	ClaudeSettings            string    `yaml:"claude_settings"`
-	GitHubApp                 GitHubApp `yaml:"github_app"`
-	GitHubPAT                 GitHubPAT `yaml:"github_pat"`
-	LogLevel                  string    `yaml:"log_level"`
-	LogFormat                 string    `yaml:"log_format"`
+	Port                      int          `yaml:"port"`
+	AdminPort                 int          `yaml:"admin_port"`
+	ContextMatrixURL          string       `yaml:"contextmatrix_url"`
+	ContainerContextMatrixURL string       `yaml:"container_contextmatrix_url"`
+	APIKey                    string       `yaml:"api_key"`
+	BaseImage                 string       `yaml:"base_image"`
+	AllowedImages             []string     `yaml:"allowed_images"`
+	ImagePullPolicy           string       `yaml:"image_pull_policy"`
+	MaxConcurrent             int          `yaml:"max_concurrent"`
+	ContainerTimeout          string       `yaml:"container_timeout"`
+	ContainerMemoryLimit      int64        `yaml:"container_memory_limit"`
+	ContainerPidsLimit        int64        `yaml:"container_pids_limit"`
+	ClaudeAuthDir             string       `yaml:"claude_auth_dir"`
+	ClaudeOAuthToken          string       `yaml:"claude_oauth_token"`
+	AnthropicAPIKey           string       `yaml:"anthropic_api_key"`
+	ClaudeSettings            string       `yaml:"claude_settings"`
+	GitHub                    GitHubConfig `yaml:"github"`
+	LogLevel                  string       `yaml:"log_level"`
+	LogFormat                 string       `yaml:"log_format"`
 	// SecretsDir is the host directory where per-container secrets files
 	// are written. Each file is bind-mounted read-only into its container
 	// at /run/cm-secrets/env so the values never appear in HostConfig.Env
@@ -121,18 +120,26 @@ const (
 	LogFormatJSON = "json"
 )
 
-// GitHubApp holds GitHub App credentials for generating installation tokens.
-type GitHubApp struct {
+// GitHubAppConfig holds GitHub App credentials for generating installation tokens.
+type GitHubAppConfig struct {
 	AppID          int64  `yaml:"app_id"`
 	InstallationID int64  `yaml:"installation_id"`
 	PrivateKeyPath string `yaml:"private_key_path"`
-	APIBaseURL     string `yaml:"api_base_url"`
 }
 
-// GitHubPAT holds a fine-grained personal access token used instead of a
+// GitHubPATConfig holds a fine-grained personal access token used instead of a
 // GitHub App in enterprise environments where App creation is restricted.
-type GitHubPAT struct {
+type GitHubPATConfig struct {
 	Token string `yaml:"token"`
+}
+
+// GitHubConfig is the unified GitHub auth block. Set AuthMode to "app" or "pat".
+type GitHubConfig struct {
+	AuthMode   string          `yaml:"auth_mode"`    // "app" | "pat"
+	Host       string          `yaml:"host"`         // optional GHE/GHEC-DR host
+	APIBaseURL string          `yaml:"api_base_url"` // optional override
+	App        GitHubAppConfig `yaml:"app"`
+	PAT        GitHubPATConfig `yaml:"pat"`
 }
 
 // Load reads a YAML config file and applies environment variable overrides.
@@ -412,18 +419,37 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("claude_settings is not valid JSON")
 	}
 
-	appConfigured := c.GitHubApp.AppID != 0 || c.GitHubApp.InstallationID != 0 || c.GitHubApp.PrivateKeyPath != ""
-
-	patConfigured := c.GitHubPAT.Token != ""
-	switch {
-	case appConfigured && patConfigured:
-		return fmt.Errorf("exactly one of github_app or github_pat may be configured")
-	case !appConfigured && !patConfigured:
-		return fmt.Errorf("either github_app or github_pat is required")
-	case appConfigured:
-		if err := c.GitHubApp.validate(); err != nil {
-			return fmt.Errorf("github_app: %w", err)
+	switch c.GitHub.AuthMode {
+	case "app":
+		if c.GitHub.App.AppID == 0 {
+			return fmt.Errorf("github.app.app_id is required when github.auth_mode is \"app\"")
 		}
+
+		if c.GitHub.App.InstallationID == 0 {
+			return fmt.Errorf("github.app.installation_id is required when github.auth_mode is \"app\"")
+		}
+
+		if c.GitHub.App.PrivateKeyPath == "" {
+			return fmt.Errorf("github.app.private_key_path is required when github.auth_mode is \"app\"")
+		}
+
+		if _, err := os.Stat(c.GitHub.App.PrivateKeyPath); err != nil {
+			return fmt.Errorf("github.app.private_key_path does not exist: %w", err)
+		}
+
+		if c.GitHub.PAT.Token != "" {
+			return fmt.Errorf("github.pat.token must be empty when github.auth_mode is \"app\"")
+		}
+	case "pat":
+		if c.GitHub.PAT.Token == "" {
+			return fmt.Errorf("github.pat.token is required when github.auth_mode is \"pat\"")
+		}
+
+		if c.GitHub.App.AppID != 0 || c.GitHub.App.InstallationID != 0 || c.GitHub.App.PrivateKeyPath != "" {
+			return fmt.Errorf("github.app.* must be empty when github.auth_mode is \"pat\"")
+		}
+	default:
+		return fmt.Errorf("github.auth_mode is required: must be \"app\" or \"pat\" (got %q)", c.GitHub.AuthMode)
 	}
 
 	return nil
@@ -454,26 +480,6 @@ func requireDigestPin(field, image string) error {
 		default:
 			return fmt.Errorf("%s has non-hex characters in sha256 digest: %q", field, image)
 		}
-	}
-
-	return nil
-}
-
-func (g *GitHubApp) validate() error {
-	if g.AppID == 0 {
-		return fmt.Errorf("app_id is required")
-	}
-
-	if g.InstallationID == 0 {
-		return fmt.Errorf("installation_id is required")
-	}
-
-	if g.PrivateKeyPath == "" {
-		return fmt.Errorf("private_key_path is required")
-	}
-
-	if _, err := os.Stat(g.PrivateKeyPath); err != nil {
-		return fmt.Errorf("private_key_path does not exist: %w", err)
 	}
 
 	return nil
@@ -544,28 +550,36 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.ClaudeSettings = v
 	}
 
+	if v := os.Getenv("CMR_GITHUB_AUTH_MODE"); v != "" {
+		cfg.GitHub.AuthMode = v
+	}
+
+	if v := os.Getenv("CMR_GITHUB_HOST"); v != "" {
+		cfg.GitHub.Host = v
+	}
+
+	if v := os.Getenv("CMR_GITHUB_API_BASE_URL"); v != "" {
+		cfg.GitHub.APIBaseURL = v
+	}
+
 	if v := os.Getenv("CMR_GITHUB_APP_ID"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			cfg.GitHubApp.AppID = n
+			cfg.GitHub.App.AppID = n
 		}
 	}
 
 	if v := os.Getenv("CMR_GITHUB_INSTALLATION_ID"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			cfg.GitHubApp.InstallationID = n
+			cfg.GitHub.App.InstallationID = n
 		}
 	}
 
 	if v := os.Getenv("CMR_GITHUB_PRIVATE_KEY_PATH"); v != "" {
-		cfg.GitHubApp.PrivateKeyPath = v
-	}
-
-	if v := os.Getenv("CMR_GITHUB_API_BASE_URL"); v != "" {
-		cfg.GitHubApp.APIBaseURL = v
+		cfg.GitHub.App.PrivateKeyPath = v
 	}
 
 	if v := os.Getenv("CMR_GITHUB_PAT_TOKEN"); v != "" {
-		cfg.GitHubPAT.Token = v
+		cfg.GitHub.PAT.Token = v
 	}
 
 	if v := os.Getenv("CMR_LOG_LEVEL"); v != "" {

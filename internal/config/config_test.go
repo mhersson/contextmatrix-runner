@@ -95,10 +95,12 @@ contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "` + claudeDir + `"
-github_app:
-  app_id: 12345
-  installation_id: 67890
-  private_key_path: "` + pemPath + `"
+github:
+  auth_mode: "app"
+  app:
+    app_id: 12345
+    installation_id: 67890
+    private_key_path: "` + pemPath + `"
 `
 }
 
@@ -118,9 +120,10 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, 3, cfg.MaxConcurrent)
 	assert.Equal(t, "2h", cfg.ContainerTimeout)
 	assert.Equal(t, "info", cfg.LogLevel)
-	assert.Equal(t, int64(12345), cfg.GitHubApp.AppID)
-	assert.Equal(t, int64(67890), cfg.GitHubApp.InstallationID)
-	assert.Equal(t, pemPath, cfg.GitHubApp.PrivateKeyPath)
+	assert.Equal(t, "app", cfg.GitHub.AuthMode)
+	assert.Equal(t, int64(12345), cfg.GitHub.App.AppID)
+	assert.Equal(t, int64(67890), cfg.GitHub.App.InstallationID)
+	assert.Equal(t, pemPath, cfg.GitHub.App.PrivateKeyPath)
 }
 
 func TestLoad_Defaults(t *testing.T) {
@@ -179,10 +182,13 @@ func TestValidate_ContainerContextMatrixURL_DefaultsToContextMatrixURL(t *testin
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
 		AnthropicAPIKey:  "sk-ant-test",
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 	require.NoError(t, cfg.Validate())
@@ -202,10 +208,13 @@ func TestValidate_ContainerContextMatrixURL_ExplicitValuePreserved(t *testing.T)
 		MaxConcurrent:             1,
 		ContainerTimeout:          "1h",
 		AnthropicAPIKey:           "sk-ant-test",
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 	require.NoError(t, cfg.Validate())
@@ -241,10 +250,13 @@ func TestValidate_ServiceURLValidation(t *testing.T) {
 				MaxConcurrent:    1,
 				ContainerTimeout: "1h",
 				AnthropicAPIKey:  "sk-ant-test",
-				GitHubApp: GitHubApp{
-					AppID:          1,
-					InstallationID: 1,
-					PrivateKeyPath: pemPath,
+				GitHub: GitHubConfig{
+					AuthMode: "app",
+					App: GitHubAppConfig{
+						AppID:          1,
+						InstallationID: 1,
+						PrivateKeyPath: pemPath,
+					},
 				},
 			}
 
@@ -272,10 +284,13 @@ func TestValidate_ContainerContextMatrixURL_InvalidExplicitValue(t *testing.T) {
 		MaxConcurrent:             1,
 		ContainerTimeout:          "1h",
 		AnthropicAPIKey:           "sk-ant-test",
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 	err := cfg.Validate()
@@ -315,10 +330,13 @@ func TestValidate_NoCCAuth(t *testing.T) {
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 	err := cfg.Validate()
@@ -337,10 +355,13 @@ func TestValidate_AnthropicAPIKeyAlone(t *testing.T) {
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
 		AnthropicAPIKey:  "sk-ant-test",
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 	err := cfg.Validate()
@@ -359,10 +380,13 @@ func TestValidate_ClaudeOAuthTokenAlone(t *testing.T) {
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
 		ClaudeOAuthToken: "oauth-token-value",
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 	err := cfg.Validate()
@@ -381,10 +405,13 @@ func TestValidate_AuthMethodsSatisfyRequirement(t *testing.T) {
 			ImagePullPolicy:  PullAlways,
 			MaxConcurrent:    1,
 			ContainerTimeout: "1h",
-			GitHubApp: GitHubApp{
-				AppID:          1,
-				InstallationID: 1,
-				PrivateKeyPath: pemPath,
+			GitHub: GitHubConfig{
+				AuthMode: "app",
+				App: GitHubAppConfig{
+					AppID:          1,
+					InstallationID: 1,
+					PrivateKeyPath: pemPath,
+				},
 			},
 		}
 	}
@@ -446,10 +473,12 @@ func TestLoad_ClaudeOAuthTokenEnvOverride(t *testing.T) {
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-github_app:
-  app_id: 12345
-  installation_id: 67890
-  private_key_path: "` + pemPath + `"
+github:
+  auth_mode: "app"
+  app:
+    app_id: 12345
+    installation_id: 67890
+    private_key_path: "` + pemPath + `"
 `
 	path := writeConfig(t, dir, content)
 
@@ -477,7 +506,7 @@ func TestValidate_InvalidContainerTimeout(t *testing.T) {
 func TestValidate_GitHubAppMissingFields(t *testing.T) {
 	dir := t.TempDir()
 
-	// Neither App nor PAT configured → "either ... is required".
+	// auth_mode "app" with missing fields — each field required.
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -486,23 +515,22 @@ func TestValidate_GitHubAppMissingFields(t *testing.T) {
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
 		AnthropicAPIKey:  "sk-ant-test",
-		GitHubApp:        GitHubApp{},
+		GitHub:           GitHubConfig{AuthMode: "app"},
 	}
 	err := cfg.Validate()
-	require.ErrorContains(t, err, "either github_app or github_pat is required")
+	require.ErrorContains(t, err, "github.app.app_id is required")
 
-	// Once any App field is set the App path is taken — missing fields surface.
-	cfg.GitHubApp.AppID = 1
+	cfg.GitHub.App.AppID = 1
 	err = cfg.Validate()
-	require.ErrorContains(t, err, "github_app: installation_id is required")
+	require.ErrorContains(t, err, "github.app.installation_id is required")
 
-	cfg.GitHubApp.InstallationID = 1
+	cfg.GitHub.App.InstallationID = 1
 	err = cfg.Validate()
-	require.ErrorContains(t, err, "github_app: private_key_path is required")
+	require.ErrorContains(t, err, "github.app.private_key_path is required")
 
-	cfg.GitHubApp.PrivateKeyPath = filepath.Join(dir, "nonexistent.pem")
+	cfg.GitHub.App.PrivateKeyPath = filepath.Join(dir, "nonexistent.pem")
 	err = cfg.Validate()
-	assert.ErrorContains(t, err, "private_key_path does not exist")
+	assert.ErrorContains(t, err, "github.app.private_key_path does not exist")
 }
 
 func TestContainerTimeoutDuration(t *testing.T) {
@@ -517,10 +545,13 @@ func TestContainerTimeoutDuration(t *testing.T) {
 		MaxConcurrent:    1,
 		ContainerTimeout: "2h",
 		AnthropicAPIKey:  "sk-ant-test",
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 	require.NoError(t, cfg.Validate())
@@ -540,10 +571,13 @@ func TestValidate_ClaudeSettings(t *testing.T) {
 			MaxConcurrent:    1,
 			ContainerTimeout: "1h",
 			AnthropicAPIKey:  "sk-ant-test",
-			GitHubApp: GitHubApp{
-				AppID:          1,
-				InstallationID: 1,
-				PrivateKeyPath: pemPath,
+			GitHub: GitHubConfig{
+				AuthMode: "app",
+				App: GitHubAppConfig{
+					AppID:          1,
+					InstallationID: 1,
+					PrivateKeyPath: pemPath,
+				},
 			},
 		}
 	}
@@ -626,16 +660,18 @@ contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "` + dir + `"
-github_app:
-  app_id: 12345
-  installation_id: 67890
-  private_key_path: "` + pemPath + `"
+github:
+  auth_mode: "app"
   api_base_url: "https://api.acme.ghe.com"
+  app:
+    app_id: 12345
+    installation_id: 67890
+    private_key_path: "` + pemPath + `"
 `
 	path := writeConfig(t, dir, content)
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, "https://api.acme.ghe.com", cfg.GitHubApp.APIBaseURL)
+	assert.Equal(t, "https://api.acme.ghe.com", cfg.GitHub.APIBaseURL)
 }
 
 func TestLoad_GitHubApp_APIBaseURL_EnvOverride(t *testing.T) {
@@ -647,11 +683,13 @@ contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "` + dir + `"
-github_app:
-  app_id: 12345
-  installation_id: 67890
-  private_key_path: "` + pemPath + `"
+github:
+  auth_mode: "app"
   api_base_url: "https://api.yaml.example"
+  app:
+    app_id: 12345
+    installation_id: 67890
+    private_key_path: "` + pemPath + `"
 `
 	path := writeConfig(t, dir, content)
 
@@ -659,7 +697,7 @@ github_app:
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, "https://api.env.example", cfg.GitHubApp.APIBaseURL)
+	assert.Equal(t, "https://api.env.example", cfg.GitHub.APIBaseURL)
 }
 
 func TestLoad_GitHubApp_APIBaseURL_Default(t *testing.T) {
@@ -670,7 +708,7 @@ func TestLoad_GitHubApp_APIBaseURL_Default(t *testing.T) {
 	path := writeConfig(t, dir, validConfig(pemPath, dir))
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Empty(t, cfg.GitHubApp.APIBaseURL)
+	assert.Empty(t, cfg.GitHub.APIBaseURL)
 }
 
 func TestLogLevelSlog(t *testing.T) {
@@ -712,79 +750,84 @@ func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		app         GitHubApp
-		pat         GitHubPAT
+		github      GitHubConfig
 		wantErr     bool
 		errContains string
 	}{
 		{
 			name: "app-only configured is valid",
-			app: GitHubApp{
-				AppID:          1,
-				InstallationID: 1,
-				PrivateKeyPath: pemPath,
+			github: GitHubConfig{
+				AuthMode: "app",
+				App: GitHubAppConfig{
+					AppID:          1,
+					InstallationID: 1,
+					PrivateKeyPath: pemPath,
+				},
 			},
-			pat:     GitHubPAT{},
 			wantErr: false,
 		},
 		{
-			name:    "pat-only configured is valid",
-			app:     GitHubApp{},
-			pat:     GitHubPAT{Token: "ghp_testtoken"},
-			wantErr: false,
-		},
-		{
-			name: "both configured is an error",
-			app: GitHubApp{
-				AppID:          1,
-				InstallationID: 1,
-				PrivateKeyPath: pemPath,
+			name: "pat-only configured is valid",
+			github: GitHubConfig{
+				AuthMode: "pat",
+				PAT:      GitHubPATConfig{Token: "ghp_testtoken"},
 			},
-			pat:         GitHubPAT{Token: "ghp_testtoken"},
-			wantErr:     true,
-			errContains: "exactly one of github_app or github_pat may be configured",
-		},
-		{
-			name:        "neither configured is an error",
-			app:         GitHubApp{},
-			pat:         GitHubPAT{},
-			wantErr:     true,
-			errContains: "either github_app or github_pat is required",
-		},
-		{
-			name:    "pat-only does not trigger GitHubApp.validate errors",
-			app:     GitHubApp{}, // missing app_id etc. — should NOT surface
-			pat:     GitHubPAT{Token: "ghp_patonly"},
 			wantErr: false,
 		},
 		{
-			name:        "any app field set counts as app-configured (app_id only)",
-			app:         GitHubApp{AppID: 1}, // partial — triggers validate()
-			pat:         GitHubPAT{},
+			name: "app mode with pat.token set is an error",
+			github: GitHubConfig{
+				AuthMode: "app",
+				App: GitHubAppConfig{
+					AppID:          1,
+					InstallationID: 1,
+					PrivateKeyPath: pemPath,
+				},
+				PAT: GitHubPATConfig{Token: "ghp_testtoken"},
+			},
 			wantErr:     true,
-			errContains: "github_app: installation_id is required",
+			errContains: "github.pat.token must be empty when github.auth_mode is \"app\"",
 		},
 		{
-			name:        "any app field set counts as app-configured (installation_id only)",
-			app:         GitHubApp{InstallationID: 1}, // partial — triggers validate()
-			pat:         GitHubPAT{},
+			name:        "empty auth_mode is an error",
+			github:      GitHubConfig{},
 			wantErr:     true,
-			errContains: "github_app: app_id is required",
+			errContains: "github.auth_mode is required",
 		},
 		{
-			name:        "any app field set counts as app-configured (private_key_path only)",
-			app:         GitHubApp{PrivateKeyPath: "/tmp/key.pem"}, // partial — triggers validate()
-			pat:         GitHubPAT{},
+			name: "pat mode with app fields set is an error",
+			github: GitHubConfig{
+				AuthMode: "pat",
+				PAT:      GitHubPATConfig{Token: "ghp_patonly"},
+				App:      GitHubAppConfig{AppID: 1},
+			},
 			wantErr:     true,
-			errContains: "github_app: app_id is required",
+			errContains: "github.app.* must be empty when github.auth_mode is \"pat\"",
+		},
+		{
+			name: "app mode missing installation_id",
+			github: GitHubConfig{
+				AuthMode: "app",
+				App:      GitHubAppConfig{AppID: 1},
+			},
+			wantErr:     true,
+			errContains: "github.app.installation_id is required",
+		},
+		{
+			name: "app mode missing private_key_path",
+			github: GitHubConfig{
+				AuthMode: "app",
+				App:      GitHubAppConfig{AppID: 1, InstallationID: 1},
+			},
+			wantErr:     true,
+			errContains: "github.app.private_key_path is required",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseValidConfigNoGitHub(t)
-			cfg.GitHubApp = tt.app
-			cfg.GitHubPAT = tt.pat
+			cfg.GitHub = tt.github
 
 			err := cfg.Validate()
 			if tt.wantErr {
@@ -801,7 +844,7 @@ func TestValidate_ReplayCacheDefaultsWhenUnset(t *testing.T) {
 	// A Config literal that leaves the new CTXRUN-047 tunables at zero
 	// must validate and receive the documented defaults.
 	cfg := baseValidConfigNoGitHub(t)
-	cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+	cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 
 	require.NoError(t, cfg.Validate())
 
@@ -850,7 +893,7 @@ func TestValidate_ReplayCacheRejectsNegative(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := baseValidConfigNoGitHub(t)
-			cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+			cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 			tc.mutate(cfg)
 			err := cfg.Validate()
 			require.Error(t, err)
@@ -871,11 +914,13 @@ anthropic_api_key: "sk-ant-test"
 `
 	path := writeConfig(t, dir, content)
 
+	t.Setenv("CMR_GITHUB_AUTH_MODE", "pat")
 	t.Setenv("CMR_GITHUB_PAT_TOKEN", "ghp_envtoken123")
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, "ghp_envtoken123", cfg.GitHubPAT.Token)
+	assert.Equal(t, "pat", cfg.GitHub.AuthMode)
+	assert.Equal(t, "ghp_envtoken123", cfg.GitHub.PAT.Token)
 }
 
 func TestLoad_GitHubPAT_YAMLOverriddenByEnv(t *testing.T) {
@@ -886,8 +931,10 @@ contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 anthropic_api_key: "sk-ant-test"
-github_pat:
-  token: "ghp_fromyaml"
+github:
+  auth_mode: "pat"
+  pat:
+    token: "ghp_fromyaml"
 `
 	path := writeConfig(t, dir, content)
 
@@ -895,7 +942,7 @@ github_pat:
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, "ghp_fromenv", cfg.GitHubPAT.Token)
+	assert.Equal(t, "ghp_fromenv", cfg.GitHub.PAT.Token)
 }
 
 // TestValidate_BaseImageDigestPin covers the CTXRUN-044 requirement that
@@ -944,7 +991,7 @@ func TestValidate_BaseImageDigestPin(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseValidConfigNoGitHub(t)
-			cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+			cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 			cfg.BaseImage = tt.image
 
 			err := cfg.Validate()
@@ -1055,10 +1102,13 @@ func baseDevConfig(t *testing.T, pemPath string) *Config {
 		ContainerTimeout:  "1h",
 		AnthropicAPIKey:   "sk-ant-test",
 		DeploymentProfile: ProfileDev,
-		GitHubApp: GitHubApp{
-			AppID:          1,
-			InstallationID: 1,
-			PrivateKeyPath: pemPath,
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
 		},
 	}
 }
@@ -1110,10 +1160,13 @@ func TestValidate_Production_UnpinnedBaseImageFails(t *testing.T) {
 	pemPath := writePEM(t, dir)
 
 	cfg := baseValidConfigNoGitHub(t)
-	cfg.GitHubApp = GitHubApp{
-		AppID:          1,
-		InstallationID: 1,
-		PrivateKeyPath: pemPath,
+	cfg.GitHub = GitHubConfig{
+		AuthMode: "app",
+		App: GitHubAppConfig{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
 	}
 	cfg.BaseImage = "contextmatrix/worker:latest"
 	// DeploymentProfile is zero-value ("") which Validate normalises to production.
@@ -1172,14 +1225,14 @@ func TestValidate_AllowedImagesDigestPin(t *testing.T) {
 
 	t.Run("all digest-pinned entries pass", func(t *testing.T) {
 		cfg := baseValidConfigNoGitHub(t)
-		cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+		cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 		cfg.AllowedImages = []string{testDigestImage, validDigest}
 		assert.NoError(t, cfg.Validate())
 	})
 
 	t.Run("one tag-only entry fails", func(t *testing.T) {
 		cfg := baseValidConfigNoGitHub(t)
-		cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+		cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 		cfg.AllowedImages = []string{testDigestImage, "contextmatrix/worker:latest"}
 		err := cfg.Validate()
 		require.Error(t, err)
@@ -1188,7 +1241,7 @@ func TestValidate_AllowedImagesDigestPin(t *testing.T) {
 
 	t.Run("empty list is accepted", func(t *testing.T) {
 		cfg := baseValidConfigNoGitHub(t)
-		cfg.GitHubPAT = GitHubPAT{Token: "ghp_patonly"}
+		cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 		cfg.AllowedImages = nil
 		assert.NoError(t, cfg.Validate())
 	})
@@ -1294,10 +1347,12 @@ contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "`+dir+`"
-github_app:
-  app_id: 12345
-  installation_id: 67890
-  private_key_path: "`+pemPath+`"
+github:
+  auth_mode: "app"
+  app:
+    app_id: 12345
+    installation_id: 67890
+    private_key_path: "`+pemPath+`"
 task_skills_dir: /var/lib/contextmatrix/task-skills
 `), 0o600))
 
@@ -1315,14 +1370,118 @@ contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 claude_auth_dir: "`+dir+`"
-github_app:
-  app_id: 12345
-  installation_id: 67890
-  private_key_path: "`+pemPath+`"
+github:
+  auth_mode: "app"
+  app:
+    app_id: 12345
+    installation_id: 67890
+    private_key_path: "`+pemPath+`"
 `), 0o600))
 
 	cfg, err := Load(configPath)
 	require.NoError(t, err)
 	assert.Empty(t, cfg.TaskSkillsDir,
 		"unset task_skills_dir is allowed; feature simply disabled")
+}
+
+// writeConfigFile is an alias for writeConfig used by the new unified-github tests.
+func writeConfigFile(t *testing.T, dir, content string) string {
+	t.Helper()
+
+	return writeConfig(t, dir, content)
+}
+
+// minimalValidRunnerConfig returns a minimal valid Config without GitHub auth so
+// tests can set the GitHub block themselves.
+func minimalValidRunnerConfig(t *testing.T) *Config {
+	t.Helper()
+
+	return &Config{
+		ContextMatrixURL: "http://localhost",
+		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:        testDigestImage,
+		ImagePullPolicy:  PullAlways,
+		MaxConcurrent:    1,
+		ContainerTimeout: "1h",
+		AnthropicAPIKey:  "sk-ant-test",
+	}
+}
+
+func TestLoad_GitHubAuthModeApp(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	yamlContent := `
+github:
+  auth_mode: "app"
+  app:
+    app_id: 123
+    installation_id: 456
+    private_key_path: ` + pemPath + `
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+anthropic_api_key: "sk-ant-test"
+secrets_dir: ` + dir + `
+`
+	path := writeConfigFile(t, dir, yamlContent)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "app", cfg.GitHub.AuthMode)
+	assert.Equal(t, int64(123), cfg.GitHub.App.AppID)
+	assert.Equal(t, int64(456), cfg.GitHub.App.InstallationID)
+	assert.Equal(t, pemPath, cfg.GitHub.App.PrivateKeyPath)
+}
+
+func TestLoad_GitHubAuthModePAT(t *testing.T) {
+	dir := t.TempDir()
+	yamlContent := `
+github:
+  auth_mode: "pat"
+  pat:
+    token: "ghp_runner"
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+anthropic_api_key: "sk-ant-test"
+secrets_dir: ` + dir + `
+`
+	path := writeConfigFile(t, dir, yamlContent)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "pat", cfg.GitHub.AuthMode)
+	assert.Equal(t, "ghp_runner", cfg.GitHub.PAT.Token)
+}
+
+func TestEnvOverrides_GitHubAuthMode(t *testing.T) {
+	t.Setenv("CMR_GITHUB_AUTH_MODE", "app")
+	t.Setenv("CMR_GITHUB_APP_ID", "999")
+	t.Setenv("CMR_GITHUB_INSTALLATION_ID", "888")
+
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	t.Setenv("CMR_GITHUB_PRIVATE_KEY_PATH", pemPath)
+	t.Setenv("CMR_ANTHROPIC_API_KEY", "sk-ant-test")
+
+	path := writeConfigFile(t, dir, `
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+anthropic_api_key: "sk-ant-test"
+secrets_dir: `+dir)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "app", cfg.GitHub.AuthMode)
+	assert.Equal(t, int64(999), cfg.GitHub.App.AppID)
+	assert.Equal(t, int64(888), cfg.GitHub.App.InstallationID)
+}
+
+func TestValidate_AuthModeRequired(t *testing.T) {
+	cfg := minimalValidRunnerConfig(t)
+	cfg.GitHub.AuthMode = ""
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "github.auth_mode")
 }
