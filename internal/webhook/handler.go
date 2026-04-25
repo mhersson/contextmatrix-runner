@@ -273,6 +273,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		Interactive:   payload.Interactive,
 		Model:         payload.Model,
 		CorrelationID: correlationIDFromContext(r.Context()),
+		TaskSkills:    payload.TaskSkills,
 	})
 
 	writeSuccess(w, http.StatusAccepted, "container starting")
