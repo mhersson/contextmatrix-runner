@@ -104,6 +104,14 @@ container_pids_limit: 512
 # Env: CMR_SECRETS_DIR
 secrets_dir: "/var/run/cm-runner/secrets"
 
+# Path on the runner host to the task skills repo clone. Bind-mounted
+# read-only into worker containers at /host-skills. The entrypoint copies
+# the resolved subset of skills (per the trigger payload's task_skills field)
+# into ~/.claude/skills/ so Claude Code engages them via the Skill tool.
+# Empty disables the feature; trigger payload's task_skills is ignored and
+# no /host-skills mount is added.
+task_skills_dir: ""
+
 # ----- Claude Code Authentication -----
 # At least one of claude_auth_dir, claude_oauth_token, or anthropic_api_key must be set.
 # Priority order (highest to lowest): claude_auth_dir > claude_oauth_token > anthropic_api_key.

@@ -1284,3 +1284,45 @@ func TestLoad_ProductionDefaults_UnsetValues(t *testing.T) {
 	assert.Equal(t, PullNever, cfg.ImagePullPolicy, "production: pull policy must default to never")
 	assert.Empty(t, cfg.AppliedDevDefaults, "production mode must not populate AppliedDevDefaults")
 }
+
+func TestConfig_TaskSkillsDir(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	configPath := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+claude_auth_dir: "`+dir+`"
+github_app:
+  app_id: 12345
+  installation_id: 67890
+  private_key_path: "`+pemPath+`"
+task_skills_dir: /var/lib/contextmatrix/task-skills
+`), 0644))
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, "/var/lib/contextmatrix/task-skills", cfg.TaskSkillsDir)
+}
+
+func TestConfig_TaskSkillsDirDefault(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	configPath := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+contextmatrix_url: "http://localhost:8080"
+api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+claude_auth_dir: "`+dir+`"
+github_app:
+  app_id: 12345
+  installation_id: 67890
+  private_key_path: "`+pemPath+`"
+`), 0644))
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	assert.Empty(t, cfg.TaskSkillsDir,
+		"unset task_skills_dir is allowed; feature simply disabled")
+}
