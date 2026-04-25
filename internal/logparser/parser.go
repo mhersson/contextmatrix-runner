@@ -169,6 +169,14 @@ func (r *Redactor) Redact(input string) string {
 	return Redact(input)
 }
 
+// SkillEngagedEvent is emitted when the model invokes the Skill tool to
+// engage a specialist skill mounted at ~/.claude/skills/. Downstream
+// consumers (callback layer) forward this to ContextMatrix so the
+// engagement appears in the card's activity log.
+type SkillEngagedEvent struct {
+	SkillName string
+}
+
 // event is the top-level structure of every stream-json line.
 type event struct {
 	Type    string  `json:"type"`
@@ -376,13 +384,16 @@ func compactJSON(input json.RawMessage) string {
 // ProcessStream applies the static Redact patterns. Callers wanting
 // per-container literal-secret redaction should use ProcessStreamWithRedactor.
 func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogEntry)) {
-	ProcessStreamWithRedactor(r, logger, nil, emit)
+	ProcessStreamWithRedactor(r, logger, nil, emit, nil)
 }
 
 // ProcessStreamWithRedactor is like ProcessStream but applies redactor to
 // every text/thinking/tool_use block before logging and emission. If redactor
 // is nil the behaviour falls back to the static Redact.
-func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redactor, emit func(logbroadcast.LogEntry)) {
+//
+// onSkillEngaged is called whenever a Skill tool_use is detected. It may be
+// nil when the caller does not need skill-engagement notifications.
+func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redactor, emit func(logbroadcast.LogEntry), onSkillEngaged func(*SkillEngagedEvent)) {
 	redact := func(s string) string {
 		if redactor == nil {
 			return Redact(s)
@@ -434,6 +445,12 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 					continue
 				}
 
+				if block.Name == "Skill" {
+					handleSkillToolUse(block.Input, logger, onSkillEngaged)
+
+					continue
+				}
+
 				content := redact(formatToolCall(block.Name, block.Input))
 				logger.Info("claude", "claude_tool", content)
 
@@ -442,5 +459,34 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 				}
 			}
 		}
+	}
+}
+
+// handleSkillToolUse parses a Skill tool_use block and calls onSkillEngaged
+// if a skill name can be extracted. It accepts both the "skill" and "name"
+// input keys so callers can handle either shape that Claude Code may emit.
+func handleSkillToolUse(rawInput json.RawMessage, logger *slog.Logger, onSkillEngaged func(*SkillEngagedEvent)) {
+	var input struct {
+		Skill string `json:"skill"`
+		Name  string `json:"name"` // fallback — CC may use either key
+	}
+
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		logger.Warn("logparser: failed to parse Skill tool input", "error", err)
+
+		return
+	}
+
+	name := input.Skill
+	if name == "" {
+		name = input.Name
+	}
+
+	if name == "" {
+		return
+	}
+
+	if onSkillEngaged != nil {
+		onSkillEngaged(&SkillEngagedEvent{SkillName: name})
 	}
 }

@@ -1109,7 +1109,7 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 			m.broadcaster.Publish(e)
 		}
 
-		logparser.ProcessStreamWithRedactor(stdoutPr, log, redactor, emit)
+		logparser.ProcessStreamWithRedactor(stdoutPr, log, redactor, emit, nil)
 	}()
 
 	return done
