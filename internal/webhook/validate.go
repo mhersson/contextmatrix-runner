@@ -30,6 +30,11 @@ var (
 	hostRE = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
 	// message_id: UUIDs, prefixed ids, etc. 1..128 runes.
 	messageIDRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+	// task_skill_name: restricts skill names to a safe charset that cannot
+	// reach outside the /host-skills mount via path traversal. Must start with
+	// alphanumeric (no leading dash to avoid argv injection, no leading dot to
+	// avoid hidden directories), then alphanumeric / dot / underscore / dash.
+	taskSkillNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 )
 
 // maxContentBytes is the maximum permitted byte length of a MessagePayload
@@ -168,6 +173,17 @@ func validateMessageID(v string) error {
 	return nil
 }
 
+// ValidateTaskSkills checks every skill name in the slice against the
+// allowlist pattern. Empty slice is valid (means "no skills").
+func ValidateTaskSkills(skills []string) error {
+	for _, s := range skills {
+		if !taskSkillNamePattern.MatchString(s) {
+			return fmt.Errorf("invalid task skill name: %q", s)
+		}
+	}
+	return nil
+}
+
 // ValidatePayload type-switches on the known webhook payload structs and
 // validates every field. It returns a *ValidationError on failure so callers
 // can test with errors.As, or a nil error on success.
@@ -251,6 +267,12 @@ func validateTrigger(p *TriggerPayload) error {
 
 	if err := validateBaseBranch(p.BaseBranch); err != nil {
 		return err
+	}
+
+	if p.TaskSkills != nil {
+		if err := ValidateTaskSkills(*p.TaskSkills); err != nil {
+			return err
+		}
 	}
 
 	return nil
