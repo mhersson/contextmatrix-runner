@@ -41,25 +41,25 @@ type UnpinnedImageRef struct {
 
 // Config holds all runner configuration.
 type Config struct {
-	Port                      int       `yaml:"port"`
-	AdminPort                 int       `yaml:"admin_port"`
-	ContextMatrixURL          string    `yaml:"contextmatrix_url"`
-	ContainerContextMatrixURL string    `yaml:"container_contextmatrix_url"`
-	APIKey                    string    `yaml:"api_key"`
-	BaseImage                 string    `yaml:"base_image"`
-	AllowedImages             []string  `yaml:"allowed_images"`
-	ImagePullPolicy           string    `yaml:"image_pull_policy"`
-	MaxConcurrent             int       `yaml:"max_concurrent"`
-	ContainerTimeout          string    `yaml:"container_timeout"`
-	ContainerMemoryLimit      int64     `yaml:"container_memory_limit"`
-	ContainerPidsLimit        int64     `yaml:"container_pids_limit"`
-	ClaudeAuthDir             string    `yaml:"claude_auth_dir"`
-	ClaudeOAuthToken          string    `yaml:"claude_oauth_token"`
-	AnthropicAPIKey           string    `yaml:"anthropic_api_key"`
-	ClaudeSettings            string    `yaml:"claude_settings"`
+	Port                      int          `yaml:"port"`
+	AdminPort                 int          `yaml:"admin_port"`
+	ContextMatrixURL          string       `yaml:"contextmatrix_url"`
+	ContainerContextMatrixURL string       `yaml:"container_contextmatrix_url"`
+	APIKey                    string       `yaml:"api_key"`
+	BaseImage                 string       `yaml:"base_image"`
+	AllowedImages             []string     `yaml:"allowed_images"`
+	ImagePullPolicy           string       `yaml:"image_pull_policy"`
+	MaxConcurrent             int          `yaml:"max_concurrent"`
+	ContainerTimeout          string       `yaml:"container_timeout"`
+	ContainerMemoryLimit      int64        `yaml:"container_memory_limit"`
+	ContainerPidsLimit        int64        `yaml:"container_pids_limit"`
+	ClaudeAuthDir             string       `yaml:"claude_auth_dir"`
+	ClaudeOAuthToken          string       `yaml:"claude_oauth_token"`
+	AnthropicAPIKey           string       `yaml:"anthropic_api_key"`
+	ClaudeSettings            string       `yaml:"claude_settings"`
 	GitHub                    GitHubConfig `yaml:"github"`
-	LogLevel                  string    `yaml:"log_level"`
-	LogFormat                 string    `yaml:"log_format"`
+	LogLevel                  string       `yaml:"log_level"`
+	LogFormat                 string       `yaml:"log_format"`
 	// SecretsDir is the host directory where per-container secrets files
 	// are written. Each file is bind-mounted read-only into its container
 	// at /run/cm-secrets/env so the values never appear in HostConfig.Env

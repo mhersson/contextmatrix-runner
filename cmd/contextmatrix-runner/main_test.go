@@ -56,30 +56,39 @@ func (f *fakeDocker) ImageInspect(_ context.Context, imageID string) (image.Insp
 func (f *fakeDocker) ImagePull(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerCreate(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerStart(_ context.Context, _ string, _ container.StartOptions) error {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerWait(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerStop(_ context.Context, _ string, _ container.StopOptions) error {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerRemove(_ context.Context, _ string, _ container.RemoveOptions) error {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerLogs(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerList(_ context.Context, _ container.ListOptions) ([]ctr.DockerContainer, error) {
 	panic("not called")
 }
+
 func (f *fakeDocker) ContainerAttach(_ context.Context, _ string, _ container.AttachOptions) (*ctr.HijackedResponse, error) {
 	panic("not called")
 }
+
 func (f *fakeDocker) ImagesPrune(_ context.Context, _ filters.Args) (image.PruneReport, error) {
 	panic("not called")
 }
