@@ -103,9 +103,9 @@ func main() {
 	// Select GitHub auth provider based on config.
 	var tokenProvider github.TokenGenerator
 
-	switch {
-	case cfg.GitHubPAT.Token != "":
-		tp, err := github.NewPATProvider(cfg.GitHubPAT.Token)
+	switch cfg.GitHub.AuthMode {
+	case "pat":
+		tp, err := github.NewPATProvider(cfg.GitHub.PAT.Token)
 		if err != nil {
 			logger.Error("failed to create GitHub PAT provider", "error", err)
 			os.Exit(1)
@@ -116,10 +116,10 @@ func main() {
 		logger.Info("github auth mode", "mode", "pat")
 	default:
 		tp, err := github.NewTokenProvider(
-			cfg.GitHubApp.AppID,
-			cfg.GitHubApp.InstallationID,
-			cfg.GitHubApp.PrivateKeyPath,
-			github.WithAPIBaseURL(cfg.GitHubApp.APIBaseURL),
+			cfg.GitHub.App.AppID,
+			cfg.GitHub.App.InstallationID,
+			cfg.GitHub.App.PrivateKeyPath,
+			github.WithAPIBaseURL(cfg.GitHub.APIBaseURL),
 		)
 		if err != nil {
 			logger.Error("failed to create GitHub token provider", "error", err)
