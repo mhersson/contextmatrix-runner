@@ -74,6 +74,7 @@ ALLOWED_TOOLS_COMMON=(
     # Node.js / frontend workflow (npm install/test/build, node scripts).
     "Bash(npm:*)"
     "Bash(node:*)"
+    "Bash(npx:*)"
     # Python — generic scripts, pip for packages; pytest etc. run via python3 -m.
     "Bash(python3:*)"
     "Bash(pip3:*)"
