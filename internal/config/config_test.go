@@ -50,21 +50,35 @@ func TestLogFormat_ValidationRejectsUnknown(t *testing.T) {
 }
 
 // TestAdminPort_DefaultsAnd_ValidationRange verifies the default admin_port
-// value and that out-of-range values fail validation.
+// value and that out-of-range or invalid values fail validation.
 func TestAdminPort_DefaultsAnd_ValidationRange(t *testing.T) {
 	dir := t.TempDir()
 	pemPath := writePEM(t, dir)
 	claudeDir := dir
 
-	// Default should be 9091 when unset.
+	// (a) Default should be 0 (disabled) when unset.
 	path := writeConfig(t, dir, validConfig(pemPath, claudeDir))
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, 9091, cfg.AdminPort)
+	assert.Equal(t, 0, cfg.AdminPort)
 
-	// Out-of-range should fail.
-	yaml := validConfig(pemPath, claudeDir) + "\nadmin_port: 70000\n"
+	// (b) Explicit admin_port: 0 must pass Validate().
+	yaml := validConfig(pemPath, claudeDir) + "\nadmin_port: 0\n"
+	path = writeConfig(t, dir, yaml)
+	cfg, err = Load(path)
+	require.NoError(t, err)
+	assert.NoError(t, cfg.Validate())
+
+	// (c) Negative value must be rejected with an error mentioning "admin_port".
+	yaml = validConfig(pemPath, claudeDir) + "\nadmin_port: -1\n"
+	path = writeConfig(t, dir, yaml)
+	_, err = Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "admin_port")
+
+	// (d) Out-of-range value should fail.
+	yaml = validConfig(pemPath, claudeDir) + "\nadmin_port: 70000\n"
 	path = writeConfig(t, dir, yaml)
 	_, err = Load(path)
 	require.Error(t, err)

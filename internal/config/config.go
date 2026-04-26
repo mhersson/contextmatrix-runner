@@ -155,7 +155,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		Port:                       9090,
-		AdminPort:                  9091,
+		AdminPort:                  0,
 		MaxConcurrent:              3,
 		ContainerTimeout:           "2h",
 		ContainerMemoryLimit:       8 * 1024 * 1024 * 1024, // 8 GiB
@@ -362,7 +362,7 @@ func (c *Config) Validate() error {
 	}
 
 	if c.AdminPort != 0 && (c.AdminPort < 1 || c.AdminPort > 65535) {
-		return fmt.Errorf("admin_port must be between 1 and 65535")
+		return fmt.Errorf("admin_port must be 0 (disabled) or between 1 and 65535")
 	}
 
 	switch c.LogFormat {

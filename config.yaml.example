@@ -26,11 +26,13 @@
 port: 9090
 
 # Admin port for Prometheus /metrics and /ready. Bound to 127.0.0.1 only.
-# Reuses the webhook HMAC secret — scrape with a signed request, e.g.
-# prometheus scrape_configs can run a local exporter that signs on behalf of
-# the collector.
+# Set to 0 (the default) to disable the admin endpoint entirely — no port is
+# bound and no metrics are exposed. To enable Prometheus scraping, set a
+# non-zero port (e.g. 9091). The endpoint reuses the webhook HMAC secret —
+# scrape with a signed request, e.g. via a local exporter that signs on behalf
+# of the collector.
 # Env: CMR_ADMIN_PORT
-admin_port: 9091
+admin_port: 0
 
 # Structured log output format: "text" (human-readable) or "json" (machine-
 # parseable, for log shippers). Env: CMR_LOG_FORMAT
