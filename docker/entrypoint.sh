@@ -279,10 +279,6 @@ HELPER_EOF
     export GH_TOKEN="$CM_GIT_TOKEN"
     # Required by gh CLI when targeting a non-github.com host.
     export GH_HOST="$GIT_HOST"
-    # Redirect SSH-style URLs to HTTPS so the token helper is consulted.
-    git config --global "url.https://${GIT_HOST}/.insteadOf" "git@${GIT_HOST}:"
-    git config --global --add "url.https://${GIT_HOST}/.insteadOf" "ssh://git@${GIT_HOST}/"
-    git config --global --add "url.https://${GIT_HOST}/.insteadOf" "ssh://${GIT_HOST}/"
 fi
 
 # ----- Clone and Execute -----

@@ -90,11 +90,6 @@ func TestEntrypointGitHostExtraction(t *testing.T) {
 			wantHost:  "github.com",
 		},
 		{
-			name:      "SCP-style SSH URL (normalizeRepoURL should prevent this, but default gracefully)",
-			cmRepoURL: "git@github.com:org/repo.git",
-			wantHost:  "github.com",
-		},
-		{
 			// CTXRUN-043: a newline in the host would inject a second
 			// `machine` clause into .netrc / a second line into the
 			// credential helper. The case-based extractor must reject

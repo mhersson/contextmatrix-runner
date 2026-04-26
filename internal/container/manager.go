@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -109,10 +110,12 @@ var idleWatchdogCheckInterval = 30 * time.Second
 // wall time per synthetic-wedge scenario.
 var logDrainTimeout = 5 * time.Second
 
-// pullSkillsRepo runs `git pull --ff-only` in dir. Returns nil if dir is
-// not a git repo (caller may have a non-tracked local clone). Returns the
-// git error otherwise — caller should log and continue, not abort.
-var pullSkillsRepo = func(ctx context.Context, dir string) error {
+// pullSkillsRepo runs `git pull --ff-only` in dir, authenticating against the
+// configured upstream with a freshly minted GitHub token when the remote is
+// HTTPS. Returns nil if dir is not a git repo (operator may have a non-tracked
+// local clone) or has no `origin` remote configured. Returns the git error
+// otherwise — caller should log and continue, not abort.
+var pullSkillsRepo = func(ctx context.Context, dir, token string) error {
 	gitDir := filepath.Join(dir, ".git")
 	if _, err := os.Stat(gitDir); err != nil {
 		if os.IsNotExist(err) {
@@ -123,6 +126,7 @@ var pullSkillsRepo = func(ctx context.Context, dir string) error {
 	}
 
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "pull", "--ff-only")
+	cmd.Env = pullSkillsEnv(ctx, dir, token)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -130,6 +134,43 @@ var pullSkillsRepo = func(ctx context.Context, dir string) error {
 	}
 
 	return nil
+}
+
+// pullSkillsEnv returns the env for the `git pull` invocation. When the
+// repo's `origin` remote is HTTPS, it injects an HTTP Basic authorization
+// header with username `x-access-token` (GitHub's documented pattern for
+// both App installation tokens and PATs) via GIT_CONFIG_COUNT/KEY_0/VALUE_0
+// so the token never appears in the process command line. For any other
+// remote, or if the URL cannot be read, the parent env is returned
+// unchanged and `git pull` runs with no injected auth.
+func pullSkillsEnv(ctx context.Context, dir, token string) []string {
+	parent := os.Environ()
+
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		// `git config --get` exits 1 when the key is unset; either way we
+		// just run plain git pull and let the caller's WARN handle any
+		// failure.
+		return parent
+	}
+
+	remoteURL := strings.TrimSpace(string(out))
+	if remoteURL == "" {
+		return parent
+	}
+
+	u, err := url.Parse(remoteURL)
+	if err != nil || strings.ToLower(u.Scheme) != "https" || u.Host == "" {
+		return parent
+	}
+
+	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+
+	return append(parent,
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http.https://"+u.Host+"/.extraheader",
+		"GIT_CONFIG_VALUE_0=Authorization: Basic "+auth,
+	)
 }
 
 // imagePruneMaxAge is the "until" filter passed to ImagesPrune so the
@@ -489,7 +530,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	}
 
 	if m.cfg.TaskSkillsDir != "" {
-		if err := pullSkillsRepo(ctx, m.cfg.TaskSkillsDir); err != nil {
+		if err := pullSkillsRepo(ctx, m.cfg.TaskSkillsDir, gitToken); err != nil {
 			slog.Warn("task skills pull failed; using existing local clone",
 				"task_skills_dir", m.cfg.TaskSkillsDir,
 				"error", err,
@@ -1613,36 +1654,23 @@ func (m *Manager) pullImage(ctx context.Context, img string) error {
 
 var containerNameRe = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
 
-// scpRe matches SCP-style git remote URLs of the form [user@]host:path
-// where path does not begin with a slash (which would indicate an absolute
-// ssh:// URI instead).  Examples: git@github.com:org/repo.git
-var scpRe = regexp.MustCompile(`^([^@:/\s]+@)?([^:/\s]+):([^/].*)$`)
-
-// normalizeRepoURL converts SCP-style and ssh:// git remote URLs to their
-// HTTPS equivalents so the container can authenticate with a token rather
-// than an SSH key.
+// normalizeRepoURL rewrites an ssh:// git remote URL to its https equivalent
+// so the container can authenticate with a token rather than an SSH key.
+// Other schemes (notably https://) pass through unchanged. Validation upstream
+// rejects everything except https:// and ssh://, so this only ever runs on
+// those two cases.
 //
-//	git@github.com:org/repo.git        → https://github.com/org/repo.git
 //	ssh://git@github.com/org/repo.git  → https://github.com/org/repo.git
 //	ssh://github.com/org/repo.git      → https://github.com/org/repo.git
 //	https://github.com/org/repo.git    → (unchanged)
 func normalizeRepoURL(rawURL string) string {
-	// SCP-style: [user@]host:path (path must not start with /).
-	if m := scpRe.FindStringSubmatch(rawURL); m != nil {
-		host := m[2]
-		path := m[3]
-
-		return "https://" + host + "/" + path
-	}
-
-	// Parse generic URL schemes.
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
 
 	if u.Scheme == "ssh" {
-		// Strip the user info (e.g. "git@") and rewrite to https.
+		// Strip user info (e.g. "git@") and rewrite to https.
 		u.Scheme = "https"
 		u.User = nil
 

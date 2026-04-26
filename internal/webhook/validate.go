@@ -95,7 +95,8 @@ func validateBaseBranch(v string) error {
 
 // validateRepoURL parses the repo_url and enforces https/ssh scheme, non-empty
 // host with a strict host regex, and rejection of control bytes in the raw
-// input (defence against .netrc-style injection).
+// input (defence against .netrc-style injection). ssh URLs are accepted at
+// validation but rewritten to https before the container sees them.
 func validateRepoURL(v string) error {
 	if v == "" {
 		return &ValidationError{Field: "repo_url", Reason: "required"}

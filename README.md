@@ -523,7 +523,7 @@ non-zero exit), `completed` (clean exit).
 | -------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                                                           |
 | `project`      | string | yes      | Project name                                                                                                                  |
-| `repo_url`     | string | yes      | Repository URL. HTTPS and SCP-style SSH (`git@github.com:org/repo`) are both supported.                                       |
+| `repo_url`     | string | yes      | Repository URL. HTTPS (`https://github.com/org/repo`) is the supported form; `ssh://` URLs are accepted and rewritten to HTTPS. |
 | `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                                                           |
 | `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted.                                       |
 | `runner_image` | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.                                               |
@@ -644,9 +644,10 @@ Every container is launched with the following restrictions:
 
 - Verify the repo URL in the ContextMatrix project config matches an installed
   repo
-- Both HTTPS (`https://github.com/org/repo`) and SCP-style SSH
-  (`git@github.com:org/repo`) URLs are supported — SCP-style URLs are
-  automatically normalized to HTTPS before the container clones
+- The container only authenticates over HTTPS. `https://github.com/org/repo`
+  is the supported form; `ssh://` URLs are accepted at webhook validation but
+  rewritten to HTTPS before the container clones. SCP-style URLs
+  (`git@github.com:org/repo`) are rejected at validation
 - Check that the GitHub App has "Contents: Read & Write" permission
 - If the token expired (>1 hour task), retry — the new container gets a fresh
   token

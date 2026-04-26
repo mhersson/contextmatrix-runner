@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -108,7 +109,7 @@ func testPayload() RunConfig {
 	return RunConfig{
 		CardID:  "PROJ-042",
 		Project: "my-project",
-		RepoURL: "git@github.com:org/repo.git",
+		RepoURL: "https://github.com/org/repo.git",
 		MCPURL:  "http://cm:8080/mcp",
 	}
 }
@@ -2328,16 +2329,6 @@ func TestNormalizeRepoURL(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "SCP-style with user",
-			input:    "git@github.com:org/repo.git",
-			expected: "https://github.com/org/repo.git",
-		},
-		{
-			name:     "SCP-style without user",
-			input:    "github.com:org/repo.git",
-			expected: "https://github.com/org/repo.git",
-		},
-		{
 			name:     "ssh scheme with user",
 			input:    "ssh://git@github.com/org/repo.git",
 			expected: "https://github.com/org/repo.git",
@@ -2348,24 +2339,14 @@ func TestNormalizeRepoURL(t *testing.T) {
 			expected: "https://github.com/org/repo.git",
 		},
 		{
-			name:     "https passthrough",
-			input:    "https://github.com/org/repo.git",
-			expected: "https://github.com/org/repo.git",
-		},
-		{
-			name:     "http passthrough",
-			input:    "http://github.com/org/repo.git",
-			expected: "http://github.com/org/repo.git",
-		},
-		{
-			name:     "SCP-style with non-GitHub host",
-			input:    "git@gitlab.com:mygroup/myrepo.git",
-			expected: "https://gitlab.com/mygroup/myrepo.git",
-		},
-		{
 			name:     "ssh scheme with non-GitHub host",
 			input:    "ssh://git@bitbucket.org/team/project.git",
 			expected: "https://bitbucket.org/team/project.git",
+		},
+		{
+			name:     "https passthrough",
+			input:    "https://github.com/org/repo.git",
+			expected: "https://github.com/org/repo.git",
 		},
 	}
 	for _, tt := range tests {
@@ -3478,17 +3459,18 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 	// runWithPullStub builds a manager, swaps pullSkillsRepo with stub, runs
 	// one container creation, and returns whatever stub recorded.
-	runWithPullStub := func(t *testing.T, cfg *config.Config, payload RunConfig, stub func(context.Context, string) error) (calls []string) {
+	runWithPullStub := func(t *testing.T, cfg *config.Config, payload RunConfig, stub func(context.Context, string, string) error) (calls []string, tokens []string) {
 		t.Helper()
 
 		orig := pullSkillsRepo
 
 		t.Cleanup(func() { pullSkillsRepo = orig })
 
-		pullSkillsRepo = func(ctx context.Context, dir string) error {
+		pullSkillsRepo = func(ctx context.Context, dir, token string) error {
 			calls = append(calls, dir)
+			tokens = append(tokens, token)
 
-			return stub(ctx, dir)
+			return stub(ctx, dir, token)
 		}
 
 		mock := successfulMock()
@@ -3513,7 +3495,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		mgr.Run(context.Background(), payload)
 		mgr.Wait()
 
-		return calls
+		return calls, tokens
 	}
 
 	t.Run("pull invoked when task_skills_dir configured", func(t *testing.T) {
@@ -3524,12 +3506,14 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		cfg := testConfig()
 		cfg.TaskSkillsDir = dir
 
-		calls := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _ string) error {
+		calls, tokens := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _, _ string) error {
 			return nil
 		})
 
 		require.Len(t, calls, 1, "pull must be called exactly once")
 		assert.Equal(t, dir, calls[0])
+		require.Len(t, tokens, 1)
+		assert.NotEmpty(t, tokens[0], "pullSkillsRepo must receive a non-empty git token")
 	})
 
 	t.Run("pull failure does not abort container creation", func(t *testing.T) {
@@ -3544,7 +3528,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 
 		t.Cleanup(func() { pullSkillsRepo = orig })
 
-		pullSkillsRepo = func(_ context.Context, _ string) error {
+		pullSkillsRepo = func(_ context.Context, _, _ string) error {
 			return fmt.Errorf("git pull: exit status 1")
 		}
 
@@ -3583,7 +3567,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		cfg := testConfig()
 		cfg.TaskSkillsDir = ""
 
-		calls := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _ string) error {
+		calls, _ := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _, _ string) error {
 			return nil
 		})
 
@@ -3595,7 +3579,78 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		// no .git entry — the implementation must return nil silently.
 		dir := t.TempDir() // exists, but no .git inside
 
-		err := pullSkillsRepo(context.Background(), dir)
+		err := pullSkillsRepo(context.Background(), dir, "any-token")
 		assert.NoError(t, err, "pullSkillsRepo must return nil when dir is not a git repo")
+	})
+}
+
+// TestPullSkillsEnv verifies that pullSkillsEnv injects an Authorization
+// header via env-based git config when the upstream is HTTPS, and falls
+// back to the parent env unchanged otherwise. The token must never appear
+// in argv-visible places — only in the GIT_CONFIG_VALUE_0 env var.
+func TestPullSkillsEnv(t *testing.T) {
+	gitInit := func(t *testing.T, remote string) string {
+		t.Helper()
+
+		dir := t.TempDir()
+		mustGit := func(args ...string) {
+			//nolint:gosec // args are test-controlled literals
+			cmd := exec.CommandContext(context.Background(), "git", append([]string{"-C", dir}, args...)...)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, "git %v: %s", args, out)
+		}
+		mustGit("init", "--quiet")
+
+		if remote != "" {
+			mustGit("remote", "add", "origin", remote)
+		}
+
+		return dir
+	}
+
+	t.Run("https remote injects extraheader", func(t *testing.T) {
+		dir := gitInit(t, "https://github.com/org/skills.git")
+
+		env := pullSkillsEnv(context.Background(), dir, "ghs_secret_token_value")
+
+		assert.Contains(t, env, "GIT_CONFIG_COUNT=1")
+		assert.Contains(t, env, "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader")
+		// "x-access-token:ghs_secret_token_value" base64 == "eC1hY2Nlc3MtdG9rZW46Z2hzX3NlY3JldF90b2tlbl92YWx1ZQ=="
+		assert.Contains(t, env,
+			"GIT_CONFIG_VALUE_0=Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hzX3NlY3JldF90b2tlbl92YWx1ZQ==",
+		)
+	})
+
+	t.Run("https remote with port scopes header to host:port", func(t *testing.T) {
+		dir := gitInit(t, "https://gh.example.com:8443/org/skills.git")
+
+		env := pullSkillsEnv(context.Background(), dir, "tok")
+
+		assert.Contains(t, env, "GIT_CONFIG_KEY_0=http.https://gh.example.com:8443/.extraheader")
+	})
+
+	t.Run("no remote returns parent env unchanged", func(t *testing.T) {
+		dir := gitInit(t, "")
+
+		env := pullSkillsEnv(context.Background(), dir, "tok")
+
+		for _, e := range env {
+			assert.False(t, strings.HasPrefix(e, "GIT_CONFIG_"),
+				"no remote should not inject GIT_CONFIG_* (got %q)", e)
+		}
+	})
+
+	t.Run("non-https remote returns parent env unchanged", func(t *testing.T) {
+		// e.g. a local file:// upstream used in dev — pull works without
+		// auth injection, and we must not pretend HTTPS scoping applies.
+		upstream := t.TempDir()
+		dir := gitInit(t, "file://"+upstream)
+
+		env := pullSkillsEnv(context.Background(), dir, "tok")
+
+		for _, e := range env {
+			assert.False(t, strings.HasPrefix(e, "GIT_CONFIG_"),
+				"non-https remote should not inject GIT_CONFIG_* (got %q)", e)
+		}
 	})
 }
