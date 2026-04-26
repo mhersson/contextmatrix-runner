@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -21,6 +22,9 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	ctr "github.com/mhersson/contextmatrix-runner/internal/container"
+	"github.com/mhersson/contextmatrix-runner/internal/metrics"
+	"github.com/mhersson/contextmatrix-runner/internal/tracker"
+	"github.com/mhersson/contextmatrix-runner/internal/webhook"
 )
 
 // stubToken is a minimal githubauth.TokenGenerator used by buildProbes tests.
@@ -152,4 +156,32 @@ func TestBuildProbes_PullIfNotPresentSkipsInspect(t *testing.T) {
 	probes := buildProbes(cfg, docker, stubToken{}, cb)
 
 	assert.Nil(t, probes.ImageInspect, "image inspect should be unset when pulls are permitted")
+}
+
+// TestBuildAdminServer verifies that buildAdminServer returns a non-nil
+// *http.Server bound to the configured port when admin_port is non-zero,
+// and returns nil (disabled) when admin_port is 0.
+func TestBuildAdminServer(t *testing.T) {
+	mx := metrics.New()
+	trk := tracker.New()
+	log := testLogger()
+
+	// Minimal webhook handler — nil manager/broadcaster/cmClient are fine
+	// because buildAdminServer only uses wh.AdminAuth, which only needs
+	// the apiKey set on the handler.
+	apiKey := "aaaabbbbccccddddeeeeffffaaaabbbbccccddddeeeeffffaaaabbbbccccdddde"
+	wh := webhook.NewHandler(nil, trk, nil, nil, apiKey, 1, "", log, 0, nil)
+
+	t.Run("non-zero port returns configured server", func(t *testing.T) {
+		cfg := &config.Config{AdminPort: 9091}
+		srv := buildAdminServer(cfg, wh, mx, trk, log)
+		require.NotNil(t, srv)
+		assert.Equal(t, fmt.Sprintf("127.0.0.1:%d", 9091), srv.Addr)
+	})
+
+	t.Run("admin_port=0 returns nil (disabled)", func(t *testing.T) {
+		cfg := &config.Config{AdminPort: 0}
+		srv := buildAdminServer(cfg, wh, mx, trk, log)
+		assert.Nil(t, srv)
+	})
 }

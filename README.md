@@ -4,6 +4,12 @@
 >
 > This project is under heavy development. Breaking changes should be expected
 > at the current stage.
+>
+> **Breaking change (current):** `admin_port` now defaults to `0` (disabled).
+> Previously the admin endpoint (Prometheus `/metrics` + `/ready`) started
+> automatically on port `9091`. If you rely on Prometheus scraping, add
+> `admin_port: 9091` to `config.yaml` (or set `CMR_ADMIN_PORT=9091`) to restore
+> the old behaviour after upgrading.
 
 A self-hosted runner that receives webhooks from
 [ContextMatrix](https://github.com/mhersson/contextmatrix) and spawns disposable
@@ -228,6 +234,11 @@ See `config.yaml.example` for the fully-commented template.
 # HTTP port for receiving webhooks from ContextMatrix.
 # Env: CMR_PORT
 port: 9090
+
+# Admin port for Prometheus /metrics and /ready (bound to 127.0.0.1 only).
+# 0 = disabled (default). Set a non-zero port (e.g. 9091) to enable scraping.
+# Env: CMR_ADMIN_PORT
+admin_port: 0
 
 # Base URL of the ContextMatrix instance (for status callbacks).
 # Env: CMR_CONTEXTMATRIX_URL

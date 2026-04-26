@@ -588,6 +588,8 @@ func buildAdminServer(
 ) *http.Server {
 	port := cfg.AdminPort
 	if port == 0 {
+		logger.Info("admin endpoints disabled (admin_port=0)")
+
 		return nil
 	}
 
