@@ -1,5 +1,10 @@
 # contextmatrix-runner
 
+> [!WARNING]
+>
+> This project is under heavy development. Breaking changes should be expected
+> at the current stage.
+
 A self-hosted runner that receives webhooks from
 [ContextMatrix](https://github.com/mhersson/contextmatrix) and spawns disposable
 Docker containers to execute autonomous AI tasks using Claude Code.
@@ -35,7 +40,8 @@ cards, execute work, and report completion.
 - Go 1.26+
 - Docker (daemon running)
 - A running ContextMatrix instance
-- A GitHub account with either a GitHub App or a fine-grained personal access token
+- A GitHub account with either a GitHub App or a fine-grained personal access
+  token
 
 ## Quick Start
 
@@ -92,10 +98,10 @@ make lint-sh
 The runner requires credentials to generate a git token for each container. Two
 methods are supported — configure exactly one.
 
-| Method | When to use |
-| ------ | ----------- |
-| **GitHub App** | Recommended for most setups. Short-lived, repo-scoped tokens; private key never leaves the host. |
-| **Personal Access Token (PAT)** | Use in GitHub Enterprise environments where App creation is restricted, or for quick testing. |
+| Method                          | When to use                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------ |
+| **GitHub App**                  | Recommended for most setups. Short-lived, repo-scoped tokens; private key never leaves the host. |
+| **Personal Access Token (PAT)** | Use in GitHub Enterprise environments where App creation is restricted, or for quick testing.    |
 
 **No inbound connections required.** The runner only makes outbound HTTPS calls
 to the GitHub API (`api.github.com` or your enterprise endpoint). It works on a
@@ -170,8 +176,8 @@ extra git configuration is required. Set the matching `github.host` (or
 `github.api_base_url`) in ContextMatrix so both sides target the same enterprise
 instance.
 
-For end-to-end setup of a GitHub App or PAT covering both the runner
-and the contextmatrix server, see
+For end-to-end setup of a GitHub App or PAT covering both the runner and the
+contextmatrix server, see
 [contextmatrix's topology guide](https://github.com/mhersson/contextmatrix/blob/main/docs/github-auth-recommended-topologies.md).
 
 ## GitHub PAT Setup
@@ -201,7 +207,7 @@ Add the token to your `config.yaml`:
 github:
   auth_mode: "pat"
   pat:
-    token: "github_pat_..."  # Env: CMR_GITHUB_PAT_TOKEN
+    token: "github_pat_..." # Env: CMR_GITHUB_PAT_TOKEN
 ```
 
 Or set it via environment variables:
@@ -297,13 +303,13 @@ anthropic_api_key: ""
 # GitHub authentication. Configure auth_mode and the matching sub-block.
 github:
   auth_mode: "app" # CMR_GITHUB_AUTH_MODE — "app" (recommended) or "pat"
-  host: ""         # CMR_GITHUB_HOST — GHE/GHEC-DR hostname; empty for github.com
+  host: "" # CMR_GITHUB_HOST — GHE/GHEC-DR hostname; empty for github.com
   api_base_url: "" # CMR_GITHUB_API_BASE_URL — override for non-standard enterprise URLs
 
   # GitHub App credentials (required when auth_mode is "app").
   app:
-    app_id: 0           # CMR_GITHUB_APP_ID
-    installation_id: 0  # CMR_GITHUB_INSTALLATION_ID
+    app_id: 0 # CMR_GITHUB_APP_ID
+    installation_id: 0 # CMR_GITHUB_INSTALLATION_ID
     private_key_path: "" # CMR_GITHUB_PRIVATE_KEY_PATH
 
   # Fine-grained PAT (required when auth_mode is "pat").
@@ -317,7 +323,10 @@ log_level: "info"
 
 ## Task skills
 
-The runner can mount a curated set of Claude Code skills (Go, TypeScript/React, etc.) into worker containers. ContextMatrix server resolves which skills apply per card and sends the list in the `/trigger` payload; the runner copies the resolved subset into `~/.claude/skills/` for Claude Code to discover.
+The runner can mount a curated set of Claude Code skills (Go, TypeScript/React,
+etc.) into worker containers. ContextMatrix server resolves which skills apply
+per card and sends the list in the `/trigger` payload; the runner copies the
+resolved subset into `~/.claude/skills/` for Claude Code to discover.
 
 ### One-time setup
 
@@ -337,11 +346,14 @@ task_skills_dir: /var/lib/contextmatrix/task-skills
 
 ### Sync model
 
-The runner runs `git pull --ff-only` on `task_skills_dir` before each `/trigger`. No cron. Pull failures log and continue with the existing local clone — the trigger never aborts because of a sync issue.
+The runner runs `git pull --ff-only` on `task_skills_dir` before each
+`/trigger`. No cron. Pull failures log and continue with the existing local
+clone — the trigger never aborts because of a sync issue.
 
 ### Local-dev / single-host setup
 
-When the runner and the CM server share a host, both `task_skills_dir` configs can point at the same path. No upstream remote needed; edit in place.
+When the runner and the CM server share a host, both `task_skills_dir` configs
+can point at the same path. No upstream remote needed; edit in place.
 
 ## Deployment profiles
 
@@ -349,13 +361,13 @@ The runner operates in one of two modes, set via `deployment_profile` in
 `config.yaml` (or `CMR_DEPLOYMENT_PROFILE` env var). The default is
 `production`.
 
-| Profile | Behaviour |
-| ------- | --------- |
-| `production` | All validators enforced at full strength. No change from pre-feature behaviour. |
-| `dev` | Five validators relaxed for local single-box setups. Every relaxation logs a startup or per-request line — nothing is silent. |
+| Profile      | Behaviour                                                                                                                     |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `production` | All validators enforced at full strength. No change from pre-feature behaviour.                                               |
+| `dev`        | Five validators relaxed for local single-box setups. Every relaxation logs a startup or per-request line — nothing is silent. |
 
-`deployment_profile: production` (or unset) is byte-identical to the
-pre-feature behaviour.
+`deployment_profile: production` (or unset) is byte-identical to the pre-feature
+behaviour.
 
 ### Dev-mode relaxations
 
@@ -392,7 +404,7 @@ contextmatrix_url: "https://your-cm-instance"
 api_key: "your-shared-secret-at-least-32-chars"
 base_image: "contextmatrix/worker:latest"
 
-anthropic_api_key: "sk-ant-..."   # or claude_auth_dir / claude_oauth_token
+anthropic_api_key: "sk-ant-..." # or claude_auth_dir / claude_oauth_token
 
 github:
   auth_mode: "app"
@@ -431,9 +443,11 @@ remote_execution:
 
 1. User clicks **Run Now** on an autonomous card in the ContextMatrix web UI
 2. ContextMatrix sends a signed `/trigger` webhook to the runner
-3. Runner generates a git credential token (GitHub App installation token or PAT)
+3. Runner generates a git credential token (GitHub App installation token or
+   PAT)
 4. Runner pulls the Docker image and starts a hardened container with:
-   - Debian bookworm-slim base with Go 1.26, Node.js 25, GitHub CLI, and golangci-lint
+   - Debian bookworm-slim base with Go 1.26, Node.js 25, GitHub CLI, and
+     golangci-lint
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
    - Git credential token for clone/push operations
@@ -477,8 +491,8 @@ dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
 2. **Clone** — clones the project repository into `/home/user/workspace`. When
    `base_branch` is set in the trigger payload, the clone uses `-b <branch>` so
    work starts from the correct base. The Claude Code prompt is also extended
-   with an instruction to target that branch when creating PRs (`gh pr create
-   --base <branch>`).
+   with an instruction to target that branch when creating PRs
+   (`gh pr create --base <branch>`).
 3. **Execute** — `exec claude` runs Claude Code in headless mode, which connects
    to ContextMatrix via MCP tools to claim the card, execute the work, and
    report completion.
@@ -487,15 +501,15 @@ dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
 
 All webhooks are signed with HMAC-SHA256 using a shared secret.
 
-| Direction   | Endpoint                  | Purpose                         |
-| ----------- | ------------------------- | ------------------------------- |
-| CM → Runner | `POST /trigger`           | Start a task                    |
-| CM → Runner | `POST /kill`              | Stop a specific task            |
-| CM → Runner | `POST /stop-all`          | Stop all tasks (or per-project) |
+| Direction   | Endpoint                  | Purpose                                       |
+| ----------- | ------------------------- | --------------------------------------------- |
+| CM → Runner | `POST /trigger`           | Start a task                                  |
+| CM → Runner | `POST /kill`              | Stop a specific task                          |
+| CM → Runner | `POST /stop-all`          | Stop all tasks (or per-project)               |
 | CM → Runner | `POST /message`           | Send a user message to an interactive session |
 | CM → Runner | `POST /promote`           | Promote interactive session to autonomous     |
 | CM → Runner | `POST /end-session`       | Close container stdin so claude exits on EOF  |
-| Runner → CM | `POST /api/runner/status` | Report container status         |
+| Runner → CM | `POST /api/runner/status` | Report container status                       |
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
 HMAC computed over `timestamp.body`. Max 5-minute clock skew.
@@ -505,30 +519,30 @@ non-zero exit), `completed` (clean exit).
 
 ### Trigger payload fields
 
-| Field          | Type   | Required | Description                                                                              |
-| -------------- | ------ | -------- | ---------------------------------------------------------------------------------------- |
-| `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                     |
-| `project`      | string | yes      | Project name                                                                             |
-| `repo_url`     | string | yes      | Repository URL. HTTPS and SCP-style SSH (`git@github.com:org/repo`) are both supported. |
-| `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                      |
-| `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted. |
-| `runner_image`  | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.          |
-| `interactive`   | bool   | no       | When `true`, runs Claude in stream-json HITL mode and attaches to container stdin. Use `/message` and `/promote` to interact. |
-| `model`         | string | no       | Model ID for the orchestrator (e.g. `claude-sonnet-4-6`). Passed through to the container environment.                        |
+| Field          | Type   | Required | Description                                                                                                                   |
+| -------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                                                           |
+| `project`      | string | yes      | Project name                                                                                                                  |
+| `repo_url`     | string | yes      | Repository URL. HTTPS and SCP-style SSH (`git@github.com:org/repo`) are both supported.                                       |
+| `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                                                           |
+| `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted.                                       |
+| `runner_image` | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.                                               |
+| `interactive`  | bool   | no       | When `true`, runs Claude in stream-json HITL mode and attaches to container stdin. Use `/message` and `/promote` to interact. |
+| `model`        | string | no       | Model ID for the orchestrator (e.g. `claude-sonnet-4-6`). Passed through to the container environment.                        |
 
 ## API Endpoints
 
-| Method | Path        | Auth | Description                                               |
-| ------ | ----------- | ---- | --------------------------------------------------------- |
-| POST   | `/trigger`  | HMAC | Start a container for a card                              |
-| POST   | `/kill`     | HMAC | Kill a specific container (idempotent; 200 on already-stopped) |
-| POST   | `/stop-all` | HMAC | Kill all containers (207 Multi-Status on partial failure)      |
-| POST   | `/message`  | HMAC | Send a user message to an interactive (HITL) session      |
-| POST   | `/promote`  | HMAC | Promote an interactive session to autonomous mode         |
-| POST   | `/end-session` | HMAC | Close stdin of an interactive container; claude exits on EOF |
-| GET    | `/logs`     | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature. |
-| GET    | `/health`   | none | Health check                                              |
-| GET    | `/readyz`   | none | Readiness probe (503 during preflight or drain)           |
+| Method | Path           | Auth | Description                                                                                                                                                            |
+| ------ | -------------- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/trigger`     | HMAC | Start a container for a card                                                                                                                                           |
+| POST   | `/kill`        | HMAC | Kill a specific container (idempotent; 200 on already-stopped)                                                                                                         |
+| POST   | `/stop-all`    | HMAC | Kill all containers (207 Multi-Status on partial failure)                                                                                                              |
+| POST   | `/message`     | HMAC | Send a user message to an interactive (HITL) session                                                                                                                   |
+| POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode                                                                                                                      |
+| POST   | `/end-session` | HMAC | Close stdin of an interactive container; claude exits on EOF                                                                                                           |
+| GET    | `/logs`        | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature. |
+| GET    | `/health`      | none | Health check                                                                                                                                                           |
+| GET    | `/readyz`      | none | Readiness probe (503 during preflight or drain)                                                                                                                        |
 
 ### Response envelope
 
@@ -550,24 +564,24 @@ text. `/stop-all` returns a custom `StopAllResponse` with per-card `results`.
 
 ### Error codes
 
-| Code                | Status | Endpoint(s)                                 | Meaning                                                        |
-| ------------------- | ------ | ------------------------------------------- | -------------------------------------------------------------- |
-| `invalid_json`      | 400    | all mutating endpoints                      | request body was not valid JSON                                |
-| `invalid_field`     | 400    | all mutating endpoints                      | a field failed validation (`message` names the field)          |
-| `unauthorized`      | 401    | all HMAC-guarded endpoints                  | HMAC auth failed (missing header, bad sig, expired, …)         |
-| `not_found`         | 404    | `/message`, `/promote`, `/end-session`      | no container tracked for (project, card_id)                    |
-| `conflict`          | 409    | `/trigger`, `/message`, `/promote`, `/end-session` | state conflict (already tracked, non-interactive, …)    |
-| `duplicate`         | 409    | all HMAC-guarded endpoints                  | HMAC signature replay detected                                 |
-| `stdin_closed`      | 410    | `/message`, `/promote`                      | session has ended (stdin was once attached, now closed)        |
-| `too_large`         | 413    | `/message`                                  | `content` exceeds 8192 bytes                                   |
-| `limit_reached`     | 429    | `/trigger`                                  | `max_concurrent` reached                                       |
-| `internal`          | 500    | any                                         | server-side bug; details logged, never echoed                  |
-| `upstream_failure`  | 502    | `/promote`                                  | CM verify-autonomous call failed                               |
-| `draining`          | 503    | `/trigger`, `/message`, `/promote`, `/end-session` | graceful shutdown in progress                            |
+| Code               | Status | Endpoint(s)                                        | Meaning                                                 |
+| ------------------ | ------ | -------------------------------------------------- | ------------------------------------------------------- |
+| `invalid_json`     | 400    | all mutating endpoints                             | request body was not valid JSON                         |
+| `invalid_field`    | 400    | all mutating endpoints                             | a field failed validation (`message` names the field)   |
+| `unauthorized`     | 401    | all HMAC-guarded endpoints                         | HMAC auth failed (missing header, bad sig, expired, …)  |
+| `not_found`        | 404    | `/message`, `/promote`, `/end-session`             | no container tracked for (project, card_id)             |
+| `conflict`         | 409    | `/trigger`, `/message`, `/promote`, `/end-session` | state conflict (already tracked, non-interactive, …)    |
+| `duplicate`        | 409    | all HMAC-guarded endpoints                         | HMAC signature replay detected                          |
+| `stdin_closed`     | 410    | `/message`, `/promote`                             | session has ended (stdin was once attached, now closed) |
+| `too_large`        | 413    | `/message`                                         | `content` exceeds 8192 bytes                            |
+| `limit_reached`    | 429    | `/trigger`                                         | `max_concurrent` reached                                |
+| `internal`         | 500    | any                                                | server-side bug; details logged, never echoed           |
+| `upstream_failure` | 502    | `/promote`                                         | CM verify-autonomous call failed                        |
+| `draining`         | 503    | `/trigger`, `/message`, `/promote`, `/end-session` | graceful shutdown in progress                           |
 
 Raw `err.Error()` strings, HMAC-failure reasons, upstream response bodies, and
-unmarshal byte offsets are never echoed to clients — they are logged
-server-side only.
+unmarshal byte offsets are never echoed to clients — they are logged server-side
+only.
 
 ## Security Model
 
@@ -600,9 +614,9 @@ Every container is launched with the following restrictions:
 - **HMAC-SHA256 webhook signing** in both directions (shared secret, never
   transmitted)
 - **GitHub App tokens**: short-lived (1 hour), repo-scoped, only ephemeral
-  tokens enter containers. **PAT alternative**: the static token is injected
-  as an env var per-container — use a token with minimal repository scope and
-  set an expiration
+  tokens enter containers. **PAT alternative**: the static token is injected as
+  an env var per-container — use a token with minimal repository scope and set
+  an expiration
 - **Read-only mounts**: OAuth token directory mounted read-only when using
   `claude_auth_dir`; long-lived OAuth tokens and API keys injected as env vars
   when using the other auth methods
