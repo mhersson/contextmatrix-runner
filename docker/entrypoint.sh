@@ -128,6 +128,7 @@ ALLOWED_TOOLS_COMMON=(
     "mcp__contextmatrix__release_card"
     "mcp__contextmatrix__report_push"
     "mcp__contextmatrix__report_usage"
+    "mcp__contextmatrix__start_review"
     "mcp__contextmatrix__start_workflow"
     "mcp__contextmatrix__transition_card"
     "mcp__contextmatrix__update_card"
