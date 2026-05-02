@@ -173,82 +173,6 @@ func TestValidateRepoURL(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// content (MessagePayload)
-// -----------------------------------------------------------------------------
-
-func TestValidateContent(t *testing.T) {
-	cases := []struct {
-		name    string
-		val     string
-		wantErr bool
-	}{
-		{"simple text", "hello", false},
-		{"with newline allowed", "hello\nworld", false},
-		{"unicode ok", "café 🚀", false},
-		{"at size cap", strings.Repeat("a", maxContentBytes), false},
-
-		{"empty", "", true},
-		{"over size cap", strings.Repeat("a", maxContentBytes+1), true},
-		{"NUL byte rejected", "hello\x00world", true},
-		// 0xff alone is not valid UTF-8.
-		{"invalid utf8", string([]byte{0xff, 0xfe, 0xfd}), true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateContent(tc.val)
-			if tc.wantErr {
-				require.Error(t, err)
-
-				var ve *ValidationError
-
-				require.ErrorAs(t, err, &ve)
-				assert.Equal(t, "content", ve.Field)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
-// -----------------------------------------------------------------------------
-// message_id
-// -----------------------------------------------------------------------------
-
-func TestValidateMessageID(t *testing.T) {
-	cases := []struct {
-		name    string
-		val     string
-		wantErr bool
-	}{
-		{"empty allowed", "", false},
-		{"uuid v4", "550e8400-e29b-41d4-a716-446655440000", false},
-		{"prefixed", "msg_abc.123", false},
-		{"max length 128", strings.Repeat("a", 128), false},
-
-		{"length 129", strings.Repeat("a", 129), true},
-		{"newline", "msg\nfoo", true},
-		{"NUL byte", "msg\x00foo", true},
-		{"space", "msg foo", true},
-		{"slash", "msg/foo", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateMessageID(tc.val)
-			if tc.wantErr {
-				require.Error(t, err)
-
-				var ve *ValidationError
-
-				require.ErrorAs(t, err, &ve)
-				assert.Equal(t, "message_id", ve.Field)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
-// -----------------------------------------------------------------------------
 // ValidatePayload dispatch table
 // -----------------------------------------------------------------------------
 
@@ -322,54 +246,10 @@ func TestValidatePayload_StopAll(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestValidatePayload_Message(t *testing.T) {
-	p := &MessagePayload{
-		CardID:    "C-1",
-		Project:   "p",
-		Content:   "hello",
-		MessageID: "msg-1",
-	}
-	require.NoError(t, ValidatePayload(p))
-
-	// Empty content
-	p2 := *p
-	p2.Content = ""
-	err := ValidatePayload(&p2)
-	require.Error(t, err)
-
-	var ve *ValidationError
-
-	require.ErrorAs(t, err, &ve)
-	assert.Equal(t, "content", ve.Field)
-
-	// Bad message_id
-	p3 := *p
-	p3.MessageID = "msg id with space"
-	err = ValidatePayload(&p3)
-	require.Error(t, err)
-	require.ErrorAs(t, err, &ve)
-	assert.Equal(t, "message_id", ve.Field)
-}
-
-func TestValidatePayload_Promote(t *testing.T) {
-	require.NoError(t, ValidatePayload(&PromotePayload{CardID: "C-1", Project: "p"}))
-	require.Error(t, ValidatePayload(&PromotePayload{CardID: "", Project: "p"}))
-}
-
-func TestValidatePayload_EndSession(t *testing.T) {
-	require.NoError(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "p"}))
-	require.Error(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "-bad"}))
-}
-
 func TestValidatePayload_ByValue(t *testing.T) {
 	// Pass-by-value should work as well as pass-by-pointer.
 	require.NoError(t, ValidatePayload(KillPayload{CardID: "C-1", Project: "p"}))
 	require.NoError(t, ValidatePayload(StopAllPayload{}))
-	require.NoError(t, ValidatePayload(PromotePayload{CardID: "C-1", Project: "p"}))
-	require.NoError(t, ValidatePayload(EndSessionPayload{CardID: "C-1", Project: "p"}))
-	require.NoError(t, ValidatePayload(
-		MessagePayload{CardID: "C-1", Project: "p", Content: "hi"},
-	))
 }
 
 func TestValidatePayload_UnknownTypeNoop(t *testing.T) {
@@ -424,13 +304,9 @@ func TestValidationError_Message(t *testing.T) {
 // NOT touch the tracker or container runner.
 // -----------------------------------------------------------------------------
 
-// strictRunner fails the test if Run or Kill is called — the handler must
-// reject an invalid payload before dispatching to the manager.
+// strictRunner fails the test if any ContainerOps method is called — the
+// handler must reject an invalid payload before dispatching to the manager.
 type strictRunner struct{ t *testing.T }
-
-func (r *strictRunner) Run(_ context.Context, _ container.RunConfig) {
-	r.t.Fatalf("manager.Run must not be called on invalid payload")
-}
 
 func (r *strictRunner) Kill(_, _ string) error {
 	r.t.Fatalf("manager.Kill must not be called on invalid payload")

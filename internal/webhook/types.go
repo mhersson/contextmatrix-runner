@@ -24,38 +24,12 @@ type StopAllPayload struct {
 	Project string `json:"project,omitempty"`
 }
 
-// MessagePayload is received from ContextMatrix to deliver a user chat message
-// to a running interactive container's stdin.
-type MessagePayload struct {
-	CardID    string `json:"card_id"`
-	Project   string `json:"project"`
-	Content   string `json:"content"`
-	MessageID string `json:"message_id,omitempty"`
-}
-
-// PromotePayload is received from ContextMatrix to switch a running interactive
-// session to fully autonomous mode.
-type PromotePayload struct {
-	CardID  string `json:"card_id"`
-	Project string `json:"project"`
-}
-
-// EndSessionPayload is received from ContextMatrix to close the stdin of a
-// running interactive container so claude exits on EOF. Used when the card
-// reaches a terminal state and is released.
-type EndSessionPayload struct {
-	CardID  string `json:"card_id"`
-	Project string `json:"project"`
-}
-
 // SuccessResponse is the body returned for any 2xx webhook response. `OK` is
 // always true; `Message` is a short, free-form human-readable label (never
-// derived from user input); `MessageID` is only populated by /message acks so
-// CM can correlate the retryable request.
+// derived from user input).
 type SuccessResponse struct {
-	OK        bool   `json:"ok"`
-	Message   string `json:"message,omitempty"`
-	MessageID string `json:"message_id,omitempty"`
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
 }
 
 // ErrorResponse is the body returned for any non-2xx webhook response (except
@@ -112,21 +86,4 @@ type StopAllResponse struct {
 	Stopped int              `json:"stopped"`
 	Failed  int              `json:"failed"`
 	Results []CardKillResult `json:"results"`
-}
-
-// Response is the legacy polymorphic webhook response body.
-//
-// Deprecated: new handlers should emit SuccessResponse or ErrorResponse via
-// writeSuccess / writeError. This type is retained because existing tests
-// decode the shape directly (and a few external consumers may depend on the
-// `error` field). It is a union of Success + Error fields and no longer
-// produced by the runner — but a JSON unmarshal of a SuccessResponse or an
-// ErrorResponse into a Response still populates the matching subset of
-// fields so older callers keep working.
-type Response struct {
-	OK        bool   `json:"ok"`
-	Message   string `json:"message,omitempty"`
-	MessageID string `json:"message_id,omitempty"`
-	Error     string `json:"error,omitempty"`
-	Code      string `json:"code,omitempty"`
 }
