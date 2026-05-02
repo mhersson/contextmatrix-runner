@@ -58,20 +58,20 @@ api_key: ""
 
 # ----- Container Settings -----
 
-# Default Docker image for worker containers. Can be overridden per-project
-# via runner_image in the trigger payload.
+# Default Docker image for orchestrated worker containers. Long-lived shell;
+# the runner spawns Claude Code per phase via docker exec.
 #
-# base_image MUST be @sha256:... pinned (enforced by Validate). See CTXRUN-044.
+# agent_image MUST be @sha256:... pinned (enforced by Validate). See CTXRUN-044.
 # Mutable tags like `:latest` are rejected so a rebuilt upstream image can
 # never silently ship into production. Replace the digest below with the
 # output of `docker inspect --format='{{index .RepoDigests 0}}' <image>`.
-# Env: CMR_BASE_IMAGE
-base_image: "contextmatrix/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# Env: CMR_AGENT_IMAGE
+agent_image: "contextmatrix/orchestrated@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
-# Allowlist of permitted Docker images. When set, only these images may be used
-# (including via runner_image in the trigger payload). When empty, only base_image
-# is permitted — any runner_image override that differs from base_image is rejected.
-# Every entry MUST be @sha256:... pinned for the same reason as base_image.
+# Allowlist of permitted Docker images. When set, only these images may be used.
+# When empty, only agent_image is permitted (the runner has no other path that
+# spawns containers from a different reference). Every entry MUST be @sha256:...
+# pinned for the same reason as agent_image.
 # No env var override (list type).
 allowed_images: []
 
@@ -100,11 +100,17 @@ container_pids_limit: 512
 # bind-mounted read-only into its container at /run/cm-secrets/env so the
 # values never appear in HostConfig.Env (and therefore not in `docker
 # inspect`). Must be writable by the runner process; should be on tmpfs.
-# Systemd user services: `/var/run/cm-runner` is not auto-created and
-# `/var/run` is root-owned — either pre-create the directory (chown to the
-# runner user) or override this to a path under `%h/.cm-runner`.
+#
+# Defaults:
+#   production: /var/run/cm-runner/secrets — operator-provisioned (root-owned
+#               on Linux; pre-create with `chown` to the runner user, or
+#               override below).
+#   dev:        $XDG_RUNTIME_DIR/cm-runner/secrets when XDG_RUNTIME_DIR is
+#               set, otherwise <os.TempDir()>/cm-runner-<uid>/secrets.
+#               The chosen path is logged at startup via AppliedDevDefaults.
+#
 # Env: CMR_SECRETS_DIR
-secrets_dir: "/var/run/cm-runner/secrets"
+# secrets_dir: "/var/run/cm-runner/secrets"
 
 # Path on the runner host to the task skills repo clone. Bind-mounted
 # read-only into worker containers at /host-skills. The entrypoint copies
@@ -186,16 +192,6 @@ webhook_replay_cache_size: 10000
 # before a replay becomes out-of-window on its own.
 webhook_replay_skew_seconds: 330
 
-# /message idempotency cache: stores the ack for each successful
-# (project, card_id, message_id) tuple so a client retry after a network
-# timeout sees the original 202 without a second stdin write.
-message_dedup_cache_size: 1000
-
-# TTL (seconds) for the /message dedup cache. Default 10 minutes — long
-# enough to cover operator-side retries but short enough that a new
-# message_id collision is vanishingly unlikely.
-message_dedup_ttl_seconds: 600
-
 # ----- Runtime watchdogs (CTXRUN-058) -----
 
 # Kill a container that has produced no output for this long. Go duration
@@ -209,13 +205,6 @@ idle_output_timeout: "30m"
 # worker containers (left over from crashes) and prunes dangling images
 # older than 24h. Must be positive. No env var override.
 maintenance_interval: "10m"
-
-# ----- Callback auth (CTXRUN-048) -----
-
-# Use HMAC-signed GET for VerifyAutonomous callbacks to ContextMatrix.
-# Set to false ONLY during the cross-repo transition if the CM server
-# does not yet accept HMAC on that endpoint. See CTXRUN-048.
-use_hmac_for_verify_autonomous: true
 
 # ----- Logging -----
 

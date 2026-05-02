@@ -41,6 +41,28 @@ disposable Docker containers per task. Each container runs Claude Code in
 headless mode, which connects back to ContextMatrix via MCP tools to claim
 cards, execute work, and report completion.
 
+### Phases and models
+
+The orchestrator FSM walks each card through a fixed set of phases. Each
+phase runs Claude Code with a phase-specific system prompt and model.
+Source of truth: `modelForPhase` in `internal/orchestrator/actions.go`.
+
+| Phase           | Model               | Mode     | Why                                                                 |
+| --------------- | ------------------- | -------- | ------------------------------------------------------------------- |
+| **Brainstorm**  | `claude-opus-4-7`   | HITL     | Invents the design from a fuzzy prompt; output drives every later phase. |
+| **Diagnose**    | `claude-opus-4-7`   | both     | Bug investigation; reasoning quality drives the rest of the run.    |
+| **Plan**        | `claude-opus-4-7`   | both     | Decomposes work into subtasks; structural decisions compound downstream. |
+| **Replan**      | `claude-opus-4-7`   | both     | Same code path as Plan; inherits the model.                         |
+| **Execute** (per-subtask) | `claude-sonnet-4-6` | both | Volume phase — many parallel subtask agents; tests verify correctness. |
+| **Document**    | `claude-sonnet-4-6` | both     | Summarisation-heavy; minimal docs only when user-facing behaviour changed. |
+| **Review**      | `claude-opus-4-7`   | both     | Critical evaluation against the plan; the gate before push/PR.       |
+
+The split is deliberate: **Opus** for the decision-heavy phases where reasoning
+quality compounds across the run, **Sonnet** for the volume phases where
+good-enough output at lower cost is the right tradeoff. The mapping is
+hard-coded in v1; future versions will read per-card overrides from runner
+config.
+
 ## Prerequisites
 
 - Go 1.26+
@@ -255,14 +277,14 @@ contextmatrix_url: "http://localhost:8080"
 # Env: CMR_API_KEY
 api_key: "your-shared-secret-here-at-least-32-chars"
 
-# Default Docker image for worker containers. MUST be @sha256:... pinned
+# Default Docker image for orchestrated worker containers. MUST be @sha256:... pinned
 # (enforced by Validate; mutable tags are rejected). See CTXRUN-044.
-# Env: CMR_BASE_IMAGE
-base_image: "contextmatrix/worker@sha256:<digest>"
+# Env: CMR_AGENT_IMAGE
+agent_image: "contextmatrix/orchestrated@sha256:<digest>"
 
 # Allowlist of permitted Docker images. When set, only listed images may be
 # used (including runner_image overrides from trigger payloads). When empty,
-# only base_image is permitted. Every entry MUST also be @sha256:... pinned.
+# only agent_image is permitted. Every entry MUST also be @sha256:... pinned.
 allowed_images: []
 
 # When to pull the image: always, never, if-not-present.
@@ -382,10 +404,10 @@ behaviour.
 
 ### Dev-mode relaxations
 
-1. **Unpinned image tags accepted** — `base_image`/`allowed_images` may use
-   mutable tags (e.g. `contextmatrix/worker:latest`). Each unpinned reference
+1. **Unpinned image tags accepted** — `agent_image`/`allowed_images` may use
+   mutable tags (e.g. `contextmatrix/orchestrated:latest`). Each unpinned reference
    logs on startup:
-   `level=WARN msg="dev profile: accepting unpinned image reference" field=base_image image=...`
+   `level=WARN msg="dev profile: accepting unpinned image reference" field=agent_image image=...`
 
 2. **Wider HMAC replay window** — `webhook_replay_skew_seconds` defaults to
    86400 (24 h) instead of 330 s, so a laptop that slept still processes
@@ -413,7 +435,7 @@ deployment_profile: dev
 
 contextmatrix_url: "https://your-cm-instance"
 api_key: "your-shared-secret-at-least-32-chars"
-base_image: "contextmatrix/worker:latest"
+agent_image: "contextmatrix/orchestrated:latest"
 
 anthropic_api_key: "sk-ant-..." # or claude_auth_dir / claude_oauth_token
 
@@ -512,15 +534,13 @@ dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
 
 All webhooks are signed with HMAC-SHA256 using a shared secret.
 
-| Direction   | Endpoint                  | Purpose                                       |
-| ----------- | ------------------------- | --------------------------------------------- |
-| CM → Runner | `POST /trigger`           | Start a task                                  |
-| CM → Runner | `POST /kill`              | Stop a specific task                          |
-| CM → Runner | `POST /stop-all`          | Stop all tasks (or per-project)               |
-| CM → Runner | `POST /message`           | Send a user message to an interactive session |
-| CM → Runner | `POST /promote`           | Promote interactive session to autonomous     |
-| CM → Runner | `POST /end-session`       | Close container stdin so claude exits on EOF  |
-| Runner → CM | `POST /api/runner/status` | Report container status                       |
+| Direction   | Endpoint                         | Purpose                              |
+| ----------- | -------------------------------- | ------------------------------------ |
+| CM → Runner | `POST /trigger`                  | Start a task                         |
+| CM → Runner | `POST /kill`                     | Stop a specific task                 |
+| CM → Runner | `POST /stop-all`                 | Stop all tasks (or per-project)      |
+| Runner → CM | `POST /api/runner/status`        | Report container status              |
+| Runner → CM | `POST /api/runner/skill-engaged` | Report a skill engagement (rolled up) |
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
 HMAC computed over `timestamp.body`. Max 5-minute clock skew.
@@ -538,22 +558,18 @@ non-zero exit), `completed` (clean exit).
 | `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                                                           |
 | `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted.                                       |
 | `runner_image` | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.                                               |
-| `interactive`  | bool   | no       | When `true`, runs Claude in stream-json HITL mode and attaches to container stdin. Use `/message` and `/promote` to interact. |
-| `model`        | string | no       | Model ID for the orchestrator (e.g. `claude-sonnet-4-6`). Passed through to the container environment.                        |
+| `interactive`  | bool   | no       | Deprecated; retained for backward compatibility. The runner now always uses the orchestrated path; HITL turns spawn `claude --resume` per message via the orchestrator FSM. |
 
 ## API Endpoints
 
-| Method | Path           | Auth | Description                                                                                                                                                            |
-| ------ | -------------- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/trigger`     | HMAC | Start a container for a card                                                                                                                                           |
-| POST   | `/kill`        | HMAC | Kill a specific container (idempotent; 200 on already-stopped)                                                                                                         |
-| POST   | `/stop-all`    | HMAC | Kill all containers (207 Multi-Status on partial failure)                                                                                                              |
-| POST   | `/message`     | HMAC | Send a user message to an interactive (HITL) session                                                                                                                   |
-| POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode                                                                                                                      |
-| POST   | `/end-session` | HMAC | Close stdin of an interactive container; claude exits on EOF                                                                                                           |
-| GET    | `/logs`        | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature. |
-| GET    | `/health`      | none | Health check                                                                                                                                                           |
-| GET    | `/readyz`      | none | Readiness probe (503 during preflight or drain)                                                                                                                        |
+| Method | Path        | Auth | Description                                                                                                                                                            |
+| ------ | ----------- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/trigger`  | HMAC | Start a container for a card                                                                                                                                           |
+| POST   | `/kill`     | HMAC | Kill a specific container (idempotent; 200 on already-stopped)                                                                                                         |
+| POST   | `/stop-all` | HMAC | Kill all containers (207 Multi-Status on partial failure)                                                                                                              |
+| GET    | `/logs`     | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature. |
+| GET    | `/health`   | none | Health check                                                                                                                                                           |
+| GET    | `/readyz`   | none | Readiness probe (503 during preflight or drain)                                                                                                                        |
 
 ### Response envelope
 
@@ -575,20 +591,18 @@ text. `/stop-all` returns a custom `StopAllResponse` with per-card `results`.
 
 ### Error codes
 
-| Code               | Status | Endpoint(s)                                        | Meaning                                                 |
-| ------------------ | ------ | -------------------------------------------------- | ------------------------------------------------------- |
-| `invalid_json`     | 400    | all mutating endpoints                             | request body was not valid JSON                         |
-| `invalid_field`    | 400    | all mutating endpoints                             | a field failed validation (`message` names the field)   |
-| `unauthorized`     | 401    | all HMAC-guarded endpoints                         | HMAC auth failed (missing header, bad sig, expired, …)  |
-| `not_found`        | 404    | `/message`, `/promote`, `/end-session`             | no container tracked for (project, card_id)             |
-| `conflict`         | 409    | `/trigger`, `/message`, `/promote`, `/end-session` | state conflict (already tracked, non-interactive, …)    |
-| `duplicate`        | 409    | all HMAC-guarded endpoints                         | HMAC signature replay detected                          |
-| `stdin_closed`     | 410    | `/message`, `/promote`                             | session has ended (stdin was once attached, now closed) |
-| `too_large`        | 413    | `/message`                                         | `content` exceeds 8192 bytes                            |
-| `limit_reached`    | 429    | `/trigger`                                         | `max_concurrent` reached                                |
-| `internal`         | 500    | any                                                | server-side bug; details logged, never echoed           |
-| `upstream_failure` | 502    | `/promote`                                         | CM verify-autonomous call failed                        |
-| `draining`         | 503    | `/trigger`, `/message`, `/promote`, `/end-session` | graceful shutdown in progress                           |
+| Code               | Status | Endpoint(s)                | Meaning                                                |
+| ------------------ | ------ | -------------------------- | ------------------------------------------------------ |
+| `invalid_json`     | 400    | all mutating endpoints     | request body was not valid JSON                        |
+| `invalid_field`    | 400    | all mutating endpoints     | a field failed validation (`message` names the field)  |
+| `unauthorized`     | 401    | all HMAC-guarded endpoints | HMAC auth failed (missing header, bad sig, expired, …) |
+| `conflict`         | 409    | `/trigger`                 | state conflict (already tracked)                       |
+| `duplicate`        | 409    | all HMAC-guarded endpoints | HMAC signature replay detected                         |
+| `too_large`        | 413    | mutating endpoints         | request body exceeds the runner's 1 MiB cap            |
+| `limit_reached`    | 429    | `/trigger`                 | `max_concurrent` reached                               |
+| `internal`         | 500    | any                        | server-side bug; details logged, never echoed          |
+| `upstream_failure` | 502    | `/trigger`                 | upstream Docker call failed                            |
+| `draining`         | 503    | `/trigger`, `/kill`        | graceful shutdown in progress                          |
 
 Raw `err.Error()` strings, HMAC-failure reasons, upstream response bodies, and
 unmarshal byte offsets are never echoed to clients — they are logged server-side
@@ -615,7 +629,7 @@ Every container is launched with the following restrictions:
 - **PID limit** (default 512, configurable via `container_pids_limit`). Prevents
   fork bombs from consuming all host PIDs.
 - **Image allowlist** (`allowed_images`). When set, only explicitly listed
-  images may be used. When empty, only the configured `base_image` is permitted.
+  images may be used. When empty, only the configured `agent_image` is permitted.
   This prevents trigger payloads from requesting execution of arbitrary images.
 - **Disposable containers**. Each task gets a fresh environment, destroyed after
   completion. No state persists between runs.
