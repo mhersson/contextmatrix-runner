@@ -82,11 +82,10 @@ func TestBuildWorkerSpec_TaskSkills(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			dp := &Dispatcher{
-				cfg: &config.Config{
-					AgentImage:    "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-					TaskSkillsDir: tc.taskSkillsDir,
-				},
+			dp := newTestDispatcher()
+			dp.cfg = &config.Config{
+				AgentImage:    "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				TaskSkillsDir: tc.taskSkillsDir,
 			}
 			payload := webhook.TriggerPayload{
 				CardID:     "TEST-1",
@@ -95,7 +94,7 @@ func TestBuildWorkerSpec_TaskSkills(t *testing.T) {
 				TaskSkills: tc.payloadSkills,
 			}
 
-			spec, _ := dp.buildWorkerSpec(payload, "http://cm:8080", "")
+			spec, _ := dp.buildWorkerSpec(t.Context(), payload, "http://cm:8080", "")
 
 			var hostSkillsMount *spawn.Mount
 
