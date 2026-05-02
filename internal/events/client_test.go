@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -144,5 +145,49 @@ func TestSSEClientStopsOnContextCancel(t *testing.T) {
 		require.False(t, ok, "events channel should close on cancel")
 	case <-time.After(time.Second):
 		t.Fatal("subscribe goroutine didn't exit on cancel")
+	}
+}
+
+// TestSSEClientReconstructsMultiLineData locks in the runner-side half of
+// the multi-line data contract: when CM emits one `data:` line per \n
+// fragment, the parser must join them back with \n so the orchestrator's
+// chat-input handlers see the original message intact.
+func TestSSEClientReconstructsMultiLineData(t *testing.T) {
+	const want = "line one\nline two\n\nline four after blank"
+
+	body := strings.NewReader(
+		"id: 1\n" +
+			"event: chat_input\n" +
+			"data: line one\n" +
+			"data: line two\n" +
+			"data: \n" +
+			"data: line four after blank\n" +
+			"\n",
+	)
+
+	c := &SSEClient{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	events := make(chan RunnerEvent, 1)
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- c.parseStream(ctx, body, events) }()
+
+	select {
+	case ev := <-events:
+		if ev.Type != "chat_input" {
+			t.Fatalf("Type: got %q, want chat_input", ev.Type)
+		}
+
+		if ev.Data != want {
+			t.Fatalf("Data round-trip:\n got: %q\nwant: %q", ev.Data, want)
+		}
+	case err := <-errCh:
+		t.Fatalf("parseStream returned before event: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for event")
 	}
 }

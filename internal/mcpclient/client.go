@@ -269,9 +269,13 @@ func (c *Client) UpdateCardBody(ctx context.Context, project, cardID, sectionNam
 	}, nil)
 }
 
-// UpdateCardField sends a field-only patch. CM's update_card tool only
-// accepts a fixed set of mutable fields; unknown fields are ignored.
-// The map is therefore forwarded verbatim with project/card_id added.
+// UpdateCardField sends a field-only patch. The accepted field set is
+// defined by CM's update_card MCP tool input (see
+// contextmatrix/internal/mcp/tools.go: updateCardInput). The map is
+// forwarded verbatim with project/card_id added; the MCP SDK's typed
+// input dispatch will silently drop any keys not in the schema, so
+// callers that need confirmation a field landed should re-read the
+// card via GetTaskContext.
 func (c *Client) UpdateCardField(ctx context.Context, project, cardID string, fields map[string]any) error {
 	args := map[string]any{
 		"project": project,

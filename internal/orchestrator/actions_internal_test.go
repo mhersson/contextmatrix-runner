@@ -1386,6 +1386,38 @@ func TestIntegrateSubtaskRepo_AbortsAndReturnsErrOnResolverFailure(t *testing.T)
 		"FastForwardFeature must NOT run when the resolver gave up")
 }
 
+// TestIntegrateSubtaskRepo_AbortsRebaseOnFastForwardFailure asserts that
+// when FastForwardFeature returns an error after a successful rebase
+// (clean or via the resolver), integrateSubtaskRepo defensively calls
+// AbortRebase so a leftover rebase state in the worktree can't confuse
+// the next attempt. AbortRebase is idempotent, so the call is safe even
+// when there's nothing to abort.
+func TestIntegrateSubtaskRepo_AbortsRebaseOnFastForwardFailure(t *testing.T) {
+	fsm := newTestFSM(t)
+
+	exec := &integrateExec{
+		ffErr: errors.New("boom"),
+	}
+	fsm.Context.Workspace = workspace.NewManager(
+		exec,
+		[]workspace.RepoSpec{{Slug: "auth", URL: "https://github.com/acme/auth.git"}},
+	)
+
+	// No Claude wrapper — the rebase is clean so the resolver must not spawn.
+	require.Nil(t, fsm.Context.Claude)
+
+	err := fsm.integrateSubtaskRepo(context.Background(), "auth", "SUB-1", "Add JWT", "feat/x")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "boom")
+
+	require.True(t, exec.hasCallContaining("rebase", "feat/x"),
+		"RebaseSubtask must still run on the FF-failure path")
+	require.True(t, exec.hasCallContaining("merge", "--ff-only", "cm/SUB-1"),
+		"FastForwardFeature must be attempted before AbortRebase fires")
+	require.True(t, exec.hasCallContaining("rebase", "--abort"),
+		"AbortRebase must run after FF failure to clean up any leftover rebase state")
+}
+
 func TestPushBranchesAndOpenPRsActionNoRepos(t *testing.T) {
 	fsm := newTestFSM(t)
 	fsm.ExtendedState.Card = &Card{ID: "P-1"}

@@ -1062,6 +1062,13 @@ func (fsm *ContextMatrixOrchestrator) integrateSubtaskRepo(ctx context.Context, 
 	}
 
 	if ferr := fsm.Context.Workspace.FastForwardFeature(ctx, repoSlug, subtaskID, featureBranch); ferr != nil {
+		// FF failed after rebase completed (clean or via resolver). Defensively
+		// abort any leftover rebase state in the worktree — AbortRebase is
+		// idempotent (workspace/finalize.go) so the call is a safe no-op when
+		// there's nothing to abort, and prevents a half-completed integration
+		// from confusing the next attempt.
+		_ = fsm.Context.Workspace.AbortRebase(ctx, repoSlug, subtaskID)
+
 		return fmt.Errorf("integrate %s on %s: %w", subtaskID, repoSlug, ferr)
 	}
 
