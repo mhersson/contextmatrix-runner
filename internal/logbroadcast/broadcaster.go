@@ -30,8 +30,7 @@ type LogEntry struct {
 	CardID    string    `json:"card_id"`
 	Project   string    `json:"project"`
 	// Type is one of: text, thinking, tool_call, stderr, system, user.
-	// "user" is a message submitted via the HITL chat input — published
-	// directly by the /message webhook handler, bypassing logparser.Redact.
+	// "user" is a message submitted via the HITL chat input.
 	Type    string `json:"type"`
 	Content string `json:"content"`
 }
@@ -213,10 +212,11 @@ func (b *Broadcaster) Subscribe(project string) (<-chan LogEntry, func()) {
 //
 // Because the send runs outside the lock, a concurrent Unsubscribe can close
 // a snapshotted subscriber's channel between the snapshot and the send. We
-// guard each send with trySend, which recovers from the "send on closed
-// channel" panic and treats it as a drop — consistent with the semantics of
-// an unsubscribed client (they asked to stop receiving, so losing this
-// in-flight entry is expected and invisible to them).
+// guard each send with trySend, which serialises against Unsubscribe via the
+// per-subscriber closeMu + closed flag so we never attempt a send on a
+// closed channel — concurrent unsubscribers are treated as a drop, consistent
+// with the semantics of an unsubscribed client (they asked to stop receiving,
+// so losing this in-flight entry is expected and invisible to them).
 func (b *Broadcaster) Publish(entry LogEntry) {
 	b.mu.RLock()
 

@@ -309,17 +309,15 @@ func TestUserEntryFanOutVerbatim(t *testing.T) {
 
 // TestUserEntryNotRedacted is a regression test asserting that user-submitted
 // content containing a Bearer token is delivered verbatim to broadcaster
-// subscribers. The Broadcaster.Publish path does not invoke logparser.Redact;
-// redaction only occurs inside logparser.ProcessStream (for assistant text/
-// thinking blocks) and the stderr scanner in container/manager.go.
-// User-typed secrets are the user's own responsibility.
+// subscribers. The Broadcaster.Publish path does not redact; user-typed
+// secrets are the user's own responsibility.
 func TestUserEntryNotRedacted(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
 
 	ch, unsub := b.Subscribe("")
 	defer unsub()
 
-	// A Bearer token that logparser.Redact would normally replace with [REDACTED].
+	// A Bearer token to confirm the broadcaster does not redact it.
 	secretContent := "Please use Bearer abcdefghijklmnopqrstuvwxyz1234567890 for auth"
 
 	b.Publish(logbroadcast.LogEntry{
