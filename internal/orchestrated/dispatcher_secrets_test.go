@@ -28,11 +28,10 @@ import (
 func TestBuildWorkerSpec_SecretsRoutedToFile(t *testing.T) {
 	t.Parallel()
 
-	dp := &Dispatcher{
-		cfg: &config.Config{
-			AgentImage:       "contextmatrix/orchestrated@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-			ClaudeOAuthToken: "claude-oauth-secret",
-		},
+	dp := newTestDispatcher()
+	dp.cfg = &config.Config{
+		AgentImage:       "contextmatrix/orchestrated@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ClaudeOAuthToken: "claude-oauth-secret",
 	}
 	payload := webhook.TriggerPayload{
 		CardID:    "ALPHA-9",
@@ -40,7 +39,7 @@ func TestBuildWorkerSpec_SecretsRoutedToFile(t *testing.T) {
 		MCPAPIKey: "mcp-secret",
 	}
 
-	spec, secrets := dp.buildWorkerSpec(payload, "http://cm:8080", "/tmp/cm-secrets/cm-agent-alpha-alpha-9.env")
+	spec, secrets := dp.buildWorkerSpec(t.Context(), payload, "http://cm:8080", "/tmp/cm-secrets/cm-agent-alpha-alpha-9.env")
 
 	// MCP_API_KEY is staged via the secrets file, never on Config.Env.
 	_, present := spec.Env["MCP_API_KEY"]
@@ -88,11 +87,10 @@ func TestBuildWorkerSpec_SecretsRoutedToFile(t *testing.T) {
 func TestBuildWorkerSpec_SecretsFallbackToEnv(t *testing.T) {
 	t.Parallel()
 
-	dp := &Dispatcher{
-		cfg: &config.Config{
-			AgentImage:      "contextmatrix/orchestrated@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-			AnthropicAPIKey: "anthropic-secret",
-		},
+	dp := newTestDispatcher()
+	dp.cfg = &config.Config{
+		AgentImage:      "contextmatrix/orchestrated@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		AnthropicAPIKey: "anthropic-secret",
 	}
 	payload := webhook.TriggerPayload{
 		CardID:    "BETA-1",
@@ -100,7 +98,7 @@ func TestBuildWorkerSpec_SecretsFallbackToEnv(t *testing.T) {
 		MCPAPIKey: "mcp-secret",
 	}
 
-	spec, secrets := dp.buildWorkerSpec(payload, "http://cm:8080", "")
+	spec, secrets := dp.buildWorkerSpec(t.Context(), payload, "http://cm:8080", "")
 
 	// Without a secrets file path, the MCP key lives on Env.
 	assert.Equal(t, "mcp-secret", spec.Env["MCP_API_KEY"])

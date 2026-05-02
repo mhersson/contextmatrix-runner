@@ -14,8 +14,11 @@ package orchestrated
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,7 +73,21 @@ type Dispatcher struct {
 	callback    *callback.Client
 	broadcaster *logbroadcast.Broadcaster
 	tracker     *tracker.Tracker
+	// dnsCache memoises buildExtraHosts() resolver calls so a spawn burst
+	// against the same MCP hostname doesn't pay N DNS RTTs. Lifetime is
+	// process-long; TTL is dnsCacheTTL.
+	dnsCache *dnsCache
+	// resolver is the DNS resolver used by buildExtraHosts. Swappable for
+	// tests; nil is treated as net.DefaultResolver.
+	resolver hostResolver
 }
+
+// dnsLookupTimeout bounds buildExtraHosts' resolver call. An attacker who
+// points the card's MCP URL at a slow-responding authoritative server could
+// otherwise stall the spawn path indefinitely; the deadline caps exposure
+// at 2s and then falls back to running the container without the ExtraHosts
+// entry.
+const dnsLookupTimeout = 2 * time.Second
 
 // New wires up the spawner and logger. Returns an error when essential
 // config is missing so callers fail loudly during bootstrap rather than
@@ -102,6 +119,7 @@ func New(d Deps) (*Dispatcher, error) {
 		callback:    d.Callback,
 		broadcaster: d.Broadcaster,
 		tracker:     d.Tracker,
+		dnsCache:    newDNSCache(dnsCacheTTL, dnsCacheCapacity),
 	}, nil
 }
 
@@ -211,7 +229,7 @@ func (dp *Dispatcher) Dispatch(ctx context.Context, p webhook.TriggerPayload, ca
 		secretsFilePath = filepath.Join(dp.cfg.SecretsDir, workerContainerName(p)+".env")
 	}
 
-	workerSpec, secretEnv := dp.buildWorkerSpec(p, containerMCPURL, secretsFilePath)
+	workerSpec, secretEnv := dp.buildWorkerSpec(ctx, p, containerMCPURL, secretsFilePath)
 
 	if secretsFilePath != "" {
 		if err := writeSecretsFile(secretsFilePath, secretEnv); err != nil {
@@ -263,6 +281,19 @@ func (dp *Dispatcher) Dispatch(ctx context.Context, p webhook.TriggerPayload, ca
 			// the orchestrated container. Tracker is optional in tests.
 			if dp.tracker != nil {
 				dp.tracker.UpdateContainerID(p.Project, p.CardID, w.ID())
+			}
+
+			// Wait for the entrypoint to finish staging credentials before
+			// any docker-exec touches Claude. Without this the first phase
+			// races against `cp -r /claude-auth/.` (which can be hundreds
+			// of megabytes on an active developer machine), so claude
+			// reads a half-populated $HOME/.claude.json and 401s with
+			// "OAuth authentication is currently not supported".
+			if waitErr := waitForEntrypointReady(ctx, w, dp.logger); waitErr != nil {
+				dp.logger.Warn("worker entrypoint readiness wait failed",
+					"err", waitErr,
+					"worker", w.ID(),
+				)
 			}
 
 			// Smoke test the worker: run `claude --version` so we know the
@@ -497,7 +528,7 @@ const secretsMountTarget = "/run/cm-secrets/env" //nolint:gosec // path, not a c
 // GitHub tokens are NOT spawn-time secrets: the runner mints a fresh
 // token before each docker-exec via workspaceExec, so neither
 // Config.Env nor the secrets file ever holds CM_GIT_TOKEN/GH_TOKEN.
-func (dp *Dispatcher) buildWorkerSpec(p webhook.TriggerPayload, containerMCPURL, secretsFilePath string) (spawn.WorkerSpec, map[string]string) {
+func (dp *Dispatcher) buildWorkerSpec(ctx context.Context, p webhook.TriggerPayload, containerMCPURL, secretsFilePath string) (spawn.WorkerSpec, map[string]string) {
 	env := map[string]string{
 		"MCP_URL":    containerMCPURL + "/mcp",
 		"CM_CARD_ID": p.CardID,
@@ -511,15 +542,46 @@ func (dp *Dispatcher) buildWorkerSpec(p webhook.TriggerPayload, containerMCPURL,
 	var mounts []spawn.Mount
 
 	if dp.cfg.ClaudeAuthDir != "" {
-		// Bind-mount the host's ~/.claude into the container at the
-		// running user's home. The orchestrated entrypoint then writes
-		// $HOME/.claude.json next to it; pre-existing OAuth tokens
-		// inside the mount stay readable.
+		// Bind-mount the host's ~/.claude read-only at /claude-auth (legacy
+		// path). The entrypoint copies its contents into $HOME/.claude/ so
+		// the worker gets the host's credentials without any path inside
+		// the worker being able to write back to the host. Mounting
+		// read-only at a separate target also leaves $HOME/.claude/ in
+		// tmpfs so writes done by the entrypoint (settings.json,
+		// .claude.json) and by Claude itself (project history, etc.) never
+		// persist to the host.
 		mounts = append(mounts, spawn.Mount{
 			Source:   dp.cfg.ClaudeAuthDir,
-			Target:   "/home/user/.claude",
-			ReadOnly: false,
+			Target:   "/claude-auth",
+			ReadOnly: true,
 		})
+
+		// Also mount the host's ~/.claude.json (sibling file, not inside
+		// the .claude/ dir). Claude Code stores subscription/account state
+		// there — userID, oauthAccount, hasAvailableSubscription,
+		// migration flags. Without it Claude considers a fresh worker
+		// "first run", backs up our merged file, and rewrites it with a
+		// minimal template. Either the rewrite drops mcpServers (worker
+		// loses the contextmatrix MCP), or the OAuth flow ends up routing
+		// through the API-key endpoint (401 "OAuth authentication is
+		// currently not supported"). Skip the mount if the host file does
+		// not exist; Docker would otherwise create an empty directory at
+		// the source path.
+		hostClaudeJSON := filepath.Join(filepath.Dir(dp.cfg.ClaudeAuthDir), ".claude.json")
+		if _, err := os.Stat(hostClaudeJSON); err == nil {
+			mounts = append(mounts, spawn.Mount{
+				Source:   hostClaudeJSON,
+				Target:   "/claude-auth.json",
+				ReadOnly: true,
+			})
+		}
+	}
+
+	// Operator-supplied claude_settings: written to ~/.claude/settings.json
+	// by the entrypoint after the optional /host-claude copy so the
+	// operator's settings always win over a host-side settings.json.
+	if dp.cfg.ClaudeSettings != "" {
+		env["CM_CLAUDE_SETTINGS"] = dp.cfg.ClaudeSettings
 	}
 
 	// Task skills: when the runner is configured with a host skills dir,
@@ -590,10 +652,12 @@ func (dp *Dispatcher) buildWorkerSpec(p webhook.TriggerPayload, containerMCPURL,
 			cmcontainer.LabelCardID:  p.CardID,
 		},
 		// host-gateway lets host.docker.internal resolve from inside the
-		// container on Linux (Docker Desktop adds it automatically). Without
-		// this, every Claude → CM MCP call inside the worker dies with DNS
-		// "no such host".
-		ExtraHosts: []string{"host.docker.internal:host-gateway"},
+		// container on Linux. We additionally resolve the MCP URL hostname
+		// on the runner host (which sees the host's /etc/hosts) and inject
+		// the result so a LAN-only / split-horizon name reaches CM from
+		// inside the worker even when the container's resolver can't see
+		// it.
+		ExtraHosts: dp.buildExtraHosts(ctx, containerMCPURL),
 		Resources: spawn.ResourceLimits{
 			MemoryBytes: dp.cfg.ContainerMemoryLimit,
 			PIDs:        dp.cfg.ContainerPidsLimit,
@@ -640,6 +704,72 @@ const (
 	workerUID = 1000
 	workerGID = 1000
 )
+
+// buildExtraHosts returns the /etc/hosts entries Docker should add to the
+// worker container. host.docker.internal is always included so the
+// host-gateway alias resolves on Linux. When containerMCPURL points at a
+// hostname (not an IP, localhost, or host.docker.internal), the runner
+// resolves it on the host's resolver — which honours /etc/hosts via
+// nsswitch — and pins the result into the container so a LAN-only or
+// split-horizon name still reaches CM from inside the worker.
+//
+// Resolution failures (timeout, NXDOMAIN, parse error) degrade silently to
+// the default entry; the spawn path must never block on DNS. Successful
+// lookups are memoised in dnsCache for dnsCacheTTL so a spawn burst pays
+// at most one resolver RTT per hostname.
+func (dp *Dispatcher) buildExtraHosts(_ context.Context, mcpURL string) []string {
+	hosts := []string{"host.docker.internal:host-gateway"}
+
+	u, err := url.Parse(mcpURL)
+	if err != nil || u.Hostname() == "" {
+		return hosts
+	}
+
+	hostname := u.Hostname()
+	if net.ParseIP(hostname) != nil || hostname == "localhost" || hostname == "host.docker.internal" {
+		return hosts
+	}
+
+	if dp.dnsCache != nil {
+		if addrs, ok := dp.dnsCache.get(hostname); ok && len(addrs) > 0 {
+			hosts = append(hosts, hostname+":"+addrs[0])
+
+			return hosts
+		}
+	}
+
+	resolver := dp.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+
+	// Use context.Background as the parent so a nearly-cancelled parent
+	// ctx doesn't cut the deadline short — the 2s cap is already tight.
+	lookupCtx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
+	defer cancel()
+
+	addrs, err := resolver.LookupHost(lookupCtx, hostname)
+	if err != nil || len(addrs) == 0 {
+		if errors.Is(err, context.DeadlineExceeded) || lookupCtx.Err() != nil {
+			dp.logger.Warn("MCP hostname lookup timed out; container will run without ExtraHosts mapping",
+				"hostname", hostname, "timeout", dnsLookupTimeout)
+		} else {
+			dp.logger.Warn("could not resolve MCP hostname for container",
+				"hostname", hostname, "error", err)
+		}
+
+		return hosts
+	}
+
+	if dp.dnsCache != nil {
+		dp.dnsCache.put(hostname, addrs)
+	}
+
+	hosts = append(hosts, hostname+":"+addrs[0])
+	dp.logger.Info("added MCP host to container", "hostname", hostname, "ip", addrs[0])
+
+	return hosts
+}
 
 // claudeAuthEnv returns the per-exec env that authenticates Claude
 // inside the worker. The runner injects this on every Claude
@@ -831,4 +961,59 @@ func (n *broadcasterNotifier) Notify(kind, message string) {
 		Type:      kind,
 		Content:   message,
 	})
+}
+
+// entrypointReadyMarker is the path the orchestrated entrypoint touches
+// once it has staged every file Claude needs at first-exec time
+// (.claude.json, .credentials.json, settings.json). The bulk copy of
+// ~/.claude/ runs after this marker, so the marker may exist before the
+// container is fully populated — that is fine, only the auth/MCP files
+// are critical for the first phase exec.
+const entrypointReadyMarker = "/tmp/.cm-entrypoint-ready"
+
+// entrypointReadyTimeout caps how long we wait for the marker. The
+// fast operations the marker covers complete in tens of milliseconds
+// even on slow disks, so a generous 30s ceiling only ever fires when
+// the entrypoint itself crashed before reaching the marker.
+const entrypointReadyTimeout = 30 * time.Second
+
+// waitForEntrypointReady polls the worker for the readiness marker the
+// entrypoint touches once auth/MCP files are staged. Without this the
+// runner's first phase exec races against the entrypoint's slow bulk
+// copy and Claude reads a half-populated $HOME/.claude.json.
+//
+// The poll uses `test -f` via docker-exec rather than ContainerExecCreate
+// pre-checks because it costs nothing on a hit and handles the race
+// where the worker is "running" per Docker but PID 1 hasn't begun
+// executing the script yet.
+func waitForEntrypointReady(ctx context.Context, w spawn.Worker, logger *slog.Logger) error {
+	deadline := time.Now().Add(entrypointReadyTimeout)
+
+	pollCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	const pollInterval = 50 * time.Millisecond
+
+	for {
+		res, err := w.Exec(pollCtx, spawn.ExecOptions{
+			Cmd:          []string{"test", "-f", entrypointReadyMarker},
+			AttachStdout: true,
+			AttachStderr: true,
+		})
+		if err == nil && res.ExitCode == 0 {
+			return nil
+		}
+
+		if pollCtx.Err() != nil {
+			return fmt.Errorf("entrypoint readiness wait timed out after %s", entrypointReadyTimeout)
+		}
+
+		select {
+		case <-pollCtx.Done():
+			return fmt.Errorf("entrypoint readiness wait timed out after %s", entrypointReadyTimeout)
+		case <-time.After(pollInterval):
+		}
+
+		_ = logger // suppressed-poll messages would be too noisy; keep the parameter for future use
+	}
 }

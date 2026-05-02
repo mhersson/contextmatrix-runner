@@ -17,18 +17,18 @@ import (
 func TestBuildWorkerSpec_Labels(t *testing.T) {
 	t.Parallel()
 
-	dp := &Dispatcher{
-		cfg: &config.Config{
-			AgentImage: "contextmatrix/orchestrated@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		},
+	dp := newTestDispatcher()
+	dp.cfg = &config.Config{
+		AgentImage: "contextmatrix/orchestrated@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 	}
+
 	payload := webhook.TriggerPayload{
 		CardID:    "ALPHA-007",
 		Project:   "alpha",
 		MCPAPIKey: "k",
 	}
 
-	spec, _ := dp.buildWorkerSpec(payload, "http://cm:8080", "")
+	spec, _ := dp.buildWorkerSpec(t.Context(), payload, "http://cm:8080", "")
 
 	assert.Equal(t, "true", spec.Labels[container.LabelRunner])
 	assert.Equal(t, "alpha", spec.Labels[container.LabelProject])
