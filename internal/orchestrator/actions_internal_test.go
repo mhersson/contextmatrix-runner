@@ -541,6 +541,74 @@ func TestRunChatLoopInjectsGitTokenEnv(t *testing.T) {
 		"chat-loop Spawn must inject GH_TOKEN on the per-turn Claude exec")
 }
 
+// TestRunEphemeralPhaseInjectsClaudeAuthEnv pins the regression that
+// triggered "Not logged in · Please run /login" inside the worker:
+// CLAUDE_CODE_OAUTH_TOKEN (and ANTHROPIC_API_KEY) must reach `claude`
+// via the per-exec env on every Spawn. The orchestrated worker is a
+// long-lived `sleep infinity` shell — docker exec does not inherit the
+// entrypoint's env, so anything sourced into the entrypoint shell from
+// the secrets file is invisible to the Claude exec.
+func TestRunEphemeralPhaseInjectsClaudeAuthEnv(t *testing.T) {
+	fsm := newTestFSM(t)
+	fsm.ExtendedState.Project = "p1"
+	fsm.ExtendedState.CardID = "ABC-1"
+	fsm.ExtendedState.AgentID = "agent:test"
+	fsm.ExtendedState.Card = &Card{ID: "ABC-1"}
+	fsm.Context.GitTokens = &mockGitTokens{}
+	fsm.Context.ClaudeAuthEnv = map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": "tok-abc"}
+
+	fakeAPI := newFakeExecAPI()
+	fsm.Context.Claude = claudeclient.NewWrapperWithExecAPI(fakeAPI, nil)
+
+	go func() {
+		_, _ = fakeAPI.stdoutWrite.Write([]byte(`{"type":"system","subtype":"init","session_id":"sess_1"}` + "\n"))
+		_, _ = fakeAPI.stdoutWrite.Write([]byte(`{"type":"text","text":"PLAN_DRAFTED\ncard_id: ABC-1\nstatus: drafted\nplan_summary: ok\nsubtask_count: 0\n"}` + "\n"))
+		_, _ = fakeAPI.stdoutWrite.Write([]byte(`{"type":"system","subtype":"end","usage":{"input_tokens":1,"output_tokens":1}}` + "\n"))
+		_ = fakeAPI.stdoutWrite.Close()
+	}()
+
+	require.NoError(t, fsm.RunPlanPhaseAction())
+	require.NoError(t, fsm.ExtendedState.Error)
+
+	require.Contains(t, fakeAPI.lastEnv, "CLAUDE_CODE_OAUTH_TOKEN=tok-abc",
+		"ephemeral phase Spawn must inject CLAUDE_CODE_OAUTH_TOKEN so the worker's "+
+			"`claude` subprocess can authenticate; without this, agent invocations "+
+			"die with \"Not logged in\"")
+}
+
+// TestRunChatLoopInjectsClaudeAuthEnv is the chat-loop counterpart of
+// TestRunEphemeralPhaseInjectsClaudeAuthEnv. HITL phases run their
+// turns through runOneChatTurn, which must carry the Claude auth env
+// on every per-turn `docker exec claude` just like the autonomous path.
+func TestRunChatLoopInjectsClaudeAuthEnv(t *testing.T) {
+	fsm := newTestFSM(t)
+	fsm.ExtendedState.Project = "p1"
+	fsm.ExtendedState.CardID = "ABC-1"
+	fsm.ExtendedState.AgentID = "agent:test"
+	fsm.ExtendedState.Card = &Card{ID: "ABC-1"}
+	fsm.Context.GitTokens = &mockGitTokens{}
+	fsm.Context.ClaudeAuthEnv = map[string]string{"ANTHROPIC_API_KEY": "key-xyz"}
+
+	fsm.ExtendedState.ChatInputCh = make(chan string, 4)
+	fsm.ExtendedState.StopCh = make(chan struct{}, 1)
+
+	fakeAPI := newFakeExecAPI()
+	fsm.Context.Claude = claudeclient.NewWrapperWithExecAPI(fakeAPI, nil)
+
+	go func() {
+		_, _ = fakeAPI.stdoutWrite.Write([]byte(`{"type":"system","subtype":"init","session_id":"sess_brain"}` + "\n"))
+		_, _ = fakeAPI.stdoutWrite.Write([]byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__contextmatrix__discovery_complete","input":{"design_summary":"ok"}}]}}` + "\n"))
+		_, _ = fakeAPI.stdoutWrite.Write([]byte(`{"type":"system","subtype":"end","usage":{"input_tokens":1,"output_tokens":1}}` + "\n"))
+		_ = fakeAPI.stdoutWrite.Close()
+	}()
+
+	require.NoError(t, fsm.RunBrainstormingDialogueAction())
+	require.NoError(t, fsm.ExtendedState.Error)
+
+	require.Contains(t, fakeAPI.lastEnv, "ANTHROPIC_API_KEY=key-xyz",
+		"chat-loop Spawn must inject ANTHROPIC_API_KEY on the per-turn Claude exec")
+}
+
 // TestRunBrainstormingDialogueDrainsBufferedPromotionMessage exercises
 // the regression: when the user clicks Promote DURING an in-flight turn,
 // the driver flips Mode to Autonomous AND buffers the canned promotion

@@ -189,12 +189,21 @@ func (dp *Dispatcher) Dispatch(ctx context.Context, p webhook.TriggerPayload, ca
 		)
 	}
 
-	// Stage credentials in a tmpfs-backed file the entrypoint sources at
-	// startup so MCP_API_KEY / *_OAUTH_TOKEN never appear in
-	// `docker inspect`. GitHub tokens are NOT staged here — they are
-	// minted on demand and injected per docker-exec by workspaceExec, so
-	// every git/gh subprocess inside the worker sees a freshly-minted,
-	// non-expired token regardless of how long the card runs.
+	// Stage MCP_API_KEY in a tmpfs-backed file the entrypoint sources at
+	// startup so it never appears in `docker inspect`. The entrypoint
+	// uses it to write $HOME/.claude.json (Claude reads the bearer from
+	// disk, not env, on every exec) and then unsets it.
+	//
+	// CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY are NOT staged here:
+	// docker exec ignores PID 1's env, so anything sourced into the
+	// entrypoint shell is invisible to subsequent execs. Those land
+	// per-exec via driver.Config.ClaudeAuthEnv (claudeAuthEnv()).
+	//
+	// GitHub tokens are likewise per-exec — minted on demand and
+	// injected by workspaceExec — so every git/gh subprocess inside the
+	// worker sees a freshly-minted, non-expired token regardless of how
+	// long the card runs.
+	//
 	// SecretsDir empty disables the file path (e.g. unit tests);
 	// buildWorkerSpec then folds the remaining secrets back into Env.
 	secretsFilePath := ""
@@ -326,8 +335,9 @@ func (dp *Dispatcher) Dispatch(ctx context.Context, p webhook.TriggerPayload, ca
 			}, nil
 		},
 
-		MCP:       mcp,
-		GitTokens: dp.gitTokens,
+		MCP:           mcp,
+		GitTokens:     dp.gitTokens,
+		ClaudeAuthEnv: claudeAuthEnv(dp.cfg),
 
 		SSE:               sse,
 		Logger:            dp.logger,
@@ -468,14 +478,17 @@ const secretsMountTarget = "/run/cm-secrets/env" //nolint:gosec // path, not a c
 //
 //	claude_auth_dir > claude_oauth_token > anthropic_api_key
 //
-// Without one of these the spawned Claude has no credentials, makes
-// no API calls, and exits silently — exactly what we just observed.
+// Only the auth_dir branch lands here (as a bind-mount). The OAuth
+// token / API key paths are handled per-exec via
+// driver.Config.ClaudeAuthEnv → orchestrator.Context.ClaudeAuthEnv —
+// see claudeAuthEnv() below. They cannot live in the spawn-time
+// secrets file because the worker's PID 1 is `sleep infinity` and
+// `docker exec` does not inherit the entrypoint shell's env.
 //
-// secretsFilePath, when non-empty, redirects credential-bearing env
-// (MCP_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY) into a
+// secretsFilePath, when non-empty, redirects MCP_API_KEY into a
 // separate map returned alongside the spec; the caller writes that map
 // to disk with 0600 perms and bind-mounts it read-only at
-// /run/cm-secrets/env. Secrets are kept off Config.Env so
+// /run/cm-secrets/env. The MCP key is kept off Config.Env so
 // `docker inspect` reveals only non-credential plumbing.
 //
 // When secretsFilePath is empty the secrets fall back into Env — kept for
@@ -497,8 +510,7 @@ func (dp *Dispatcher) buildWorkerSpec(p webhook.TriggerPayload, containerMCPURL,
 
 	var mounts []spawn.Mount
 
-	switch {
-	case dp.cfg.ClaudeAuthDir != "":
+	if dp.cfg.ClaudeAuthDir != "" {
 		// Bind-mount the host's ~/.claude into the container at the
 		// running user's home. The orchestrated entrypoint then writes
 		// $HOME/.claude.json next to it; pre-existing OAuth tokens
@@ -508,10 +520,6 @@ func (dp *Dispatcher) buildWorkerSpec(p webhook.TriggerPayload, containerMCPURL,
 			Target:   "/home/user/.claude",
 			ReadOnly: false,
 		})
-	case dp.cfg.ClaudeOAuthToken != "":
-		secrets["CLAUDE_CODE_OAUTH_TOKEN"] = dp.cfg.ClaudeOAuthToken
-	case dp.cfg.AnthropicAPIKey != "":
-		secrets["ANTHROPIC_API_KEY"] = dp.cfg.AnthropicAPIKey
 	}
 
 	// Task skills: when the runner is configured with a host skills dir,
@@ -632,6 +640,34 @@ const (
 	workerUID = 1000
 	workerGID = 1000
 )
+
+// claudeAuthEnv returns the per-exec env that authenticates Claude
+// inside the worker. The runner injects this on every Claude
+// docker-exec via orchestrator.Context.ClaudeAuthEnv → spawnEnv. It
+// cannot be a spawn-time env or a sourced secrets file because
+// `docker exec` does not inherit the entrypoint shell's env: PID 1 is
+// `sleep infinity`, and exec'd processes only see Container.Config.Env
+// plus the per-exec env passed into ContainerExecCreate.
+//
+// Priority mirrors buildWorkerSpec's auth-dir mount precedence:
+//
+//	claude_auth_dir > claude_oauth_token > anthropic_api_key
+//
+// Returns nil when claude_auth_dir is configured (Claude reads
+// credentials from the bind-mounted ~/.claude/.credentials.json
+// instead) or when no auth source is configured at all.
+func claudeAuthEnv(cfg *config.Config) map[string]string {
+	switch {
+	case cfg.ClaudeAuthDir != "":
+		return nil
+	case cfg.ClaudeOAuthToken != "":
+		return map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": cfg.ClaudeOAuthToken}
+	case cfg.AnthropicAPIKey != "":
+		return map[string]string{"ANTHROPIC_API_KEY": cfg.AnthropicAPIKey}
+	}
+
+	return nil
+}
 
 // writeSecretsFile writes the credential map to path with 0600 perms,
 // one KEY=VALUE per line, suitable for being sourced by /bin/sh. The

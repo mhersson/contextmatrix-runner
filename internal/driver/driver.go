@@ -40,6 +40,12 @@ type Config struct {
 	GitTokens githubauth.TokenGenerator
 	Notifier  orchestrator.Notifier
 
+	// ClaudeAuthEnv is the static auth env injected on every Claude
+	// docker-exec (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY). Empty
+	// when claude_auth_dir is configured (auth comes from the bind-
+	// mounted on-disk credentials file instead).
+	ClaudeAuthEnv map[string]string
+
 	// SkillIndex is the full task-skill catalog loaded from
 	// runner cfg.TaskSkillsDir; nil when task-skills are disabled.
 	SkillIndex []orchestrator.SkillInfo
@@ -139,6 +145,7 @@ func (d *Driver) Drive(parent context.Context) error {
 	sm.Context.Workspace = d.cfg.Workspace
 	sm.Context.GitTokens = d.cfg.GitTokens
 	sm.Context.Notifier = d.cfg.Notifier
+	sm.Context.ClaudeAuthEnv = d.cfg.ClaudeAuthEnv
 	sm.Context.SkillIndex = d.cfg.SkillIndex
 	sm.Context.WorkerContainerID = workerID
 

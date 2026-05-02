@@ -20,6 +20,15 @@ type Context struct {
 	GitTokens githubauth.TokenGenerator
 	Notifier  Notifier
 
+	// ClaudeAuthEnv is the static auth env injected on every Claude
+	// docker-exec (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY). It is
+	// per-exec rather than spawn-time because the worker's PID 1 is
+	// `sleep infinity` and `docker exec` does not inherit the
+	// entrypoint shell's env — only Container.Config.Env plus per-exec
+	// env. Empty when Claude auth is provided via a mounted
+	// claude_auth_dir on disk.
+	ClaudeAuthEnv map[string]string
+
 	// SkillIndex is the curated task-skill catalog loaded from
 	// cfg.TaskSkillsDir at dispatch time. Empty when task-skills are
 	// disabled. Priming builders render the per-card subset selected

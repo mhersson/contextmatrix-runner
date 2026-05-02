@@ -552,6 +552,30 @@ func gitTokenEnv(ctx context.Context, g githubauth.TokenGenerator) (map[string]s
 	}, nil
 }
 
+// spawnEnv returns the per-exec env for a Claude docker-exec: a
+// freshly-minted GitHub token (when configured) merged with the
+// runner's static Claude auth env. Without ClaudeAuthEnv on the spawn,
+// the worker's `claude` subprocess sees no CLAUDE_CODE_OAUTH_TOKEN /
+// ANTHROPIC_API_KEY (the entrypoint shell that sourced the secrets
+// file is a different process tree than docker-exec), and Claude
+// errors out with "Not logged in".
+func spawnEnv(ctx context.Context, fsmCtx *Context) (map[string]string, error) {
+	env, err := gitTokenEnv(ctx, fsmCtx.GitTokens)
+	if err != nil {
+		return nil, err
+	}
+
+	for k, v := range fsmCtx.ClaudeAuthEnv {
+		if env == nil {
+			env = make(map[string]string, len(fsmCtx.ClaudeAuthEnv))
+		}
+
+		env[k] = v
+	}
+
+	return env, nil
+}
+
 // runChatLoop drives a multi-turn chat with the human via ChatInputCh.
 // Each turn is a fresh `claude --print --resume` invocation: send the
 // user message, close stdin, drain the response, capture the new
@@ -700,7 +724,7 @@ func (fsm *ContextMatrixOrchestrator) runOneChatTurn(
 			"msg_preview", truncate(userMsg, 200))
 	}
 
-	env, err := gitTokenEnv(ctx, fsm.Context.GitTokens)
+	env, err := spawnEnv(ctx, fsm.Context)
 	if err != nil {
 		return sessionID, false, nil, fmt.Errorf("%s: %w", cfg.phase, err)
 	}
@@ -856,7 +880,7 @@ func (fsm *ContextMatrixOrchestrator) runEphemeralPhase(
 	workingDir string,
 	primingContent string,
 ) (string, claudeclient.Usage, error) {
-	env, err := gitTokenEnv(ctx, fsm.Context.GitTokens)
+	env, err := spawnEnv(ctx, fsm.Context)
 	if err != nil {
 		return "", claudeclient.Usage{}, err
 	}
