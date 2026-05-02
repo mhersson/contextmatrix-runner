@@ -61,9 +61,9 @@ func chatMessageForPhase(name string) string {
 	case "diagnose":
 		return "Starting diagnosis — investigating the bug before planning."
 	case "brainstorm":
-		return "Starting brainstorming — let's discuss the design."
+		return "Starting brainstorming — building context, please wait."
 	case "commit":
-		return "Pushing branches and opening PRs."
+		return "Pushing feature branch and opening PR."
 	}
 
 	return ""
