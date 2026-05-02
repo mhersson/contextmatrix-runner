@@ -286,37 +286,6 @@ func TestVerifyAutonomous_PathEscaping(t *testing.T) {
 	assert.Contains(t, rawRequestURI, "/api/v1/cards/my%20project/CARD%2F42/autonomous")
 }
 
-// TestVerifyAutonomous_BearerFallbackWhenDisabled verifies that disabling
-// the HMAC flag restores the legacy Bearer behaviour so the runner stays
-// compatible with a CM server that has not yet rolled the HMAC change.
-// No HMAC headers must be sent in this mode.
-func TestVerifyAutonomous_BearerFallbackWhenDisabled(t *testing.T) {
-	apiKey := "test-secret-key-that-is-long-enough"
-
-	var sigHeader, tsHeader, authHeader string
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sigHeader = r.Header.Get(cmhmac.SignatureHeader)
-		tsHeader = r.Header.Get(cmhmac.TimestampHeader)
-		authHeader = r.Header.Get("Authorization")
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true,"autonomous":true}`))
-	}))
-	defer srv.Close()
-
-	client := NewClient(srv.URL, apiKey, testLogger())
-	client.SetUseHMACForVerifyAutonomous(false)
-
-	autonomous, err := client.VerifyAutonomous(context.Background(), "my-project", "PROJ-001")
-	require.NoError(t, err)
-	assert.True(t, autonomous)
-
-	assert.Equal(t, "Bearer "+apiKey, authHeader, "Bearer fallback must send the apiKey")
-	assert.Empty(t, sigHeader, "HMAC signature header must not be present in Bearer mode")
-	assert.Empty(t, tsHeader, "HMAC timestamp header must not be present in Bearer mode")
-}
-
 // TestVerifyAutonomous_URLBuildsCorrectly nails down the exact URL path
 // the runner hits: /api/v1/cards/<project>/<cardID>/autonomous.
 func TestVerifyAutonomous_URLBuildsCorrectly(t *testing.T) {
@@ -512,8 +481,10 @@ func TestClient_ReportSkillEngaged(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "at-least-thirty-two-characters-long-key", slog.Default())
-	require.NoError(t, c.ReportSkillEngaged(context.Background(), "ALPHA-001", "alpha", "go-development"))
+	require.NoError(t, c.ReportSkillEngaged(context.Background(), "ALPHA-001", "alpha", "runner:ALPHA-001", "go-development"))
 
 	assert.Contains(t, string(receivedBody), `"card_id":"ALPHA-001"`)
 	assert.Contains(t, string(receivedBody), `"skill_name":"go-development"`)
+	assert.Contains(t, string(receivedBody), `"agent_id":"runner:ALPHA-001"`,
+		"runner must propagate agent_id so CM can attribute the skill engagement")
 }

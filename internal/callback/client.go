@@ -35,9 +35,12 @@ type statusRequest struct {
 }
 
 // skillEngagedRequest is the JSON body sent when the agent engages a skill.
+// AgentID identifies the agent (typically "runner:CARD-XXX") so CM can attribute
+// the activity entry to a real agent instead of a generic "runner".
 type skillEngagedRequest struct {
 	CardID    string `json:"card_id"`
 	Project   string `json:"project"`
+	AgentID   string `json:"agent_id"`
 	SkillName string `json:"skill_name"`
 }
 
@@ -48,43 +51,27 @@ type skillEngagedRequest struct {
 // NEVER be sent to ContextMatrix as a raw `Authorization: Bearer` token —
 // doing so would leak the HMAC secret and let anyone who saw a single
 // Authorization header forge signed callbacks in either direction.
-// The one transitional exception is VerifyAutonomous when
-// useHMACForVerifyAutonomous is false: the runner falls back to Bearer
-// until the ContextMatrix server accepts HMAC on that GET endpoint
-// (see CTXRUN-048). The fallback is deprecated and logs a WARN at startup.
 type Client struct {
-	httpClient                 *http.Client
-	contextMatrixURL           string
-	apiKey                     string
-	logger                     *slog.Logger
-	useHMACForVerifyAutonomous bool
-	metrics                    *metrics.Metrics
+	httpClient       *http.Client
+	contextMatrixURL string
+	apiKey           string
+	logger           *slog.Logger
+	metrics          *metrics.Metrics
 }
 
-// NewClient creates a new callback client. By default VerifyAutonomous is
-// HMAC-signed; use SetUseHMACForVerifyAutonomous(false) during the
-// cross-repo transition if the ContextMatrix server still expects Bearer.
-// The HTTP transport is wrapped with otelhttp so every outgoing request
-// becomes a child span of whatever caller context the request is made in.
+// NewClient creates a new callback client. The HTTP transport is wrapped
+// with otelhttp so every outgoing request becomes a child span of whatever
+// caller context the request is made in.
 func NewClient(cmURL, apiKey string, logger *slog.Logger) *Client {
 	return &Client{
 		httpClient: &http.Client{
 			Timeout:   requestTimeout,
 			Transport: otelhttp.NewTransport(http.DefaultTransport),
 		},
-		contextMatrixURL:           cmURL,
-		apiKey:                     apiKey,
-		logger:                     logger,
-		useHMACForVerifyAutonomous: true,
+		contextMatrixURL: cmURL,
+		apiKey:           apiKey,
+		logger:           logger,
 	}
-}
-
-// SetUseHMACForVerifyAutonomous toggles whether VerifyAutonomous signs its
-// GET request with HMAC (true, the default and secure mode) or falls back
-// to sending `Authorization: Bearer <apiKey>` (false, the deprecated
-// cross-repo transition mode). See CTXRUN-048.
-func (c *Client) SetUseHMACForVerifyAutonomous(useHMAC bool) {
-	c.useHMACForVerifyAutonomous = useHMAC
 }
 
 // WithMetrics attaches a metrics bundle so retry attempts are counted.
@@ -171,10 +158,11 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 // ReportSkillEngaged sends a skill-engagement notification to ContextMatrix.
 // The notification is HMAC-signed in the same scheme as ReportStatus and is
 // retried up to maxRetries times on server errors.
-func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillName string) error {
+func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, agentID, skillName string) error {
 	body, err := json.Marshal(skillEngagedRequest{
 		CardID:    cardID,
 		Project:   project,
+		AgentID:   agentID,
 		SkillName: skillName,
 	})
 	if err != nil {
@@ -307,16 +295,11 @@ type cardResponse struct {
 // non-2xx response so callers can remain fail-closed without issuing any
 // state-changing request back to CM (which would trigger an infinite loop).
 //
-// The request is HMAC-signed by default (CTXRUN-048). The signature covers
-// the timestamp concatenated with an empty body, identical to every other
-// runner<->CM webhook so the CM handler uses one verification path.
-// During the cross-repo transition, SetUseHMACForVerifyAutonomous(false)
-// switches back to `Authorization: Bearer <apiKey>` so the runner keeps
-// working against an older CM server that does not yet accept HMAC on
-// this endpoint.
-//
-// project and cardID are url.PathEscape'd unconditionally (M27) so values
-// like "my project" or "CARD/42" produce a well-formed URL in either mode.
+// The request is HMAC-signed: the signature covers the timestamp concatenated
+// with an empty body, identical to every other runner<->CM webhook so the CM
+// handler uses one verification path. project and cardID are url.PathEscape'd
+// unconditionally (M27) so values like "my project" or "CARD/42" produce a
+// well-formed URL.
 func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (bool, error) {
 	reqURL := fmt.Sprintf("%s/api/v1/cards/%s/%s/autonomous",
 		c.contextMatrixURL,
@@ -329,28 +312,20 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 		return false, fmt.Errorf("create verify-autonomous request: %w", err)
 	}
 
-	if c.useHMACForVerifyAutonomous {
-		// HMAC bound to method+path with an empty body. Binding the path
-		// prevents a captured signature from being replayed against a
-		// different endpoint, and binding the timestamp prevents replay
-		// outside the clock-skew window.
-		ts := strconv.FormatInt(time.Now().Unix(), 10)
+	// HMAC bound to method+path with an empty body. Binding the path
+	// prevents a captured signature from being replayed against a
+	// different endpoint, and binding the timestamp prevents replay
+	// outside the clock-skew window.
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
 
-		path, perr := verifyAutonomousPath(reqURL)
-		if perr != nil {
-			return false, perr
-		}
-
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodGet, path, nil, ts)
-		req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
-		req.Header.Set(cmhmac.TimestampHeader, ts)
-	} else {
-		// Deprecated Bearer fallback — retained only so the runner stays
-		// compatible with a CM server that has not yet rolled the HMAC
-		// change. Leaks the HMAC secret to anyone who can read the
-		// Authorization header; remove once the server accepts HMAC.
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	path, perr := verifyAutonomousPath(reqURL)
+	if perr != nil {
+		return false, perr
 	}
+
+	signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodGet, path, nil, ts)
+	req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
+	req.Header.Set(cmhmac.TimestampHeader, ts)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
