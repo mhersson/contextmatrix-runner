@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,7 +108,7 @@ func validConfig(pemPath, claudeDir string) string {
 	return `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 claude_auth_dir: "` + claudeDir + `"
 github:
   auth_mode: "app"
@@ -130,7 +131,6 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, 9090, cfg.Port)
 	assert.Equal(t, "http://localhost:8080", cfg.ContextMatrixURL)
 	assert.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.APIKey)
-	assert.Equal(t, "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.BaseImage)
 	assert.Equal(t, 3, cfg.MaxConcurrent)
 	assert.Equal(t, "2h", cfg.ContainerTimeout)
 	assert.Equal(t, "info", cfg.LogLevel)
@@ -138,6 +138,28 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, int64(12345), cfg.GitHub.App.AppID)
 	assert.Equal(t, int64(67890), cfg.GitHub.App.InstallationID)
 	assert.Equal(t, pemPath, cfg.GitHub.App.PrivateKeyPath)
+}
+
+// TestLoad_DurationStrings confirms Go duration strings (the format used in
+// config.yaml.example) parse cleanly into idle_output_timeout and
+// maintenance_interval. Before the Duration wrapper landed, anyone copying
+// the example verbatim hit `cannot unmarshal !!str "30m" into time.Duration`
+// at startup.
+func TestLoad_DurationStrings(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	claudeDir := dir
+
+	content := validConfig(pemPath, claudeDir) + `
+idle_output_timeout: "30m"
+maintenance_interval: "10m"
+`
+	path := writeConfig(t, dir, content)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 30*time.Minute, time.Duration(cfg.IdleOutputTimeout))
+	assert.Equal(t, 10*time.Minute, time.Duration(cfg.MaintenanceInterval))
 }
 
 func TestLoad_Defaults(t *testing.T) {
@@ -152,9 +174,6 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 3, cfg.MaxConcurrent)
 	assert.Equal(t, "2h", cfg.ContainerTimeout)
 	assert.Equal(t, "info", cfg.LogLevel)
-	// CTXRUN-048: default auth mode for VerifyAutonomous is HMAC.
-	assert.True(t, cfg.UseHMACForVerifyAutonomous,
-		"use_hmac_for_verify_autonomous must default to true")
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -177,8 +196,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 
 func TestValidate_MissingContextMatrixURL(t *testing.T) {
 	cfg := &Config{
-		APIKey:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage: testDigestImage,
+		APIKey:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		AgentImage: testDigestImage,
 	}
 	err := cfg.Validate()
 	assert.ErrorContains(t, err, "contextmatrix_url is required")
@@ -191,7 +210,7 @@ func TestValidate_ContainerContextMatrixURL_DefaultsToContextMatrixURL(t *testin
 	cfg := &Config{
 		ContextMatrixURL: "http://cm.lan:8080",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -217,7 +236,7 @@ func TestValidate_ContainerContextMatrixURL_ExplicitValuePreserved(t *testing.T)
 		ContextMatrixURL:          "http://cm.lan:8080",
 		ContainerContextMatrixURL: "http://host.docker.internal:8080",
 		APIKey:                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:                 testDigestImage,
+		AgentImage:                testDigestImage,
 		ImagePullPolicy:           PullAlways,
 		MaxConcurrent:             1,
 		ContainerTimeout:          "1h",
@@ -259,7 +278,7 @@ func TestValidate_ServiceURLValidation(t *testing.T) {
 			cfg := &Config{
 				ContextMatrixURL: tt.url,
 				APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-				BaseImage:        testDigestImage,
+				AgentImage:       testDigestImage,
 				ImagePullPolicy:  PullAlways,
 				MaxConcurrent:    1,
 				ContainerTimeout: "1h",
@@ -293,7 +312,7 @@ func TestValidate_ContainerContextMatrixURL_InvalidExplicitValue(t *testing.T) {
 		ContextMatrixURL:          "http://cm.lan:8080",
 		ContainerContextMatrixURL: "not-a-url",
 		APIKey:                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:                 testDigestImage,
+		AgentImage:                testDigestImage,
 		ImagePullPolicy:           PullAlways,
 		MaxConcurrent:             1,
 		ContainerTimeout:          "1h",
@@ -316,21 +335,22 @@ func TestValidate_APIKeyTooShort(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "short",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 	}
 	err := cfg.Validate()
 	assert.ErrorContains(t, err, "api_key must be at least")
 }
 
-func TestValidate_MissingBaseImage(t *testing.T) {
+func TestValidate_MissingAgentImage(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ImagePullPolicy:  PullNever,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
 	}
 	err := cfg.Validate()
-	assert.ErrorContains(t, err, "base_image is required")
+	assert.ErrorContains(t, err, "agent_image is required")
 }
 
 func TestValidate_NoCCAuth(t *testing.T) {
@@ -340,7 +360,7 @@ func TestValidate_NoCCAuth(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -364,7 +384,7 @@ func TestValidate_AnthropicAPIKeyAlone(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -389,7 +409,7 @@ func TestValidate_ClaudeOAuthTokenAlone(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -415,7 +435,7 @@ func TestValidate_AuthMethodsSatisfyRequirement(t *testing.T) {
 		return &Config{
 			ContextMatrixURL: "http://localhost",
 			APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			BaseImage:        testDigestImage,
+			AgentImage:       testDigestImage,
 			ImagePullPolicy:  PullAlways,
 			MaxConcurrent:    1,
 			ContainerTimeout: "1h",
@@ -486,7 +506,7 @@ func TestLoad_ClaudeOAuthTokenEnvOverride(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 github:
   auth_mode: "app"
   app:
@@ -507,7 +527,7 @@ func TestValidate_InvalidContainerTimeout(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "not-a-duration",
@@ -524,7 +544,7 @@ func TestValidate_GitHubAppMissingFields(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -554,7 +574,7 @@ func TestContainerTimeoutDuration(t *testing.T) {
 	cfg := &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "2h",
@@ -580,7 +600,7 @@ func TestValidate_ClaudeSettings(t *testing.T) {
 		return &Config{
 			ContextMatrixURL: "http://localhost",
 			APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			BaseImage:        testDigestImage,
+			AgentImage:       testDigestImage,
 			ImagePullPolicy:  PullAlways,
 			MaxConcurrent:    1,
 			ContainerTimeout: "1h",
@@ -672,7 +692,7 @@ func TestLoad_GitHubApp_APIBaseURL_YAML(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 claude_auth_dir: "` + dir + `"
 github:
   auth_mode: "app"
@@ -695,7 +715,7 @@ func TestLoad_GitHubApp_APIBaseURL_EnvOverride(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 claude_auth_dir: "` + dir + `"
 github:
   auth_mode: "app"
@@ -750,7 +770,7 @@ func baseValidConfigNoGitHub(t *testing.T) *Config {
 	return &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -864,8 +884,6 @@ func TestValidate_ReplayCacheDefaultsWhenUnset(t *testing.T) {
 
 	assert.Equal(t, 10000, cfg.WebhookReplayCacheSize)
 	assert.Equal(t, 330, cfg.WebhookReplaySkewSeconds)
-	assert.Equal(t, 1000, cfg.MessageDedupCacheSize)
-	assert.Equal(t, 600, cfg.MessageDedupTTLSeconds)
 }
 
 func TestValidate_ReplayCacheRejectsNegative(t *testing.T) {
@@ -888,20 +906,6 @@ func TestValidate_ReplayCacheRejectsNegative(t *testing.T) {
 			},
 			want: "webhook_replay_skew_seconds must be positive",
 		},
-		{
-			name: "negative dedup cache size",
-			mutate: func(c *Config) {
-				c.MessageDedupCacheSize = -1
-			},
-			want: "message_dedup_cache_size must be positive",
-		},
-		{
-			name: "negative dedup ttl",
-			mutate: func(c *Config) {
-				c.MessageDedupTTLSeconds = -1
-			},
-			want: "message_dedup_ttl_seconds must be positive",
-		},
 	}
 
 	for _, tc := range cases {
@@ -923,7 +927,7 @@ func TestLoad_GitHubPAT_EnvOverride(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 anthropic_api_key: "sk-ant-test"
 `
 	path := writeConfig(t, dir, content)
@@ -943,7 +947,7 @@ func TestLoad_GitHubPAT_YAMLOverriddenByEnv(t *testing.T) {
 	content := `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 anthropic_api_key: "sk-ant-test"
 github:
   auth_mode: "pat"
@@ -959,11 +963,25 @@ github:
 	assert.Equal(t, "ghp_fromenv", cfg.GitHub.PAT.Token)
 }
 
-// TestValidate_BaseImageDigestPin covers the CTXRUN-044 requirement that
-// base_image be an @sha256:... reference. Mutable tags and malformed digests
+func TestApplyEnvOverrides_AgentImage(t *testing.T) {
+	t.Setenv("CMR_AGENT_IMAGE", "ghcr.io/example/agent@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	claudeDir := dir
+
+	path := writeConfig(t, dir, validConfig(pemPath, claudeDir))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "ghcr.io/example/agent@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", cfg.AgentImage)
+}
+
+// TestValidate_AgentImageDigestPin covers the CTXRUN-044 requirement that
+// agent_image be an @sha256:... reference. Mutable tags and malformed digests
 // must fail validation so a rebuilt upstream image can never silently ship.
-func TestValidate_BaseImageDigestPin(t *testing.T) {
-	validDigest := "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+func TestValidate_AgentImageDigestPin(t *testing.T) {
+	validDigest := "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 	tests := []struct {
 		name        string
@@ -972,31 +990,31 @@ func TestValidate_BaseImageDigestPin(t *testing.T) {
 		errContains string
 	}{
 		{
-			name:    "digest-pinned base_image is accepted",
+			name:    "digest-pinned agent_image is accepted",
 			image:   validDigest,
 			wantErr: false,
 		},
 		{
-			name:        "tag-only base_image is rejected",
-			image:       "contextmatrix/worker:latest",
+			name:        "tag-only agent_image is rejected",
+			image:       "contextmatrix/orchestrated:latest",
 			wantErr:     true,
-			errContains: "base_image must be @sha256:... pinned",
+			errContains: "agent_image must be @sha256:... pinned",
 		},
 		{
 			name:        "bare name without tag or digest is rejected",
-			image:       "contextmatrix/worker",
+			image:       "contextmatrix/orchestrated",
 			wantErr:     true,
-			errContains: "base_image must be @sha256:... pinned",
+			errContains: "agent_image must be @sha256:... pinned",
 		},
 		{
 			name:        "digest of wrong length is rejected",
-			image:       "contextmatrix/worker@sha256:deadbeef",
+			image:       "contextmatrix/orchestrated@sha256:deadbeef",
 			wantErr:     true,
 			errContains: "invalid sha256 digest length",
 		},
 		{
 			name:        "digest with non-hex characters is rejected",
-			image:       "contextmatrix/worker@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+			image:       "contextmatrix/orchestrated@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
 			wantErr:     true,
 			errContains: "non-hex characters",
 		},
@@ -1006,7 +1024,7 @@ func TestValidate_BaseImageDigestPin(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseValidConfigNoGitHub(t)
 			cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
-			cfg.BaseImage = tt.image
+			cfg.AgentImage = tt.image
 
 			err := cfg.Validate()
 			if tt.wantErr {
@@ -1110,7 +1128,7 @@ func baseDevConfig(t *testing.T, pemPath string) *Config {
 	return &Config{
 		ContextMatrixURL:  "http://localhost",
 		APIKey:            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:         testDigestImage,
+		AgentImage:        testDigestImage,
 		ImagePullPolicy:   PullAlways,
 		MaxConcurrent:     1,
 		ContainerTimeout:  "1h",
@@ -1127,22 +1145,22 @@ func baseDevConfig(t *testing.T, pemPath string) *Config {
 	}
 }
 
-// TestValidate_DevMode_UnpinnedBaseImage verifies that in dev mode an unpinned
-// base_image does not cause Validate to return an error, and the reference is
+// TestValidate_DevMode_UnpinnedAgentImage verifies that in dev mode an unpinned
+// agent_image does not cause Validate to return an error, and the reference is
 // collected in UnpinnedImageRefs.
-func TestValidate_DevMode_UnpinnedBaseImage(t *testing.T) {
+func TestValidate_DevMode_UnpinnedAgentImage(t *testing.T) {
 	dir := t.TempDir()
 	pemPath := writePEM(t, dir)
 
 	cfg := baseDevConfig(t, pemPath)
-	cfg.BaseImage = "contextmatrix/worker:latest"
+	cfg.AgentImage = "contextmatrix/orchestrated:latest"
 
 	err := cfg.Validate()
 	require.NoError(t, err)
 
 	require.Len(t, cfg.UnpinnedImageRefs, 1)
-	assert.Equal(t, "base_image", cfg.UnpinnedImageRefs[0].Field)
-	assert.Equal(t, "contextmatrix/worker:latest", cfg.UnpinnedImageRefs[0].Image)
+	assert.Equal(t, "agent_image", cfg.UnpinnedImageRefs[0].Field)
+	assert.Equal(t, "contextmatrix/orchestrated:latest", cfg.UnpinnedImageRefs[0].Image)
 }
 
 // TestValidate_DevMode_MultipleUnpinnedAllowedImages verifies that all unpinned
@@ -1167,9 +1185,9 @@ func TestValidate_DevMode_MultipleUnpinnedAllowedImages(t *testing.T) {
 	assert.Equal(t, "contextmatrix/worker:v2", cfg.UnpinnedImageRefs[1].Image)
 }
 
-// TestValidate_Production_UnpinnedBaseImageFails verifies that production mode
-// keeps the existing fail-closed behaviour for unpinned base_image.
-func TestValidate_Production_UnpinnedBaseImageFails(t *testing.T) {
+// TestValidate_Production_UnpinnedAgentImageFails verifies that production mode
+// keeps the existing fail-closed behaviour for unpinned agent_image.
+func TestValidate_Production_UnpinnedAgentImageFails(t *testing.T) {
 	dir := t.TempDir()
 	pemPath := writePEM(t, dir)
 
@@ -1182,11 +1200,11 @@ func TestValidate_Production_UnpinnedBaseImageFails(t *testing.T) {
 			PrivateKeyPath: pemPath,
 		},
 	}
-	cfg.BaseImage = "contextmatrix/worker:latest"
+	cfg.AgentImage = "contextmatrix/orchestrated:latest"
 	// DeploymentProfile is zero-value ("") which Validate normalises to production.
 
 	err := cfg.Validate()
-	require.ErrorContains(t, err, "base_image must be @sha256:... pinned")
+	require.ErrorContains(t, err, "agent_image must be @sha256:... pinned")
 	assert.Nil(t, cfg.UnpinnedImageRefs)
 }
 
@@ -1200,7 +1218,7 @@ func TestValidate_DevMode_FullyPinned(t *testing.T) {
 	pinnedB := "contextmatrix/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 	cfg := baseDevConfig(t, pemPath)
-	cfg.BaseImage = pinnedA
+	cfg.AgentImage = pinnedA
 	cfg.AllowedImages = []string{pinnedB}
 
 	err := cfg.Validate()
@@ -1231,7 +1249,7 @@ func TestValidate_DevMode_MixedPinning(t *testing.T) {
 }
 
 // TestValidate_AllowedImagesDigestPin ensures every entry in the
-// allowed_images allowlist is digest-pinned, not just base_image. A single
+// allowed_images allowlist is digest-pinned, not just agent_image. A single
 // tag-only entry must fail validation so H2's "allowlist matches strings
 // not digests" gap stays closed.
 func TestValidate_AllowedImagesDigestPin(t *testing.T) {
@@ -1269,9 +1287,12 @@ func validConfigDev(pemPath, claudeDir string) string {
 }
 
 // TestLoad_DevDefaults_UnsetValues verifies that a dev-profile config
-// with no explicit skew or pull policy receives the dev defaults and that
-// AppliedDevDefaults records them both.
+// with no explicit skew, pull policy, or secrets_dir receives the dev
+// defaults and that AppliedDevDefaults records all three.
 func TestLoad_DevDefaults_UnsetValues(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+
 	dir := t.TempDir()
 	pemPath := writePEM(t, dir)
 
@@ -1282,7 +1303,17 @@ func TestLoad_DevDefaults_UnsetValues(t *testing.T) {
 
 	assert.Equal(t, 86400, cfg.WebhookReplaySkewSeconds, "dev mode: skew should default to 86400")
 	assert.Equal(t, PullIfNotPresent, cfg.ImagePullPolicy, "dev mode: pull policy should default to if-not-present")
-	assert.ElementsMatch(t, []string{"webhook_replay_skew_seconds=86400", "image_pull_policy=if-not-present"}, cfg.AppliedDevDefaults)
+
+	expectedSecrets := filepath.Join(xdg, "cm-runner", "secrets")
+	assert.Equal(t, expectedSecrets, cfg.SecretsDir, "dev mode: secrets_dir should default under XDG_RUNTIME_DIR")
+	assert.ElementsMatch(t,
+		[]string{
+			"webhook_replay_skew_seconds=86400",
+			"image_pull_policy=if-not-present",
+			"secrets_dir=" + expectedSecrets,
+		},
+		cfg.AppliedDevDefaults,
+	)
 }
 
 // TestLoad_DevDefaults_ExplicitSkew verifies that an explicitly-set
@@ -1352,6 +1383,116 @@ func TestLoad_ProductionDefaults_UnsetValues(t *testing.T) {
 	assert.Empty(t, cfg.AppliedDevDefaults, "production mode must not populate AppliedDevDefaults")
 }
 
+// TestLoad_DevDefaults_SecretsDir verifies that the dev profile picks a
+// user-writable default for secrets_dir when none is configured. The
+// production default `/var/run/cm-runner/secrets` lives under a root-owned
+// tmpfs, which fails for non-root local runners — the dev profile must
+// steer to $XDG_RUNTIME_DIR (or a temp fallback) and record the chosen
+// path in AppliedDevDefaults.
+func TestLoad_DevDefaults_SecretsDir(t *testing.T) {
+	t.Run("xdg_runtime_dir_set", func(t *testing.T) {
+		xdg := t.TempDir()
+		t.Setenv("XDG_RUNTIME_DIR", xdg)
+
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+		path := writeConfig(t, dir, validConfigDev(pemPath, dir))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+
+		expected := filepath.Join(xdg, "cm-runner", "secrets")
+		assert.Equal(t, expected, cfg.SecretsDir,
+			"dev mode should default secrets_dir to $XDG_RUNTIME_DIR/cm-runner/secrets")
+		assert.Contains(t, cfg.AppliedDevDefaults, "secrets_dir="+expected)
+	})
+
+	t.Run("xdg_runtime_dir_unset_falls_back_to_tempdir", func(t *testing.T) {
+		t.Setenv("XDG_RUNTIME_DIR", "")
+
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+		path := writeConfig(t, dir, validConfigDev(pemPath, dir))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+
+		assert.True(t, filepath.IsAbs(cfg.SecretsDir),
+			"dev fallback must produce an absolute path; got %q", cfg.SecretsDir)
+		assert.True(t, strings.HasPrefix(cfg.SecretsDir, os.TempDir()),
+			"dev fallback must live under os.TempDir(); got %q", cfg.SecretsDir)
+		assert.Contains(t, cfg.SecretsDir, "cm-runner",
+			"dev fallback should embed cm-runner in the path")
+		assert.Contains(t, cfg.AppliedDevDefaults, "secrets_dir="+cfg.SecretsDir)
+	})
+
+	t.Run("explicit_yaml_overrides_dev_default", func(t *testing.T) {
+		xdg := t.TempDir()
+		t.Setenv("XDG_RUNTIME_DIR", xdg)
+
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+		explicit := filepath.Join(dir, "explicit-secrets")
+		yaml := validConfigDev(pemPath, dir) + "secrets_dir: " + explicit + "\n"
+		path := writeConfig(t, dir, yaml)
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+
+		assert.Equal(t, explicit, cfg.SecretsDir,
+			"explicit secrets_dir must not be overridden in dev mode")
+
+		for _, entry := range cfg.AppliedDevDefaults {
+			assert.False(t, strings.HasPrefix(entry, "secrets_dir="),
+				"explicit secrets_dir must not appear in AppliedDevDefaults; got %q", entry)
+		}
+	})
+
+	t.Run("env_override_wins_over_dev_default", func(t *testing.T) {
+		xdg := t.TempDir()
+		t.Setenv("XDG_RUNTIME_DIR", xdg)
+
+		dir := t.TempDir()
+		pemPath := writePEM(t, dir)
+		envPath := filepath.Join(dir, "env-secrets")
+		t.Setenv("CMR_SECRETS_DIR", envPath)
+		path := writeConfig(t, dir, validConfigDev(pemPath, dir))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+
+		assert.Equal(t, envPath, cfg.SecretsDir,
+			"CMR_SECRETS_DIR must take precedence over the dev default")
+
+		for _, entry := range cfg.AppliedDevDefaults {
+			assert.False(t, strings.HasPrefix(entry, "secrets_dir="),
+				"env-overridden secrets_dir must not appear in AppliedDevDefaults; got %q", entry)
+		}
+	})
+}
+
+// TestLoad_ProductionDefaults_SecretsDir verifies that the production
+// profile keeps `/var/run/cm-runner/secrets` even when XDG_RUNTIME_DIR is
+// set in the environment. Operators are expected to provision that path
+// (or override via secrets_dir / CMR_SECRETS_DIR) — the production default
+// must not silently shift onto a user-runtime path.
+func TestLoad_ProductionDefaults_SecretsDir(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg) // intentionally set; production must ignore.
+
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "/var/run/cm-runner/secrets", cfg.SecretsDir,
+		"production: secrets_dir must default to /var/run/cm-runner/secrets")
+	assert.Empty(t, cfg.AppliedDevDefaults,
+		"production mode must not populate AppliedDevDefaults")
+}
+
 func TestConfig_TaskSkillsDir(t *testing.T) {
 	dir := t.TempDir()
 	pemPath := writePEM(t, dir)
@@ -1359,7 +1500,7 @@ func TestConfig_TaskSkillsDir(t *testing.T) {
 	require.NoError(t, os.WriteFile(configPath, []byte(`
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 claude_auth_dir: "`+dir+`"
 github:
   auth_mode: "app"
@@ -1382,7 +1523,7 @@ func TestConfig_TaskSkillsDirDefault(t *testing.T) {
 	require.NoError(t, os.WriteFile(configPath, []byte(`
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 claude_auth_dir: "`+dir+`"
 github:
   auth_mode: "app"
@@ -1413,7 +1554,7 @@ func minimalValidRunnerConfig(t *testing.T) *Config {
 	return &Config{
 		ContextMatrixURL: "http://localhost",
 		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		BaseImage:        testDigestImage,
+		AgentImage:       testDigestImage,
 		ImagePullPolicy:  PullAlways,
 		MaxConcurrent:    1,
 		ContainerTimeout: "1h",
@@ -1433,7 +1574,7 @@ github:
     private_key_path: ` + pemPath + `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 anthropic_api_key: "sk-ant-test"
 secrets_dir: ` + dir + `
 `
@@ -1456,7 +1597,7 @@ github:
     token: "ghp_runner"
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 anthropic_api_key: "sk-ant-test"
 secrets_dir: ` + dir + `
 `
@@ -1481,7 +1622,7 @@ func TestEnvOverrides_GitHubAuthMode(t *testing.T) {
 	path := writeConfigFile(t, dir, `
 contextmatrix_url: "http://localhost:8080"
 api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-base_image: "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 anthropic_api_key: "sk-ant-test"
 secrets_dir: `+dir)
 	cfg, err := Load(path)
@@ -1498,4 +1639,25 @@ func TestValidate_AuthModeRequired(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "github.auth_mode")
+}
+
+// TestConfigAgentImageRequired verifies that omitting agent_image fails
+// Validate.
+func TestConfigAgentImageRequired(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	// validConfig sets agent_image; strip it back out to test the
+	// required-field path.
+	yaml := strings.Replace(
+		validConfig(pemPath, dir),
+		`agent_image: "contextmatrix/orchestrated@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`,
+		"",
+		1,
+	)
+	path := writeConfig(t, dir, yaml)
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agent_image")
 }
