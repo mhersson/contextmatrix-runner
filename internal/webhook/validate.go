@@ -5,7 +5,6 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
-	"unicode/utf8"
 )
 
 // ValidationError indicates an incoming webhook payload failed ingress-level
@@ -28,19 +27,12 @@ var (
 	branchRE = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,200}$`)
 	// host component: ASCII alphanumerics, dot, hyphen.
 	hostRE = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
-	// message_id: UUIDs, prefixed ids, etc. 1..128 runes.
-	messageIDRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 	// task_skill_name: restricts skill names to a safe charset that cannot
 	// reach outside the /host-skills mount via path traversal. Must start with
 	// alphanumeric (no leading dash to avoid argv injection, no leading dot to
 	// avoid hidden directories), then alphanumeric / dot / underscore / dash.
 	taskSkillNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 )
-
-// maxContentBytes is the maximum permitted byte length of a MessagePayload
-// Content field. Duplicated here (rather than importing the handler const) so
-// this file is self-contained.
-const maxContentBytes = 8192
 
 // containsCtlBytes reports whether s contains any of \n, \r, or NUL.
 func containsCtlBytes(s string) bool {
@@ -133,47 +125,6 @@ func validateRepoURL(v string) error {
 	return nil
 }
 
-// validateContent enforces byte-size cap, UTF-8 validity and NUL rejection on
-// a MessagePayload Content string. Newlines are deliberately permitted — the
-// HITL user-message body is free-form prose.
-func validateContent(v string) error {
-	if v == "" {
-		return &ValidationError{Field: "content", Reason: "required"}
-	}
-
-	if len(v) > maxContentBytes {
-		return &ValidationError{Field: "content", Reason: "exceeds 8192 bytes"}
-	}
-
-	if !utf8.ValidString(v) {
-		return &ValidationError{Field: "content", Reason: "not valid UTF-8"}
-	}
-
-	if strings.ContainsRune(v, '\x00') {
-		return &ValidationError{Field: "content", Reason: "NUL byte not allowed"}
-	}
-
-	return nil
-}
-
-// validateMessageID allows empty (optional field) but restricts charset and
-// length when present.
-func validateMessageID(v string) error {
-	if v == "" {
-		return nil
-	}
-
-	if containsCtlBytes(v) {
-		return &ValidationError{Field: "message_id", Reason: "control bytes not allowed"}
-	}
-
-	if !messageIDRE.MatchString(v) {
-		return &ValidationError{Field: "message_id", Reason: "must match [A-Za-z0-9_.-]{1,128}"}
-	}
-
-	return nil
-}
-
 // ValidateTaskSkills checks every skill name in the slice against the
 // allowlist pattern. Empty slice is valid (means "no skills").
 func ValidateTaskSkills(skills []string) error {
@@ -222,33 +173,6 @@ func ValidatePayload(p any) error {
 		return validateStopAll(v)
 	case StopAllPayload:
 		return validateStopAll(&v)
-
-	case *MessagePayload:
-		if v == nil {
-			return nil
-		}
-
-		return validateMessage(v)
-	case MessagePayload:
-		return validateMessage(&v)
-
-	case *PromotePayload:
-		if v == nil {
-			return nil
-		}
-
-		return validatePromote(v)
-	case PromotePayload:
-		return validatePromote(&v)
-
-	case *EndSessionPayload:
-		if v == nil {
-			return nil
-		}
-
-		return validateEndSession(v)
-	case EndSessionPayload:
-		return validateEndSession(&v)
 	}
 
 	return nil
@@ -292,38 +216,6 @@ func validateStopAll(p *StopAllPayload) error {
 	// project is optional on stop-all; only validate when present.
 	if p.Project == "" {
 		return nil
-	}
-
-	return validateIdent("project", p.Project)
-}
-
-func validateMessage(p *MessagePayload) error {
-	if err := validateIdent("card_id", p.CardID); err != nil {
-		return err
-	}
-
-	if err := validateIdent("project", p.Project); err != nil {
-		return err
-	}
-
-	if err := validateContent(p.Content); err != nil {
-		return err
-	}
-
-	return validateMessageID(p.MessageID)
-}
-
-func validatePromote(p *PromotePayload) error {
-	if err := validateIdent("card_id", p.CardID); err != nil {
-		return err
-	}
-
-	return validateIdent("project", p.Project)
-}
-
-func validateEndSession(p *EndSessionPayload) error {
-	if err := validateIdent("card_id", p.CardID); err != nil {
-		return err
 	}
 
 	return validateIdent("project", p.Project)

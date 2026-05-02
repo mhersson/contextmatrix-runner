@@ -27,10 +27,10 @@ const (
 //	method + "\n" + path + "\n" + timestamp + "." + body
 //
 // Including method and path prevents a valid signature for one endpoint from
-// being replayed against another endpoint with an identical body — critical
-// because /kill, /end-session, and /promote all carry the same
-// {card_id, project} payload shape and would otherwise produce colliding
-// signatures when issued back-to-back in the same Unix second.
+// being replayed against another endpoint with an identical body — important
+// because /kill and /stop-all share an overlapping {card_id, project} payload
+// shape and would otherwise produce colliding signatures when issued
+// back-to-back in the same Unix second.
 func SignPayloadWithTimestamp(key, method, path string, body []byte, ts string) string {
 	mac := hmac.New(sha256.New, []byte(key))
 	mac.Write([]byte(method))

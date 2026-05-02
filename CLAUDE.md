@@ -18,7 +18,6 @@ internal/config/                  → YAML config + env overrides + validation
 internal/hmac/                    → HMAC-SHA256 signing/verification (shared)
 internal/webhook/                 → HTTP handlers (/trigger, /kill, /stop-all, /health)
 internal/container/               → Docker SDK abstraction, container lifecycle
-internal/logparser/               → Parses Claude Code stream-json output, logs relevant events
 internal/tracker/                 → Thread-safe card_id → container mapping
 internal/callback/                → HMAC-signed status callbacks to CM
 internal/github/                  → TokenGenerator interface; App (JWT → installation token) and PAT providers
@@ -114,71 +113,45 @@ sides sign as `HMAC-SHA256(key, timestamp + "." + body)`, hex-encoded. Headers:
 
 ### Endpoints
 
-| Method | Path           | Auth | Description                                                                                                                                                                                                                                                          |
-| ------ | -------------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/trigger`     | HMAC | Start a container. Payload includes `card_id`, `project`, `repo_url`, and optional `interactive: bool`.                                                                                                                                                               |
-| POST   | `/kill`        | HMAC | Stop a specific container. Payload: `{card_id, project}`.                                                                                                                                                                                                            |
-| POST   | `/stop-all`    | HMAC | Stop all containers (optionally filtered by project).                                                                                                                                                                                                                |
-| POST   | `/message`     | HMAC | Send a user message to an interactive session. Payload: `{card_id, project, content, message_id}`. `content` must be ≤8192 bytes (413 on overflow). Returns 404 if no container, 409 if not interactive, 202 `{ok:true, message_id}` on success.                     |
-| POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Returns 404/409 on error, 202 `{ok:true}` on success.                                                                                                                              |
-| POST   | `/end-session` | HMAC | Close the stdin of an interactive container so claude exits on EOF. Payload: `{card_id, project}`. Returns 404 if no container, 409 if not interactive (or stdin already closed), 202 `{ok:true}` on success. Safe to call more than once (second call returns 409). |
-| GET    | `/logs`        | HMAC | SSE stream of `LogEntry` events for all active containers. Browser EventSource cannot send headers, so consumers must proxy through a server that attaches the HMAC signature.                                                                                       |
-| GET    | `/health`      | none | Health probe; returns 200.                                                                                                                                                                                                                                           |
+| Method | Path          | Auth | Description                                                                                                                                                                    |
+| ------ | ------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| POST   | `/trigger`    | HMAC | Start a container. Payload includes `card_id`, `project`, `repo_url`, and optional `interactive: bool`.                                                                         |
+| POST   | `/kill`       | HMAC | Stop a specific container. Payload: `{card_id, project}`.                                                                                                                      |
+| POST   | `/stop-all`   | HMAC | Stop all containers (optionally filtered by project).                                                                                                                          |
+| GET    | `/logs`       | HMAC | SSE stream of `LogEntry` events for all active containers. Browser EventSource cannot send headers, so consumers must proxy through a server that attaches the HMAC signature. |
+| GET    | `/containers` | HMAC | List currently tracked containers.                                                                                                                                             |
+| GET    | `/health`     | none | Liveness probe; returns 200 unconditionally.                                                                                                                                   |
+| GET    | `/readyz`     | none | Readiness probe; returns 200 only when preflight has passed and the runner is not draining.                                                                                    |
 
-### HITL (interactive) mode
+### HITL and message dispatch
 
-When `interactive: true` is set in the `/trigger` payload:
+HITL chat messages, autonomous promotion, and session termination are not
+handled via runner-side webhooks. They are coordinated through the
+ContextMatrix server:
 
-- The runner sets `CM_INTERACTIVE=1` in the container environment and attaches
-  to the container's stdin.
-- `entrypoint.sh` branches on `CM_INTERACTIVE`: instead of the one-shot
-  `run-autonomous` invocation, it runs `claude` with
-  `--input-format stream-json --output-format stream-json` and a minimal
-  system-context hint as the `-p` prompt. After registering the stdin writer via
-  `tracker.SetStdin`, the runner writes a priming stream-json user message
-  (built via `streammsg.BuildUserMessage`) that instructs Claude to call
-  `get_skill(skill_name='create-plan', ...)` immediately — so plan drafting
-  begins without waiting for a human to type anything. The user provides
-  approval at the skill's built-in gates (plan approval, execution decision,
-  review) via stream-json input.
-- The tracker stashes the stdin writer; `tracker.WriteStdin` serialises
-  concurrent writes with a per-entry mutex.
-- Operators interact with the running session via:
-  - `POST /message` — writes a stream-json user message to the container stdin
-    and echoes it as a `user`-typed `LogEntry`.
-  - `POST /promote` — writes a canned autonomous-mode instruction to stdin and
-    emits a `system` LogEntry `"promoted to autonomous mode"`.
-  - `POST /end-session` — closes the container's stdin via `tracker.CloseStdin`.
-    claude receives EOF on stdin, exits the stream-json loop, and the container
-    terminates through the normal `waitAndCleanup` path. Emits a `system`
-    LogEntry `"session ended (stdin closed)"`. Used by ContextMatrix when a
-    released card reaches a terminal state.
-- `tracker.Remove` closes the stdin writer when the container exits (no-op if
-  `/end-session` already closed it).
+- The UI POSTs to `POST /api/projects/{p}/cards/{id}/message` / `/promote` /
+  `/stop` on CM. CM appends a typed event to its `RunnerEventBuffer` and the
+  per-card session log.
+- The runner subscribes to `GET /api/runner/events` (SSE, Bearer-auth). The
+  per-card driver dispatches each event into the orchestrator FSM's gate
+  channels (chat input, promote, stop).
+- HITL turns spawn `claude --resume` per message via the orchestrator FSM
+  rather than holding a long-lived stdin-attached process. Status flows back
+  to CM via `POST /api/runner/status`; skill engagements via
+  `POST /api/runner/skill-engaged`.
 
 ## LogEntry types
 
 `logbroadcast.LogEntry.Type` is a free-form string. Known values:
 
-| Type        | Source                                    | Redacted? |
-| ----------- | ----------------------------------------- | --------- |
-| `text`      | Claude assistant text block (stdout)      | yes       |
-| `thinking`  | Claude thinking block (stdout)            | yes       |
-| `tool_call` | Claude tool_use block (non-MCP, stdout)   | yes       |
-| `stderr`    | Container stderr line                     | yes       |
-| `system`    | Runner lifecycle event (start/stop/error) | no        |
-| `user`      | HITL chat message via /message webhook    | no        |
-
-`logparser.Redact` is applied to `text`, `thinking`, `stderr`, and `tool_call`
-entries. It is never called on `user` or `system` entries.
-
-`tool_call` content is formatted as `Name: <summary>` (e.g. `Bash: git status`,
-`Read: /tmp/foo.go`). The summary is a per-tool extract of the most relevant
-argument: first line of `command` for Bash; `file_path` for
-Read/Edit/Write/MultiEdit/NotebookEdit; `pattern [in <path>]` for Glob/Grep;
-`url` for WebFetch; `query` for WebSearch; `description` for Task/Agent;
-`N todos` for TodoWrite; compact JSON fallback for unknown tools. The result is
-whitespace-collapsed and truncated at 200 runes with a trailing `…`.
+| Type        | Source                                    |
+| ----------- | ----------------------------------------- |
+| `text`      | Claude assistant text block (stdout)      |
+| `thinking`  | Claude thinking block (stdout)            |
+| `tool_call` | Claude tool_use block (non-MCP, stdout)   |
+| `stderr`    | Container stderr line                     |
+| `system`    | Runner lifecycle event (start/stop/error) |
+| `user`      | HITL chat message routed via SSE          |
 
 ## Verification
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -41,25 +42,37 @@ type UnpinnedImageRef struct {
 
 // Config holds all runner configuration.
 type Config struct {
-	Port                      int          `yaml:"port"`
-	AdminPort                 int          `yaml:"admin_port"`
-	ContextMatrixURL          string       `yaml:"contextmatrix_url"`
-	ContainerContextMatrixURL string       `yaml:"container_contextmatrix_url"`
-	APIKey                    string       `yaml:"api_key"`
-	BaseImage                 string       `yaml:"base_image"`
-	AllowedImages             []string     `yaml:"allowed_images"`
-	ImagePullPolicy           string       `yaml:"image_pull_policy"`
-	MaxConcurrent             int          `yaml:"max_concurrent"`
-	ContainerTimeout          string       `yaml:"container_timeout"`
-	ContainerMemoryLimit      int64        `yaml:"container_memory_limit"`
-	ContainerPidsLimit        int64        `yaml:"container_pids_limit"`
-	ClaudeAuthDir             string       `yaml:"claude_auth_dir"`
-	ClaudeOAuthToken          string       `yaml:"claude_oauth_token"`
-	AnthropicAPIKey           string       `yaml:"anthropic_api_key"`
-	ClaudeSettings            string       `yaml:"claude_settings"`
-	GitHub                    GitHubConfig `yaml:"github"`
-	LogLevel                  string       `yaml:"log_level"`
-	LogFormat                 string       `yaml:"log_format"`
+	Port                      int    `yaml:"port"`
+	AdminPort                 int    `yaml:"admin_port"`
+	ContextMatrixURL          string `yaml:"contextmatrix_url"`
+	ContainerContextMatrixURL string `yaml:"container_contextmatrix_url"`
+	APIKey                    string `yaml:"api_key"`
+	// AgentImage is the image used for orchestrated worker containers
+	// (long-lived shell; runner spawns CC per phase). Required; must be
+	// digest-pinned (@sha256:...) to prevent silent upstream rebuilds.
+	AgentImage           string   `yaml:"agent_image"`
+	AllowedImages        []string `yaml:"allowed_images"`
+	ImagePullPolicy      string   `yaml:"image_pull_policy"`
+	MaxConcurrent        int      `yaml:"max_concurrent"`
+	ContainerTimeout     string   `yaml:"container_timeout"`
+	ContainerMemoryLimit int64    `yaml:"container_memory_limit"`
+	ContainerPidsLimit   int64    `yaml:"container_pids_limit"`
+	ClaudeAuthDir        string   `yaml:"claude_auth_dir"`
+	ClaudeOAuthToken     string   `yaml:"claude_oauth_token"`
+	AnthropicAPIKey      string   `yaml:"anthropic_api_key"`
+	ClaudeSettings       string   `yaml:"claude_settings"`
+	// WorkerExtraEnv is a generic env-passthrough into spawned worker
+	// containers. Keys reserved by the runner (MCP_URL, MCP_API_KEY,
+	// CM_CARD_ID, CM_PROJECT, CM_GIT_TOKEN, GH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN,
+	// ANTHROPIC_API_KEY) are filtered out — the dispatcher sets those itself
+	// from per-trigger payload + runner config. Intended for operator-supplied
+	// env like GIT_SSL_NO_VERIFY=1 against a self-signed local git server,
+	// proxy hostnames, etc. Use sparingly; values become visible inside the
+	// container.
+	WorkerExtraEnv map[string]string `yaml:"worker_extra_env,omitempty"`
+	GitHub         GitHubConfig      `yaml:"github"`
+	LogLevel       string            `yaml:"log_level"`
+	LogFormat      string            `yaml:"log_format"`
 	// SecretsDir is the host directory where per-container secrets files
 	// are written. Each file is bind-mounted read-only into its container
 	// at /run/cm-secrets/env so the values never appear in HostConfig.Env
@@ -74,26 +87,18 @@ type Config struct {
 	// Webhook replay-protection tunables. See CTXRUN-047.
 	WebhookReplayCacheSize   int `yaml:"webhook_replay_cache_size"`
 	WebhookReplaySkewSeconds int `yaml:"webhook_replay_skew_seconds"`
-	MessageDedupCacheSize    int `yaml:"message_dedup_cache_size"`
-	MessageDedupTTLSeconds   int `yaml:"message_dedup_ttl_seconds"`
 
-	// Idle-output watchdog (CTXRUN-058, H15). If a container's logparser
-	// has not published any event in this many seconds, the watchdog kills
-	// the container with an "idle timeout" reason. Zero or negative
-	// disables the watchdog.
-	IdleOutputTimeout time.Duration `yaml:"idle_output_timeout"`
+	// Idle-output watchdog. If a container has published no log entry in
+	// this many seconds, the watchdog kills the container with an "idle
+	// timeout" reason. Zero or negative disables the watchdog. Accepts Go
+	// duration strings ("30m") in YAML.
+	IdleOutputTimeout Duration `yaml:"idle_output_timeout"`
 
 	// MaintenanceInterval is the tick interval for the background
 	// reconcile-and-prune loop (CTXRUN-058, M12). Each tick runs
-	// CleanupOrphans and PruneImages. Must be positive.
-	MaintenanceInterval time.Duration `yaml:"maintenance_interval"`
-
-	// UseHMACForVerifyAutonomous toggles whether the VerifyAutonomous
-	// callback to CM is HMAC-signed (true, default) or falls back to
-	// `Authorization: Bearer <api_key>` (false, deprecated transition
-	// mode). See CTXRUN-048. Set false ONLY while the ContextMatrix
-	// server is being upgraded to accept HMAC on that GET endpoint.
-	UseHMACForVerifyAutonomous bool `yaml:"use_hmac_for_verify_autonomous"`
+	// CleanupOrphans and PruneImages. Must be positive. Accepts Go
+	// duration strings ("10m") in YAML.
+	MaintenanceInterval Duration `yaml:"maintenance_interval"`
 
 	// DeploymentProfile selects the operational mode: "production" (default,
 	// strict) or "dev" (loosens validators for local single-box setups).
@@ -142,6 +147,31 @@ type GitHubConfig struct {
 	PAT        GitHubPATConfig `yaml:"pat"`
 }
 
+// ResolvedAPIBaseURL returns the effective GitHub API base URL.
+// Precedence: APIBaseURL (trimmed) > "https://api." + Host > "https://api.github.com".
+func (g *GitHubConfig) ResolvedAPIBaseURL() string {
+	if v := strings.TrimSpace(g.APIBaseURL); v != "" {
+		return v
+	}
+
+	if g.Host != "" {
+		return "https://api." + g.Host
+	}
+
+	return "https://api.github.com"
+}
+
+// AllowedHosts returns the list of GitHub hostnames that are permitted.
+// When Host is empty or "github.com", only ["github.com"] is returned.
+// For any other Host value, ["github.com", Host] is returned.
+func (g *GitHubConfig) AllowedHosts() []string {
+	if g.Host == "" || g.Host == "github.com" {
+		return []string{"github.com"}
+	}
+
+	return []string{"github.com", g.Host}
+}
+
 // Load reads a YAML config file and applies environment variable overrides.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -149,27 +179,19 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	// defaultSecretsDir is a filesystem PATH, not a credential. It is named
-	// via a const to avoid the gosec G101 false-positive on struct literals.
-	const defaultSecretsDir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
-
 	cfg := &Config{
-		Port:                       9090,
-		AdminPort:                  0,
-		MaxConcurrent:              3,
-		ContainerTimeout:           "2h",
-		ContainerMemoryLimit:       8 * 1024 * 1024 * 1024, // 8 GiB
-		ContainerPidsLimit:         512,
-		LogLevel:                   "info",
-		LogFormat:                  LogFormatText,
-		WebhookReplayCacheSize:     10000,
-		MessageDedupCacheSize:      1000,
-		MessageDedupTTLSeconds:     600,
-		SecretsDir:                 defaultSecretsDir,
-		IdleOutputTimeout:          30 * time.Minute,
-		MaintenanceInterval:        10 * time.Minute,
-		UseHMACForVerifyAutonomous: true,
-		DeploymentProfile:          ProfileProduction,
+		Port:                   9090,
+		AdminPort:              0,
+		MaxConcurrent:          3,
+		ContainerTimeout:       "2h",
+		ContainerMemoryLimit:   8 * 1024 * 1024 * 1024, // 8 GiB
+		ContainerPidsLimit:     512,
+		LogLevel:               "info",
+		LogFormat:              LogFormatText,
+		WebhookReplayCacheSize: 10000,
+		IdleOutputTimeout:      Duration(30 * time.Minute),
+		MaintenanceInterval:    Duration(10 * time.Minute),
+		DeploymentProfile:      ProfileProduction,
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -177,14 +199,17 @@ func Load(path string) (*Config, error) {
 
 	applyEnvOverrides(cfg)
 
-	// Capture whether the user explicitly set ImagePullPolicy before we fill
-	// in a default. "never" is a legitimate explicit choice, so after the
-	// default-assignment below we can no longer tell the two apart — the
-	// dev-profile override must gate on this sentinel, not on the final value.
+	// Capture whether the user explicitly set ImagePullPolicy / SecretsDir
+	// before we fill in defaults. "never" / the production secrets path are
+	// legitimate explicit choices, so after the default-assignment below we
+	// can no longer tell the two apart — the dev-profile overrides must
+	// gate on these sentinels, not on the final value.
 	explicitPullPolicy := cfg.ImagePullPolicy != ""
 	if !explicitPullPolicy {
 		cfg.ImagePullPolicy = PullNever
 	}
+
+	explicitSecretsDir := cfg.SecretsDir != ""
 
 	// Dev-profile defaults: loosen a handful of tunables for local
 	// single-box setups. Only applied when the user did NOT explicitly set
@@ -199,6 +224,19 @@ func Load(path string) (*Config, error) {
 			cfg.ImagePullPolicy = PullIfNotPresent
 			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "image_pull_policy=if-not-present")
 		}
+
+		if !explicitSecretsDir {
+			cfg.SecretsDir = chooseDevSecretsDir()
+			cfg.AppliedDevDefaults = append(cfg.AppliedDevDefaults, "secrets_dir="+cfg.SecretsDir)
+		}
+	}
+
+	if !explicitSecretsDir && cfg.SecretsDir == "" {
+		// Production fallback: keep the historical /var/run path so
+		// k8s/systemd manifests that pre-provision it continue to work
+		// without changes. Operators that want a different layout set
+		// secrets_dir or CMR_SECRETS_DIR.
+		cfg.SecretsDir = defaultProductionSecretsDir
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -237,6 +275,26 @@ func (c *Config) LogLevelSlog() slog.Level {
 // IsDev returns true when the runner is configured in dev mode.
 // Dev mode loosens certain validators for local single-box setups.
 func (c *Config) IsDev() bool { return c.DeploymentProfile == ProfileDev }
+
+// defaultProductionSecretsDir is a filesystem PATH (not a credential),
+// hoisted to a const to keep gosec G101 from flagging the literal in the
+// default-assignment site.
+const defaultProductionSecretsDir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
+
+// chooseDevSecretsDir returns a user-writable default for SecretsDir in
+// dev mode. /var/run is root-owned on Linux and breaks `make run`-style
+// local setups, so dev defaults to $XDG_RUNTIME_DIR/cm-runner/secrets
+// when XDG_RUNTIME_DIR is set (the standard per-user tmpfs). Without it
+// — e.g. a non-systemd daemon user — fall back to a stable path under
+// os.TempDir() keyed by uid so concurrent runs by different users don't
+// collide.
+func chooseDevSecretsDir() string {
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		return filepath.Join(xdg, "cm-runner", "secrets")
+	}
+
+	return filepath.Join(os.TempDir(), fmt.Sprintf("cm-runner-%d", os.Getuid()), "secrets")
+}
 
 func validateServiceURL(field, rawURL string) error {
 	u, err := url.Parse(rawURL)
@@ -282,26 +340,32 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("api_key must be at least %d characters", MinAPIKeyLength)
 	}
 
-	if c.BaseImage == "" {
-		return fmt.Errorf("base_image is required")
+	switch c.ImagePullPolicy {
+	case PullAlways, PullNever, PullIfNotPresent:
+	default:
+		return fmt.Errorf("image_pull_policy must be one of: always, never, if-not-present")
 	}
 
-	// Digest-pin base_image and every allowed_images entry (CTXRUN-044).
+	if c.AgentImage == "" {
+		return fmt.Errorf("agent_image is required")
+	}
+
+	// Digest-pin agent_image and every allowed_images entry (CTXRUN-044).
 	// A mutable tag like `:latest` would let a rebuilt upstream image
 	// silently ship into production; require `@sha256:...` so operators
-	// roll base images intentionally.
+	// roll the agent image intentionally.
 	//
 	// In dev mode we collect unpinned references instead of failing hard, so
 	// local development setups can use mutable tags. The caller (main.go) logs
 	// a WARN per entry. Production mode keeps the fail-closed behaviour.
 	c.UnpinnedImageRefs = nil
 
-	if err := requireDigestPin("base_image", c.BaseImage); err != nil {
+	if err := requireDigestPin("agent_image", c.AgentImage); err != nil {
 		if !c.IsDev() {
 			return err
 		}
 
-		c.UnpinnedImageRefs = append(c.UnpinnedImageRefs, UnpinnedImageRef{Field: "base_image", Image: c.BaseImage})
+		c.UnpinnedImageRefs = append(c.UnpinnedImageRefs, UnpinnedImageRef{Field: "agent_image", Image: c.AgentImage})
 	}
 
 	for i, img := range c.AllowedImages {
@@ -313,12 +377,6 @@ func (c *Config) Validate() error {
 
 			c.UnpinnedImageRefs = append(c.UnpinnedImageRefs, UnpinnedImageRef{Field: field, Image: img})
 		}
-	}
-
-	switch c.ImagePullPolicy {
-	case PullAlways, PullNever, PullIfNotPresent:
-	default:
-		return fmt.Errorf("image_pull_policy must be one of: always, never, if-not-present")
 	}
 
 	if c.MaxConcurrent < 1 {
@@ -337,28 +395,12 @@ func (c *Config) Validate() error {
 		c.WebhookReplaySkewSeconds = 330
 	}
 
-	if c.MessageDedupCacheSize == 0 {
-		c.MessageDedupCacheSize = 1000
-	}
-
-	if c.MessageDedupTTLSeconds == 0 {
-		c.MessageDedupTTLSeconds = 600
-	}
-
 	if c.WebhookReplayCacheSize < 0 {
 		return fmt.Errorf("webhook_replay_cache_size must be positive")
 	}
 
 	if c.WebhookReplaySkewSeconds < 0 {
 		return fmt.Errorf("webhook_replay_skew_seconds must be positive")
-	}
-
-	if c.MessageDedupCacheSize < 0 {
-		return fmt.Errorf("message_dedup_cache_size must be positive")
-	}
-
-	if c.MessageDedupTTLSeconds < 0 {
-		return fmt.Errorf("message_dedup_ttl_seconds must be positive")
 	}
 
 	if c.AdminPort != 0 && (c.AdminPort < 1 || c.AdminPort > 65535) {
@@ -398,7 +440,7 @@ func (c *Config) Validate() error {
 	// Maintenance loop interval (CTXRUN-058). Default silently when zero so
 	// hand-crafted configs don't have to opt in; negatives are an error.
 	if c.MaintenanceInterval == 0 {
-		c.MaintenanceInterval = 10 * time.Minute
+		c.MaintenanceInterval = Duration(10 * time.Minute)
 	}
 
 	if c.MaintenanceInterval < 0 {
@@ -504,8 +546,8 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.APIKey = v
 	}
 
-	if v := os.Getenv("CMR_BASE_IMAGE"); v != "" {
-		cfg.BaseImage = v
+	if v := os.Getenv("CMR_AGENT_IMAGE"); v != "" {
+		cfg.AgentImage = v
 	}
 
 	if v := os.Getenv("CMR_IMAGE_PULL_POLICY"); v != "" {

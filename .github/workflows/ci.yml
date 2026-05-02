@@ -1,9 +1,9 @@
 # CI pipeline for contextmatrix-runner.
 #
 # Gates every push and pull_request on the full quality bar declared in the
-# Week-1 audit plan (see REVIEW.md C18, §9). Worker image is digest-pinned
+# Week-1 audit plan (see REVIEW.md C18, §9). Agent image is digest-pinned
 # (CTXRUN-044) so hadolint, Trivy, and shellcheck are all strict gates now.
-# Worker image signing (cosign) and SBOM generation (syft) run on push-to-main.
+# Agent image signing (cosign) and SBOM generation (syft) run on push-to-main.
 #
 # GitHub Actions are pinned to exact release tags. Full SHA pinning is a
 # follow-up once Dependabot has produced a first-pass bump PR that captures
@@ -52,7 +52,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Install golangci-lint at the version the worker image pins. Keeping
+      # Install golangci-lint at the version the agent image pins. Keeping
       # the pin outside the workflow (in the Makefile) is deliberate so the
       # runner and the CI runner use the same release.
       - name: Install golangci-lint
@@ -135,7 +135,7 @@ jobs:
       - name: Hadolint
         uses: hadolint/hadolint-action@v3.3.0
         with:
-          dockerfile: docker/Dockerfile.worker
+          dockerfile: docker/Dockerfile.orchestrated
 
   shellcheck:
     name: shellcheck
@@ -150,24 +150,24 @@ jobs:
           SHELLCHECK_OPTS: -e SC1091
         with:
           scandir: "."
-          additional_files: "svc.sh docker/entrypoint.sh"
+          additional_files: "svc.sh docker/entrypoint-orchestrated.sh"
           ignore_paths: >-
             .git
 
-  worker-image-scan:
-    name: worker-image-scan
+  agent-image-scan:
+    name: agent-image-scan
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
 
-      - name: Build worker image
-        run: make docker-worker
+      - name: Build agent image
+        run: make docker-orchestrated
 
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: contextmatrix/worker:latest
+          image-ref: contextmatrix/agent:latest
           format: table
           severity: CRITICAL,HIGH
           exit-code: "1"
@@ -184,66 +184,35 @@ jobs:
           # the file itself.
           trivyignores: .trivyignore
 
-  worker-image-sbom:
-    name: worker-image-sbom
+  agent-image-sbom:
+    name: agent-image-sbom
     runs-on: ubuntu-latest
-    needs: worker-image-scan
+    needs: agent-image-scan
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
 
-      - name: Build worker image
-        run: make docker-worker
+      - name: Build agent image
+        run: make docker-orchestrated
 
       - name: Generate SBOM with syft
         uses: anchore/sbom-action@v0.24.0
         with:
-          image: contextmatrix/worker:latest
+          image: contextmatrix/agent:latest
           format: spdx-json
-          output-file: worker-sbom.spdx.json
+          output-file: agent-sbom.spdx.json
           upload-artifact: true
           upload-artifact-retention: 90
 
-  worker-image-sign:
-    name: worker-image-sign
-    runs-on: ubuntu-latest
-    needs: worker-image-scan
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      id-token: write # for cosign keyless OIDC signing
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6.0.2
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.1
-        with:
-          cosign-release: v2.4.1
-
-      - name: Build worker image
-        run: make docker-worker
-
-      # Signing the image requires it to be pushed to a registry so cosign can
-      # reference it by digest. On push-to-main we assume an upstream registry
-      # login step lands alongside this job; until then we verify cosign is
-      # wired correctly by signing the locally-built image into a temporary
-      # OCI layout so the job exercises the full keyless-OIDC path.
-      - name: Sign image (keyless, OCI layout)
-        env:
-          COSIGN_EXPERIMENTAL: "1"
-        run: |
-          set -euxo pipefail
-          IMAGE="contextmatrix/worker:latest"
-          DIGEST=$(docker image inspect --format='{{index .RepoDigests 0}}' "${IMAGE}" 2>/dev/null || true)
-          if [ -z "${DIGEST}" ]; then
-            # Newly-built local image has no RepoDigests yet; fall back to
-            # the image ID so the signing step still runs in CI.
-            DIGEST=$(docker image inspect --format='{{.Id}}' "${IMAGE}")
-          fi
-          echo "signing ${DIGEST}"
-          cosign sign --yes --key=env://COSIGN_KEY_NOOP "${DIGEST}" || {
-            echo "NOTE: cosign sign stub — production signing happens on the registry-push pipeline." >&2
-            exit 0
-          }
+# NOTE: agent-image-sign job removed. The previous implementation invoked
+# `cosign sign` against an unset env-var key and swallowed the failure with
+# `|| { exit 0; }`, producing a green checkmark on every push-to-main while
+# generating no signature, no Rekor entry, and no transparency-log proof. A
+# misleading green status is worse than no signing at all.
+#
+# Re-introduce this job only after a registry-push step lands alongside it
+# (so cosign can reference the image by digest from a real registry) and the
+# keyless OIDC flow is wired without the `|| exit 0` swallow. Verify the
+# resulting signature with `cosign verify` against the Sigstore transparency
+# log before relying on the green check.

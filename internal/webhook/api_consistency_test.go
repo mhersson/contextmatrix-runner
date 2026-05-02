@@ -146,34 +146,6 @@ func (f *failingReader) Read([]byte) (int, error) { return 0, f.err }
 func TestEndpointStatusCodeMatrix(t *testing.T) {
 	type setup func(t *testing.T) (*Handler, []byte, string)
 
-	// withTracked seeds a container entry for (proj, card) into a fresh
-	// tracker-backed handler. Helper keeps the cases readable.
-	withTracked := func(project, card string, withStdin, stdinClosed bool) setup {
-		return func(t *testing.T) (*Handler, []byte, string) {
-			t.Helper()
-
-			tr := tracker.New()
-			b := logbroadcast.NewBroadcaster(nil, nil)
-			h := NewHandler(&noopRunner{}, tr, b, nil, testAPIKey, 3, testMCPURL,
-				slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
-			require.NoError(t, tr.Add(&tracker.ContainerInfo{
-				CardID:  card,
-				Project: project,
-			}))
-
-			if withStdin {
-				fw := &fakeWriteCloser{}
-				tr.SetStdin(project, card, fw, nil)
-
-				if stdinClosed {
-					require.NoError(t, tr.CloseStdin(project, card))
-				}
-			}
-
-			return h, nil, ""
-		}
-	}
-
 	blank := func(t *testing.T) (*Handler, []byte, string) {
 		t.Helper()
 
@@ -295,131 +267,6 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 			wantCode:   CodeInvalidJSON,
 		},
 
-		// /message
-		{
-			name:       "message: not tracked -> 404 not_found",
-			setup:      blank,
-			path:       "/message",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			payload:    MessagePayload{CardID: "NONE", Project: "proj", Content: "hi"},
-			wantStatus: http.StatusNotFound,
-			wantCode:   CodeNotFound,
-		},
-		{
-			name:       "message: no stdin (non-interactive) -> 409 conflict",
-			setup:      withTracked("proj", "CARD-1", false, false),
-			path:       "/message",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			payload:    MessagePayload{CardID: "CARD-1", Project: "proj", Content: "hi"},
-			wantStatus: http.StatusConflict,
-			wantCode:   CodeConflict,
-		},
-		{
-			name:       "message: stdin closed (session ended) -> 410 stdin_closed",
-			setup:      withTracked("proj", "CARD-1", true, true),
-			path:       "/message",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			payload:    MessagePayload{CardID: "CARD-1", Project: "proj", Content: "hi"},
-			wantStatus: http.StatusGone,
-			wantCode:   CodeStdinClosed,
-		},
-		{
-			name:       "message: too large -> 413 too_large",
-			setup:      withTracked("proj", "CARD-1", true, false),
-			path:       "/message",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			payload:    MessagePayload{CardID: "CARD-1", Project: "proj", Content: strings.Repeat("x", maxMessageContent+1)},
-			wantStatus: http.StatusRequestEntityTooLarge,
-			wantCode:   CodeTooLarge,
-		},
-		{
-			name:       "message: invalid JSON -> 400 invalid_json",
-			setup:      withTracked("proj", "CARD-1", true, false),
-			path:       "/message",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			rawBody:    []byte("not-json"),
-			wantStatus: http.StatusBadRequest,
-			wantCode:   CodeInvalidJSON,
-		},
-		{
-			name:       "message: missing content -> 400 invalid_field",
-			setup:      withTracked("proj", "CARD-1", true, false),
-			path:       "/message",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			payload:    MessagePayload{CardID: "CARD-1", Project: "proj"},
-			wantStatus: http.StatusBadRequest,
-			wantCode:   CodeInvalidField,
-		},
-		{
-			name: "message: draining -> 503 draining",
-			setup: func(t *testing.T) (*Handler, []byte, string) {
-				t.Helper()
-
-				tr := tracker.New()
-				hs := NewHealthState()
-				hs.Draining.Store(true)
-				h := NewHandler(&noopRunner{}, tr, logbroadcast.NewBroadcaster(nil, nil), nil,
-					testAPIKey, 3, testMCPURL,
-					slog.New(slog.NewTextHandler(io.Discard, nil)), 0, hs)
-
-				return h, nil, ""
-			},
-			path:       "/message",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			payload:    MessagePayload{CardID: "C-1", Project: "proj", Content: "hi"},
-			wantStatus: http.StatusServiceUnavailable,
-			wantCode:   CodeDraining,
-		},
-
-		// /promote
-		{
-			name:       "promote: not tracked -> 404 not_found",
-			setup:      blank,
-			path:       "/promote",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handlePromote },
-			payload:    PromotePayload{CardID: "GHOST-1", Project: "proj"},
-			wantStatus: http.StatusNotFound,
-			wantCode:   CodeNotFound,
-		},
-		{
-			name:       "promote: no stdin -> 409 conflict",
-			setup:      withTracked("proj", "CARD-1", false, false),
-			path:       "/promote",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handlePromote },
-			payload:    PromotePayload{CardID: "CARD-1", Project: "proj"},
-			wantStatus: http.StatusConflict,
-			wantCode:   CodeConflict,
-		},
-		{
-			name:       "promote: stdin closed -> 410 stdin_closed",
-			setup:      withTracked("proj", "CARD-1", true, true),
-			path:       "/promote",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handlePromote },
-			payload:    PromotePayload{CardID: "CARD-1", Project: "proj"},
-			wantStatus: http.StatusGone,
-			wantCode:   CodeStdinClosed,
-		},
-
-		// /end-session
-		{
-			name:       "end-session: not tracked -> 404 not_found",
-			setup:      blank,
-			path:       "/end-session",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleEndSession },
-			payload:    EndSessionPayload{CardID: "GHOST-1", Project: "proj"},
-			wantStatus: http.StatusNotFound,
-			wantCode:   CodeNotFound,
-		},
-		{
-			name:       "end-session: no stdin -> 409 conflict",
-			setup:      withTracked("proj", "CARD-1", false, false),
-			path:       "/end-session",
-			handler:    func(h *Handler) http.HandlerFunc { return h.handleEndSession },
-			payload:    EndSessionPayload{CardID: "CARD-1", Project: "proj"},
-			wantStatus: http.StatusConflict,
-			wantCode:   CodeConflict,
-		},
-
 		// /stop-all
 		{
 			name:       "stop-all: invalid JSON -> 400 invalid_json",
@@ -507,9 +354,6 @@ func TestNoRawErrLeakIntoResponseBody(t *testing.T) {
 		{"/trigger", h.handleTrigger},
 		{"/kill", h.handleKill},
 		{"/stop-all", h.handleStopAll},
-		{"/message", h.handleMessage},
-		{"/promote", h.handlePromote},
-		{"/end-session", h.handleEndSession},
 	}
 
 	for _, ep := range endpoints {
@@ -534,13 +378,12 @@ func TestNoRawErrLeakIntoResponseBody(t *testing.T) {
 	}
 }
 
-// noopRunner is a ContainerRunner that does nothing. Handler tests that do
-// not care about what happens after AddIfUnderLimit use this to avoid a real
+// noopRunner is a ContainerOps that does nothing. Handler tests that do not
+// care about what happens after AddIfUnderLimit use this to avoid a real
 // container.Manager.
 type noopRunner struct{}
 
-func (n *noopRunner) Run(_ context.Context, _ container.RunConfig) {}
-func (n *noopRunner) Kill(_, _ string) error                       { return nil }
+func (n *noopRunner) Kill(_, _ string) error { return nil }
 func (n *noopRunner) ListManaged(_ context.Context) ([]container.ManagedContainer, error) {
 	return nil, nil
 }

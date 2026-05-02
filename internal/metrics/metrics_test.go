@@ -16,11 +16,9 @@ func TestNew_RegistersAllMetrics(t *testing.T) {
 	// Touch each counter/histogram so it appears in the registry output.
 	m.WebhookRequestsTotal.WithLabelValues("trigger", "200", "success").Inc()
 	m.WebhookRequestDuration.WithLabelValues("trigger").Observe(0.1)
-	m.ContainerDuration.WithLabelValues(metrics.OutcomeSuccess).Observe(30)
 	m.RunningContainers.Set(1)
 	m.CallbackRetriesTotal.WithLabelValues("status").Inc()
 	m.BroadcasterDropsTotal.WithLabelValues("all").Inc()
-	m.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineRun).Inc()
 	m.ReplayCacheHitsTotal.Inc()
 	m.PreflightLastSuccessSec.Set(1_700_000_000)
 
@@ -35,11 +33,9 @@ func TestNew_RegistersAllMetrics(t *testing.T) {
 	want := []string{
 		"cmr_webhook_requests_total",
 		"cmr_webhook_request_duration_seconds",
-		"cmr_container_duration_seconds",
 		"cmr_running_containers",
 		"cmr_callback_retries_total",
 		"cmr_broadcaster_drops_total",
-		"cmr_panic_recovered_total",
 		"cmr_replay_cache_hits_total",
 		"cmr_preflight_last_success_timestamp_seconds",
 	}
