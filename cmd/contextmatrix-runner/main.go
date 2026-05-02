@@ -24,6 +24,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/metrics"
+	"github.com/mhersson/contextmatrix-runner/internal/orchestrated"
 	"github.com/mhersson/contextmatrix-runner/internal/preflight"
 	"github.com/mhersson/contextmatrix-runner/internal/tracing"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
@@ -110,7 +111,7 @@ func main() {
 			cfg.GitHub.App.AppID,
 			cfg.GitHub.App.InstallationID,
 			cfg.GitHub.App.PrivateKeyPath,
-			githubauth.WithAPIBaseURL(cfg.GitHub.APIBaseURL),
+			githubauth.WithAPIBaseURL(cfg.GitHub.ResolvedAPIBaseURL()),
 		)
 		if err != nil {
 			slog.Error("failed to construct GitHub App provider", "error", err)
@@ -131,32 +132,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Wrap the App/PAT provider in a CachingProvider. The runner mints
+	// a token before every docker-exec inside the worker (workspaceExec
+	// in internal/orchestrated), so without a cache each git/gh
+	// subprocess would round-trip to GitHub's token endpoint. With the
+	// cache, only the first call (and every ~55 minutes thereafter,
+	// once we're within the refresh skew of expiry) actually talks to
+	// GitHub. PATProvider returns a far-future expiry sentinel, so the
+	// cache hits forever for PAT mode.
+	tokenProvider = githubauth.NewCachingProvider(tokenProvider)
+
 	slog.Info("github token provider initialized", "auth_mode", cfg.GitHub.AuthMode)
-	// NOTE: NOT wrapped in CachingProvider — runner mints fresh per spawn
-	// (tokens hand off to long-lived worker containers; freshness at delivery matters).
 
 	// Core components.
 	defer func() { _ = docker.Close() }()
 
 	trk := tracker.New()
 	cb := callback.NewClient(cfg.ContextMatrixURL, cfg.APIKey, logger).WithMetrics(mx)
-	cb.SetUseHMACForVerifyAutonomous(cfg.UseHMACForVerifyAutonomous)
-
-	if !cfg.UseHMACForVerifyAutonomous {
-		// CTXRUN-048 cross-repo transition knob. Log loudly at startup so
-		// operators can't silently run the deprecated Bearer mode forever.
-		logger.Warn(
-			"Bearer fallback for VerifyAutonomous is deprecated; " +
-				"ContextMatrix server must accept HMAC by the next release — " +
-				"remove use_hmac_for_verify_autonomous: false once the server is upgraded",
-		)
-	}
 
 	broadcaster := logbroadcast.NewBroadcaster(logger, broadcasterDropAdapter{m: mx})
 
 	defer func() { _ = broadcaster.Close(context.Background()) }()
 
-	mgr := container.NewManager(docker, trk, cb, tokenProvider, broadcaster, cfg, logger).WithMetrics(mx)
+	mgr := container.NewManager(docker, trk, logger).WithMetrics(mx)
 
 	// HealthState is the shared view of whether preflight has passed and
 	// whether a graceful shutdown has started. /readyz reads both flags;
@@ -196,11 +194,33 @@ func main() {
 	// containers and prunes dangling images. Closes the M12 gap where
 	// CleanupOrphans only ran once at startup and the image cache grew
 	// unbounded across worker-image upgrades. See CTXRUN-058.
-	go runMaintenanceLoop(monitorCtx, mgr, cfg.MaintenanceInterval, health, logger)
+	go runMaintenanceLoop(monitorCtx, mgr, time.Duration(cfg.MaintenanceInterval), health, logger)
 
 	// Webhook handler.
 	webhookSkew := time.Duration(cfg.WebhookReplaySkewSeconds) * time.Second
 	wh := webhook.NewHandler(mgr, trk, broadcaster, cb, cfg.APIKey, cfg.MaxConcurrent, cfg.ContainerContextMatrixURL+"/mcp", logger, webhookSkew, health).WithMetrics(mx)
+
+	// Per-card driver dispatcher: every /trigger payload is routed through
+	// it. See internal/orchestrated for details.
+	disp, err := orchestrated.New(orchestrated.Deps{
+		Cfg:         cfg,
+		Logger:      logger,
+		GitTokens:   tokenProvider,
+		Callback:    cb,
+		Broadcaster: broadcaster,
+		Tracker:     trk,
+	})
+	if err != nil {
+		// Bootstrap failure: the runner must not start under a broken
+		// dispatcher. Defers above (monitorCancel, broadcaster.Close,
+		// docker.Close) are best-effort cleanup; failing fast here
+		// matches the pre-existing init-failure pattern earlier in main.
+		logger.Error("failed to init orchestrated dispatcher", "error", err)
+		os.Exit(1) //nolint:gocritic // init failure; consistent with earlier os.Exit calls in main
+	}
+
+	wh.SetOrchestratedDispatcher(disp)
+	logger.Info("orchestrated dispatcher initialized", "agent_image", cfg.AgentImage)
 
 	// Signature-replay and /message idempotency caches. Both run
 	// eviction goroutines tied to the main process context so they
@@ -212,16 +232,10 @@ func main() {
 		time.Duration(cfg.WebhookReplaySkewSeconds)*time.Second,
 		cfg.WebhookReplayCacheSize,
 	)
-	messageDedup := webhook.NewMessageDedupCache(
-		time.Duration(cfg.MessageDedupTTLSeconds)*time.Second,
-		cfg.MessageDedupCacheSize,
-	)
 
 	wh.SetReplayCache(replayCache)
-	wh.SetMessageDedupCache(messageDedup)
 
 	go replayCache.Run(replayCtx)
-	go messageDedup.Run(replayCtx)
 
 	mux := http.NewServeMux()
 	wh.Register(mux)
@@ -339,9 +353,9 @@ type shutdownDeps struct {
 //
 //  1. Flip Draining so /readyz flips to 503 immediately and the load
 //     balancer removes us from rotation before step 2 finishes. Our own
-//     /trigger/message/promote/end-session handlers also short-circuit to
-//     503 on this flag so a request that raced signal delivery doesn't
-//     start a container we're about to kill.
+//     /trigger and /kill handlers also short-circuit to 503 on this flag
+//     so a request that raced signal delivery doesn't start a container
+//     we're about to kill.
 //  2. Stop the HTTP listener with a bounded deadline. ListenAndServe
 //     returns ErrServerClosed; in-flight handlers finish within
 //     httpShutdownTimeout or are forcibly dropped.
@@ -553,7 +567,7 @@ func buildProbes(cfg *config.Config, docker container.DockerClient, tokenProvide
 	// images at /trigger time, so there is nothing to verify up front.
 	if cfg.ImagePullPolicy == config.PullNever {
 		probes.ImageInspect = func(ctx context.Context) error {
-			_, err := docker.ImageInspect(ctx, cfg.BaseImage)
+			_, err := docker.ImageInspect(ctx, cfg.AgentImage)
 
 			return err
 		}

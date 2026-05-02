@@ -117,7 +117,7 @@ func TestBuildProbes_PullNeverIncludesImageInspect(t *testing.T) {
 
 	cfg := &config.Config{
 		ImagePullPolicy: config.PullNever,
-		BaseImage:       "ghcr.io/example/worker@sha256:aaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111",
+		AgentImage:      "ghcr.io/example/worker@sha256:aaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111",
 	}
 
 	cb := callback.NewClient("http://127.0.0.1:1", "test-secret-key-that-is-long-enough", testLogger())
@@ -127,11 +127,11 @@ func TestBuildProbes_PullNeverIncludesImageInspect(t *testing.T) {
 	require.Error(t, probes.GitHubToken(context.Background()), "GitHubToken should propagate the PAT/App error")
 
 	// ImageInspect must be populated and must target the configured
-	// base image exactly — drift between config.BaseImage and the
+	// agent image exactly — drift between config.AgentImage and the
 	// probe would quietly pass preflight against the wrong reference.
 	require.NotNil(t, probes.ImageInspect)
 	require.Error(t, probes.ImageInspect(context.Background()))
-	assert.Equal(t, cfg.BaseImage, inspected)
+	assert.Equal(t, cfg.AgentImage, inspected)
 
 	// ContextMatrixPing is wired to a closed port, so it must fail
 	// during the preflight window.
@@ -149,7 +149,7 @@ func TestBuildProbes_PullIfNotPresentSkipsInspect(t *testing.T) {
 	docker := &fakeDocker{}
 	cfg := &config.Config{
 		ImagePullPolicy: config.PullIfNotPresent,
-		BaseImage:       "ghcr.io/example/worker@sha256:aaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111",
+		AgentImage:      "ghcr.io/example/worker@sha256:aaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111",
 	}
 
 	cb := callback.NewClient("http://127.0.0.1:1", "x", testLogger())
