@@ -659,7 +659,7 @@ func TestHandleLogs_ProjectFilter(t *testing.T) {
 	defer srv.Close()
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs", []byte{}, ts)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs?project=alpha", []byte{}, ts)
 
 	// Subscribe only to "alpha" project.
 	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs?project=alpha", nil)
