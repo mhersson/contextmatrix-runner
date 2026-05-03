@@ -95,12 +95,6 @@ const (
 // synthetic-wedge cases fast.
 var primingWriteTimeout = 5 * time.Second
 
-// idleWatchdogCheckInterval is the poll cadence for the per-container
-// idle-output watchdog introduced in CTXRUN-058. Declared as a package var so
-// tests can shrink it to a few milliseconds without waiting 30s of wall time
-// per synthetic idle scenario.
-var idleWatchdogCheckInterval = 30 * time.Second
-
 // logDrainTimeout bounds the <-logDone wait on the cancel, timeout, and
 // error branches of waitAndCleanup. A hung log-streaming goroutine (wedged
 // docker daemon, stuck hijacked socket, or stdcopy/scanner stall) used to
@@ -1188,17 +1182,16 @@ func (m *Manager) runIdleWatchdog(
 	lastOutputAt *atomic.Pointer[time.Time],
 	idleTimeout time.Duration,
 ) {
-	tick := idleWatchdogCheckInterval
+	tick := m.cfg.IdleWatchdogInterval
+	if tick <= 0 {
+		tick = 30 * time.Second
+	}
 	// Never let the poll interval exceed the idle timeout — otherwise a tight
 	// idle deadline (e.g. 50ms in tests) would be missed until the next 30s
 	// tick. Clamp the poll interval so the watchdog reacts within roughly one
 	// timeout window even for small values.
-	if tick > idleTimeout {
+	if tick > idleTimeout && idleTimeout > 0 {
 		tick = idleTimeout
-	}
-
-	if tick <= 0 {
-		tick = time.Millisecond
 	}
 
 	ticker := time.NewTicker(tick)

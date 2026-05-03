@@ -2503,14 +2503,10 @@ func TestWaitAndCleanup_MessageDuringCleanupGets404(t *testing.T) {
 // directly (rather than via streamLogs + a fake stream) so the test is
 // deterministic and does not depend on docker multiplexed framing.
 func TestIdleWatchdog_KillsOnSilence(t *testing.T) {
-	// Shrink the poll tick so the watchdog reacts promptly inside the test.
-	prev := idleWatchdogCheckInterval
-	idleWatchdogCheckInterval = 10 * time.Millisecond
-
-	t.Cleanup(func() { idleWatchdogCheckInterval = prev })
-
 	cfg := testConfig()
 	cfg.IdleOutputTimeout = 50 * time.Millisecond
+	// Shrink the poll tick so the watchdog reacts promptly inside the test.
+	cfg.IdleWatchdogInterval = 10 * time.Millisecond
 
 	mock := successfulMock()
 
@@ -2566,13 +2562,10 @@ func TestIdleWatchdog_KillsOnSilence(t *testing.T) {
 // TestIdleWatchdog_DoesNotKillWhileActive verifies the watchdog stays silent
 // while the container keeps publishing output faster than the idle timeout.
 func TestIdleWatchdog_DoesNotKillWhileActive(t *testing.T) {
-	prev := idleWatchdogCheckInterval
-	idleWatchdogCheckInterval = 5 * time.Millisecond
-
-	t.Cleanup(func() { idleWatchdogCheckInterval = prev })
-
 	cfg := testConfig()
 	cfg.IdleOutputTimeout = 50 * time.Millisecond
+	// Shrink the poll tick so the watchdog reacts promptly inside the test.
+	cfg.IdleWatchdogInterval = 5 * time.Millisecond
 
 	mock := successfulMock()
 

@@ -83,6 +83,12 @@ type Config struct {
 	// disables the watchdog.
 	IdleOutputTimeout time.Duration `yaml:"idle_output_timeout"`
 
+	// IdleWatchdogInterval is the poll cadence for the per-container
+	// idle-output watchdog. Default 30s. Test harnesses shrink to
+	// milliseconds to drive fast synthetic idle scenarios without waiting
+	// wall-clock seconds.
+	IdleWatchdogInterval time.Duration `yaml:"idle_watchdog_interval"`
+
 	// MaintenanceInterval is the tick interval for the background
 	// reconcile-and-prune loop (CTXRUN-058, M12). Each tick runs
 	// CleanupOrphans and PruneImages. Must be positive.
@@ -167,6 +173,7 @@ func Load(path string) (*Config, error) {
 		MessageDedupTTLSeconds:     600,
 		SecretsDir:                 defaultSecretsDir,
 		IdleOutputTimeout:          30 * time.Minute,
+		IdleWatchdogInterval:       30 * time.Second,
 		MaintenanceInterval:        10 * time.Minute,
 		UseHMACForVerifyAutonomous: true,
 		DeploymentProfile:          ProfileProduction,
@@ -393,6 +400,16 @@ func (c *Config) Validate() error {
 	// Zero is legal and disables the watchdog.
 	if c.IdleOutputTimeout < 0 {
 		return fmt.Errorf("idle_output_timeout must be zero or positive")
+	}
+
+	// Idle watchdog poll cadence. Default silently when zero so hand-crafted
+	// configs don't have to set it; negatives are an error.
+	if c.IdleWatchdogInterval == 0 {
+		c.IdleWatchdogInterval = 30 * time.Second
+	}
+
+	if c.IdleWatchdogInterval < 0 {
+		return fmt.Errorf("idle_watchdog_interval must be positive")
 	}
 
 	// Maintenance loop interval (CTXRUN-058). Default silently when zero so
