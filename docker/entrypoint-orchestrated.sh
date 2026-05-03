@@ -81,6 +81,24 @@ if [ -n "${MCP_URL:-}" ] && [ -n "${MCP_API_KEY:-}" ]; then
     mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 fi
 
+# Disable Claude Code's default cloud-only MCP servers — the worker has no
+# need for Gmail / Calendar / Drive and they'd just produce auth errors at
+# startup. Merged with `unique` so any operator-supplied disabled entries
+# (and future additions to this list) are preserved.
+CLAUDE_JSON="$HOME/.claude.json"
+[ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
+
+DISABLED_DEFAULTS=$(jq -n '[
+    "claude.ai Gmail",
+    "claude.ai Google Calendar",
+    "claude.ai Google Drive"
+]')
+
+jq --argjson disabled "$DISABLED_DEFAULTS" \
+    '.disabledMcpServers = ((.disabledMcpServers // []) + $disabled | unique)' \
+    "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp"
+mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
+
 # Operator-supplied claude_settings: written before the bulk copy so
 # Claude reads the operator's settings on its first invocation.
 if [ -n "${CM_CLAUDE_SETTINGS:-}" ]; then
