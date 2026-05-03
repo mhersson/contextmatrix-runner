@@ -40,7 +40,7 @@ func TestReportStatus_Success(t *testing.T) {
 
 		// Verify HMAC
 		sig := strings.TrimPrefix(sigHeader, "sha256=")
-		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.Path, sig, tsHeader, body, cmhmac.DefaultMaxClockSkew))
+		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, cmhmac.DefaultMaxClockSkew))
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -127,7 +127,7 @@ func TestReportStatus_HMACFormat(t *testing.T) {
 		// Verify the signature is valid
 		body, _ := io.ReadAll(r.Body)
 		hexSig := strings.TrimPrefix(sig, "sha256=")
-		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.Path, hexSig, ts, body, cmhmac.DefaultMaxClockSkew))
+		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.RequestURI(), hexSig, ts, body, cmhmac.DefaultMaxClockSkew))
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))

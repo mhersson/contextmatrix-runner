@@ -110,14 +110,14 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 
 	var lastErr error
 
-	statusPath, err := callbackStatusPath(c.contextMatrixURL)
+	statusURI, err := callbackStatusURI(c.contextMatrixURL)
 	if err != nil {
 		return err
 	}
 
 	for attempt := range maxRetries {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusPath, body, ts)
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusURI, body, ts)
 
 		lastErr = c.doRequest(ctx, body, signature, ts)
 		if lastErr == nil {
@@ -181,7 +181,7 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 		return fmt.Errorf("marshal skill-engaged callback: %w", err)
 	}
 
-	skillPath, err := callbackSkillEngagedPath(c.contextMatrixURL)
+	skillURI, err := callbackSkillEngagedURI(c.contextMatrixURL)
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 
 	for attempt := range maxRetries {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillPath, body, ts)
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillURI, body, ts)
 
 		reqURL := c.contextMatrixURL + "/api/runner/skill-engaged"
 
@@ -330,18 +330,18 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 	}
 
 	if c.useHMACForVerifyAutonomous {
-		// HMAC bound to method+path with an empty body. Binding the path
-		// prevents a captured signature from being replayed against a
-		// different endpoint, and binding the timestamp prevents replay
-		// outside the clock-skew window.
+		// HMAC bound to method+URI with an empty body. Binding the URI
+		// (path + query) prevents a captured signature from being replayed
+		// against a different endpoint, and binding the timestamp prevents
+		// replay outside the clock-skew window.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 
-		path, perr := verifyAutonomousPath(reqURL)
+		uri, perr := verifyAutonomousURI(reqURL)
 		if perr != nil {
 			return false, perr
 		}
 
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodGet, path, nil, ts)
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodGet, uri, nil, ts)
 		req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
 		req.Header.Set(cmhmac.TimestampHeader, ts)
 	} else {
@@ -407,38 +407,39 @@ func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts strin
 	return nil
 }
 
-// callbackStatusPath returns the path component of the CM status-callback
-// URL. Sender and receiver must agree on the signed path — any intermediate
-// proxy that rewrites paths would break HMAC auth, so this is derived from
-// the configured contextMatrixURL to keep both sides consistent even if the
-// base URL includes a trailing slash or a path prefix.
-func callbackStatusPath(contextMatrixURL string) (string, error) {
-	return derivePath(contextMatrixURL + "/api/runner/status")
+// callbackStatusURI returns the request-target (path + raw query) of the CM
+// status-callback URL. Sender and receiver must agree on the signed value —
+// any intermediate proxy that rewrites paths or queries would break HMAC
+// auth, so this is derived from the configured contextMatrixURL to keep
+// both sides consistent even if the base URL includes a trailing slash or
+// a path prefix.
+func callbackStatusURI(contextMatrixURL string) (string, error) {
+	return deriveURI(contextMatrixURL + "/api/runner/status")
 }
 
-// callbackSkillEngagedPath returns the path component of the CM
+// callbackSkillEngagedURI returns the request-target of the CM
 // skill-engaged callback URL.
-func callbackSkillEngagedPath(contextMatrixURL string) (string, error) {
-	return derivePath(contextMatrixURL + "/api/runner/skill-engaged")
+func callbackSkillEngagedURI(contextMatrixURL string) (string, error) {
+	return deriveURI(contextMatrixURL + "/api/runner/skill-engaged")
 }
 
-// verifyAutonomousPath returns the path component of the constructed
+// verifyAutonomousURI returns the request-target of the constructed
 // /autonomous verify URL.
-func verifyAutonomousPath(reqURL string) (string, error) {
-	return derivePath(reqURL)
+func verifyAutonomousURI(reqURL string) (string, error) {
+	return deriveURI(reqURL)
 }
 
-func derivePath(rawURL string) (string, error) {
+func deriveURI(rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", fmt.Errorf("parse url %q: %w", rawURL, err)
 	}
 
 	if u.Path == "" {
-		return "/", nil
+		u.Path = "/"
 	}
 
-	return u.Path, nil
+	return u.RequestURI(), nil
 }
 
 // maxDetailBytes caps the upstream body retained on *Error for

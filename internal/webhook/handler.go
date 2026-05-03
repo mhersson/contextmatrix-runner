@@ -928,7 +928,7 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 			skew = cmhmac.DefaultMaxClockSkew
 		}
 
-		if !cmhmac.VerifySignatureWithTimestamp(h.apiKey, r.Method, r.URL.Path, sig, tsHeader, body, skew) {
+		if !cmhmac.VerifySignatureWithTimestamp(h.apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, skew) {
 			h.logWarn("webhook authentication failed", "remote_addr", r.RemoteAddr)
 			writeUnauthorized(w)
 
