@@ -3449,6 +3449,93 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 	})
 }
 
+// TestContainerCreate_WorkerExtraEnv covers the deployment-wide
+// extra-env injection. Values land in the container env list verbatim;
+// nil/empty maps are no-ops.
+func TestContainerCreate_WorkerExtraEnv(t *testing.T) {
+	captureEnv := func(t *testing.T, cfg *config.Config) []string {
+		t.Helper()
+
+		var capturedEnv []string
+
+		mock := successfulMock()
+		mock.ContainerCreateFn = func(_ context.Context, ccfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			capturedEnv = ccfg.Env
+
+			return container.CreateResponse{ID: "extraenv-test-ctr"}, nil
+		}
+
+		cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		t.Cleanup(cbSrv.Close)
+
+		tr := tracker.New()
+		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		payload := testPayload()
+		require.NoError(t, tr.Add(&tracker.ContainerInfo{
+			CardID:  payload.CardID,
+			Project: payload.Project,
+		}))
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+
+		return capturedEnv
+	}
+
+	t.Run("nil map adds nothing", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.WorkerExtraEnv = nil
+
+		env := captureEnv(t, cfg)
+		for _, e := range env {
+			assert.False(t, strings.HasPrefix(e, "GIT_SSL_NO_VERIFY="),
+				"no extra env should be present when WorkerExtraEnv is nil")
+		}
+	})
+
+	t.Run("entries appear in env list", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.WorkerExtraEnv = map[string]string{
+			"GIT_SSL_NO_VERIFY":   "1",
+			"NPM_CONFIG_REGISTRY": "https://npm.internal/",
+		}
+
+		env := captureEnv(t, cfg)
+		assert.Contains(t, env, "GIT_SSL_NO_VERIFY=1")
+		assert.Contains(t, env, "NPM_CONFIG_REGISTRY=https://npm.internal/")
+	})
+
+	t.Run("entries sorted for deterministic output", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.WorkerExtraEnv = map[string]string{
+			"ZEBRA": "z",
+			"ALPHA": "a",
+			"MIKE":  "m",
+		}
+
+		env := captureEnv(t, cfg)
+
+		var picked []string
+
+		for _, e := range env {
+			switch {
+			case strings.HasPrefix(e, "ALPHA="),
+				strings.HasPrefix(e, "MIKE="),
+				strings.HasPrefix(e, "ZEBRA="):
+				picked = append(picked, e)
+			}
+		}
+
+		assert.Equal(t, []string{"ALPHA=a", "MIKE=m", "ZEBRA=z"}, picked)
+	})
+}
+
 func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 	// runWithPullStub builds a manager, swaps pullSkillsRepo with stub, runs
 	// one container creation, and returns whatever stub recorded.

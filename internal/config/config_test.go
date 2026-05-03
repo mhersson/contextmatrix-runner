@@ -1499,3 +1499,85 @@ func TestValidate_AuthModeRequired(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "github.auth_mode")
 }
+
+// TestValidate_WorkerExtraEnv covers the new WorkerExtraEnv field's
+// validation rules: invalid env-var keys are rejected, secrets-file
+// var collisions are rejected, well-formed entries pass.
+func TestValidate_WorkerExtraEnv(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	baseCfg := func() *Config {
+		return &Config{
+			ContextMatrixURL: "http://cm.lan:8080",
+			APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			BaseImage:        testDigestImage,
+			ImagePullPolicy:  PullAlways,
+			MaxConcurrent:    1,
+			ContainerTimeout: "1h",
+			AnthropicAPIKey:  "sk-ant-test",
+			GitHub: GitHubConfig{
+				AuthMode: "app",
+				App: GitHubAppConfig{
+					AppID:          1,
+					InstallationID: 1,
+					PrivateKeyPath: pemPath,
+				},
+			},
+		}
+	}
+
+	t.Run("valid keys accepted", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := baseCfg()
+		cfg.WorkerExtraEnv = map[string]string{
+			"GIT_SSL_NO_VERIFY":   "1",
+			"NPM_CONFIG_REGISTRY": "https://npm.internal/",
+			"_LEADING_UNDERSCORE": "ok",
+			"WITH_DIGITS_123":     "v",
+		}
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("invalid key shape rejected", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []string{
+			"",          // empty
+			"1STARTS",   // leading digit
+			"WITH-DASH", // hyphen
+			"WITH SPACE",
+			"WITH=EQ",
+		}
+		for _, k := range cases {
+			cfg := baseCfg()
+			cfg.WorkerExtraEnv = map[string]string{k: "v"}
+
+			err := cfg.Validate()
+			assert.ErrorContains(t, err, "worker_extra_env",
+				"key %q should be rejected", k)
+		}
+	})
+
+	t.Run("secrets-file collisions rejected", func(t *testing.T) {
+		t.Parallel()
+
+		secrets := []string{
+			"CM_GIT_TOKEN",
+			"CM_MCP_API_KEY",
+			"CLAUDE_CODE_OAUTH_TOKEN",
+			"ANTHROPIC_API_KEY",
+		}
+		for _, k := range secrets {
+			cfg := baseCfg()
+			cfg.WorkerExtraEnv = map[string]string{k: "leak"}
+
+			err := cfg.Validate()
+			assert.ErrorContains(t, err, "collides with a secrets-file var",
+				"key %q should collide with secrets file", k)
+		}
+	})
+}

@@ -504,6 +504,23 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		env = append(env, "CM_TASK_SKILLS="+strings.Join(*payload.TaskSkills, ","))
 	}
 
+	// Worker-extra env vars (deployment-wide, see Config.WorkerExtraEnv).
+	// Sorted for deterministic ordering — useful in tests and reproducible
+	// `docker inspect` output. Validation in config.Validate ensures keys
+	// are well-formed and don't shadow secrets-file vars.
+	if len(m.cfg.WorkerExtraEnv) > 0 {
+		extraKeys := make([]string, 0, len(m.cfg.WorkerExtraEnv))
+		for k := range m.cfg.WorkerExtraEnv {
+			extraKeys = append(extraKeys, k)
+		}
+
+		sort.Strings(extraKeys)
+
+		for _, k := range extraKeys {
+			env = append(env, k+"="+m.cfg.WorkerExtraEnv[k])
+		}
+	}
+
 	// Apply highest-priority Claude auth method only.
 	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
 	var mounts []mount.Mount

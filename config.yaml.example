@@ -210,6 +210,17 @@ idle_output_timeout: "30m"
 # operators rarely change this. No env var override.
 idle_watchdog_interval: "30s"
 
+# Deployment-wide map of env vars injected into every spawned worker
+# container. Use sparingly — most operators want this empty. Intended
+# for environments where the worker's git/HTTPS client needs special
+# trust configuration (e.g. test harnesses with self-signed certs:
+# GIT_SSL_NO_VERIFY=1) or non-default registries (NPM_CONFIG_REGISTRY).
+# Keys must be valid POSIX env-var names. Keys collidng with the
+# secrets-file vars (CM_GIT_TOKEN, CM_MCP_API_KEY,
+# CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY) are rejected by Validate.
+# No env var override.
+# worker_extra_env: {}
+
 # Tick interval for the background maintenance loop that sweeps orphaned
 # worker containers (left over from crashes) and prunes dangling images
 # older than 24h. Must be positive. No env var override.

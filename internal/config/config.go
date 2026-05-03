@@ -89,6 +89,22 @@ type Config struct {
 	// wall-clock seconds.
 	IdleWatchdogInterval time.Duration `yaml:"idle_watchdog_interval"`
 
+	// WorkerExtraEnv is a deployment-wide map of additional env vars
+	// injected into every spawned worker container. Use sparingly:
+	// production deployments shouldn't need these (the entrypoint sets
+	// CM_* vars; secrets land in /run/cm-secrets/env). Intended for
+	// environments where the worker's git/HTTPS client needs special
+	// trust configuration — e.g. test harnesses fronting a self-signed
+	// HTTPS git fixture set GIT_SSL_NO_VERIFY=1 here.
+	//
+	// Values are passed verbatim to the container. Keys must be valid
+	// shell env-var names (`A-Za-z_` start, `A-Za-z0-9_` continuation).
+	// Validation rejects keys clashing with the secrets file vars
+	// (CM_GIT_TOKEN, CM_MCP_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
+	// ANTHROPIC_API_KEY) — those must come through the bind-mounted
+	// secrets file, not env.
+	WorkerExtraEnv map[string]string `yaml:"worker_extra_env"`
+
 	// MaintenanceInterval is the tick interval for the background
 	// reconcile-and-prune loop (CTXRUN-058, M12). Each tick runs
 	// CleanupOrphans and PruneImages. Must be positive.
@@ -412,6 +428,21 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("idle_watchdog_interval must be positive")
 	}
 
+	// Worker extra env: validate key shape and reject collisions with
+	// secrets-file vars. These restrictions exist so a misconfigured
+	// extra-env map can't accidentally shadow the secret-injection path
+	// (which the entrypoint sources from /run/cm-secrets/env).
+	for k := range c.WorkerExtraEnv {
+		if !validEnvKey(k) {
+			return fmt.Errorf("worker_extra_env key %q is not a valid env var name", k)
+		}
+
+		switch k {
+		case "CM_GIT_TOKEN", "CM_MCP_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY":
+			return fmt.Errorf("worker_extra_env key %q collides with a secrets-file var; remove it", k)
+		}
+	}
+
 	// Maintenance loop interval (CTXRUN-058). Default silently when zero so
 	// hand-crafted configs don't have to opt in; negatives are an error.
 	if c.MaintenanceInterval == 0 {
@@ -620,4 +651,26 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("CMR_DEPLOYMENT_PROFILE"); v != "" {
 		cfg.DeploymentProfile = v
 	}
+}
+
+// validEnvKey returns true for strings that are valid POSIX env-var
+// names: must start with [A-Za-z_], remainder [A-Za-z0-9_]. Empty
+// strings are rejected.
+func validEnvKey(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	for i, r := range s {
+		switch {
+		case r == '_':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+
+	return true
 }
