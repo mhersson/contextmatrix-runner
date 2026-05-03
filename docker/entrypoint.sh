@@ -171,6 +171,21 @@ CLAUDE_JSON="$HOME/.claude.json"
 jq --argjson mcp "$MCP_ENTRY" '.mcpServers = ((.mcpServers // {}) * $mcp)' "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp"
 mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 
+# Disable Claude Code's default cloud-only MCP servers — the worker has no
+# need for Gmail / Calendar / Drive and they'd just produce auth errors at
+# startup. Merged with `unique` so any operator-supplied disabled entries
+# (and future additions to this list) are preserved.
+DISABLED_DEFAULTS=$(jq -n '[
+    "claude.ai Gmail",
+    "claude.ai Google Calendar",
+    "claude.ai Google Drive"
+]')
+
+jq --argjson disabled "$DISABLED_DEFAULTS" \
+    '.disabledMcpServers = ((.disabledMcpServers // []) + $disabled | unique)' \
+    "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp"
+mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
+
 # ----- Input validation (defense-in-depth) -----
 # Validate CM_CARD_ID early — we interpolate it into prompts and container logs.
 # Use `case` (whole-string match) rather than grep (line-oriented) so embedded
