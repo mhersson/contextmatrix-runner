@@ -205,6 +205,11 @@ message_dedup_ttl_seconds: 600
 # No env var override.
 idle_output_timeout: "30m"
 
+# Poll cadence for the per-container idle-output watchdog. Default 30s.
+# Lowered to a few seconds in integration test harnesses; production
+# operators rarely change this. No env var override.
+idle_watchdog_interval: "30s"
+
 # Tick interval for the background maintenance loop that sweeps orphaned
 # worker containers (left over from crashes) and prunes dangling images
 # older than 24h. Must be positive. No env var override.
