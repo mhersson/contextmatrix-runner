@@ -142,11 +142,23 @@ ALLOWED_TOOLS_AUTO_EXTRAS=(
 )
 
 # ----- Claude Code Authentication -----
-# If OAuth tokens were mounted from the host, copy them to the writable home.
-if [ -d "/claude-auth" ]; then
-    cp -r /claude-auth/. "$HOME/.claude/" 2>/dev/null || true
-fi
+# Bulk-copy /claude-auth into $HOME/.claude/, skipping entries that are
+# useless inside a worker. They're either keyed on host paths the worker
+# can't see (projects, file-history, shell-snapshots, session-env), or
+# host-specific scratch state (paste-cache, cache, history.jsonl, tasks).
+# Everything else (plugins, skills, statusline, settings) is small and
+# worth bringing along so plugins/skills behave like the host.
 mkdir -p "$HOME/.claude"
+if [ -d /claude-auth ]; then
+    for src in /claude-auth/* /claude-auth/.[!.]*; do
+        [ -e "$src" ] || continue
+        name="${src##*/}"
+        case "$name" in
+            projects|file-history|paste-cache|session-env|shell-snapshots|tasks|cache|history.jsonl) continue ;;
+        esac
+        cp -r "$src" "$HOME/.claude/" 2>/dev/null || true
+    done
+fi
 
 # Write claude settings.json if provided via env var.
 # This runs after the optional claude-auth copy so it always wins.
