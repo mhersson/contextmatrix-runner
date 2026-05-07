@@ -176,7 +176,7 @@ fi
 MCP_ENTRY=$(jq -n \
     --arg url "$CM_MCP_URL" \
     --argjson headers "$MCP_HEADERS" \
-    '{"contextmatrix": {"type": "http", "url": $url, "headers": $headers}}')
+    '{"contextmatrix": {"type": "http", "url": $url, "headers": $headers, "alwaysLoad": true}}')
 
 CLAUDE_JSON="$HOME/.claude.json"
 [ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
