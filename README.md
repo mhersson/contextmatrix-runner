@@ -75,11 +75,16 @@ is required — it uses `systemctl --user`.
 **Prerequisite:** Build the binary first (`make build`).
 
 ```bash
-./svc.sh install    # Generate service file, reload daemon, enable on login
-./svc.sh start      # Start the service
-./svc.sh stop       # Stop the service
-./svc.sh status     # Show service status
-./svc.sh uninstall  # Stop, disable, and remove the service file
+./svc.sh install              # Generate service file, reload daemon, enable on login
+./svc.sh install --dry-run    # Print the generated unit file without touching systemd
+./svc.sh start                # Start the service
+./svc.sh stop                 # Stop the service
+./svc.sh status               # Show service status
+./svc.sh print                # Print the generated unit file to stdout
+./svc.sh verify               # Print the unit and run `systemd-analyze --user verify`
+                              # plus a grep-check that the expected hardening
+                              # directives are present
+./svc.sh uninstall            # Stop, disable, and remove the service file
 ```
 
 `install` writes the unit file to
@@ -90,8 +95,16 @@ to `config.yaml` in the same directory.
 
 The unit file is configured for graceful shutdown on stop: `KillMode=mixed` and
 `TimeoutStopSec=60` give running containers time to complete before being
-force-killed. The service restarts automatically on failure (`Restart=always`,
-`RestartSec=10`) and declares `After=docker.service`.
+force-killed. The service restarts on failure with exponential backoff:
+`Restart=on-failure`, `RestartSec=10`, `RestartSteps=5`,
+`RestartMaxDelaySec=300` — capping a flaky-Docker restart storm at a five-minute
+interval.
+
+`After=docker.service` is intentionally **not** declared. The runner is a
+`systemctl --user` unit, and the per-user systemd manager cannot gate on system
+units like `docker.service`. Instead, the runner's preflight loop and `/readyz`
+probe wait for dockerd to come up before the runner reports itself ready, so
+ordering is enforced at the application level rather than at the unit level.
 
 To validate the script with shellcheck:
 
@@ -457,8 +470,9 @@ remote_execution:
 3. Runner generates a git credential token (GitHub App installation token or
    PAT)
 4. Runner pulls the Docker image and starts a hardened container with:
-   - Debian bookworm-slim base with Go 1.26, Node.js 25, GitHub CLI, and
-     golangci-lint
+   - Debian bookworm-slim base with Go 1.26, Node.js 25, GitHub CLI,
+     golangci-lint, and gopls (Go language server, for Claude Code's LSP
+     integration)
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
    - Git credential token for clone/push operations
@@ -523,37 +537,44 @@ All webhooks are signed with HMAC-SHA256 using a shared secret.
 | Runner → CM | `POST /api/runner/status` | Report container status                       |
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
-HMAC computed over `timestamp.body`. Max 5-minute clock skew.
+HMAC is computed over `method + "\n" + uri + "\n" + timestamp + "." + body`,
+where `uri` is the request-target form (path plus `?rawquery` when present).
+Method and URI are bound into the signature so a valid signature for one
+endpoint cannot be replayed against another, and same-second GETs to the same
+path with different query strings produce distinct signatures. Max 5-minute
+clock skew (configurable in dev profile via `webhook_replay_skew_seconds`).
 
 Status callback values: `running` (container started), `failed` (error or
 non-zero exit), `completed` (clean exit).
 
 ### Trigger payload fields
 
-| Field          | Type   | Required | Description                                                                                                                   |
-| -------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                                                           |
-| `project`      | string | yes      | Project name                                                                                                                  |
-| `repo_url`     | string | yes      | Repository URL. HTTPS (`https://github.com/org/repo`) is the supported form; `ssh://` URLs are accepted and rewritten to HTTPS. |
-| `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                                                           |
-| `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted.                                       |
-| `runner_image` | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.                                               |
-| `interactive`  | bool   | no       | When `true`, runs Claude in stream-json HITL mode and attaches to container stdin. Use `/message` and `/promote` to interact. |
-| `model`        | string | no       | Model ID for the orchestrator (e.g. `claude-sonnet-4-6`). Passed through to the container environment.                        |
+| Field          | Type   | Required | Description                                                                                                                                                                                                                                                                       |
+| -------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                                                                                                                                                                                                               |
+| `project`      | string | yes      | Project name                                                                                                                                                                                                                                                                      |
+| `repo_url`     | string | yes      | Repository URL. HTTPS (`https://github.com/org/repo`) is the supported form; `ssh://` URLs are accepted and rewritten to HTTPS.                                                                                                                                                   |
+| `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                                                                                                                                                                                                               |
+| `base_branch`  | string | no       | Branch to clone and target for PRs. Defaults to the repo's default branch when omitted.                                                                                                                                                                                           |
+| `runner_image` | string | no       | Docker image override. Must be in `allowed_images` when that list is non-empty.                                                                                                                                                                                                   |
+| `interactive`  | bool   | no       | When `true`, runs Claude in stream-json HITL mode and attaches to container stdin. Use `/message` and `/promote` to interact.                                                                                                                                                     |
+| `model`        | string | no       | Model ID for the orchestrator (e.g. `claude-sonnet-4-6`). Passed through to the container environment.                                                                                                                                                                            |
+| `task_skills`  | array  | no       | Resolved list of task-skill names (subset of CM's `task_skills_dir`). Runner copies the matching skill dirs into `~/.claude/skills/` inside the container before launching Claude Code. Pointer-typed on the wire so `null`/omitted is distinguished from an explicit empty list. |
 
 ## API Endpoints
 
-| Method | Path           | Auth | Description                                                                                                                                                            |
-| ------ | -------------- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/trigger`     | HMAC | Start a container for a card                                                                                                                                           |
-| POST   | `/kill`        | HMAC | Kill a specific container (idempotent; 200 on already-stopped)                                                                                                         |
-| POST   | `/stop-all`    | HMAC | Kill all containers (207 Multi-Status on partial failure)                                                                                                              |
-| POST   | `/message`     | HMAC | Send a user message to an interactive (HITL) session                                                                                                                   |
-| POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode                                                                                                                      |
-| POST   | `/end-session` | HMAC | Close stdin of an interactive container; claude exits on EOF                                                                                                           |
-| GET    | `/logs`        | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature. |
-| GET    | `/health`      | none | Health check                                                                                                                                                           |
-| GET    | `/readyz`      | none | Readiness probe (503 during preflight or drain)                                                                                                                        |
+| Method | Path           | Auth | Description                                                                                                                                                                                                                                                                                                                                |
+| ------ | -------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| POST   | `/trigger`     | HMAC | Start a container for a card                                                                                                                                                                                                                                                                                                               |
+| POST   | `/kill`        | HMAC | Kill a specific container (idempotent; 200 on already-stopped)                                                                                                                                                                                                                                                                             |
+| POST   | `/stop-all`    | HMAC | Kill all containers (207 Multi-Status on partial failure)                                                                                                                                                                                                                                                                                  |
+| POST   | `/message`     | HMAC | Send a user message to an interactive (HITL) session                                                                                                                                                                                                                                                                                       |
+| POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode                                                                                                                                                                                                                                                                                          |
+| POST   | `/end-session` | HMAC | Close stdin of an interactive container; claude exits on EOF                                                                                                                                                                                                                                                                               |
+| GET    | `/logs`        | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature.                                                                                                                                                                     |
+| GET    | `/containers`  | HMAC | List currently-running worker containers. Returns `ListContainersResponse` (one entry per container with `container_id`, `card_id`, `project`, `state`, RFC3339 `started_at`, and a `tracked` flag). CM uses this to age-cap runaway containers and to detect tracker drift (`tracked=false` while `state="running"` indicates an orphan). |
+| GET    | `/health`      | none | Health check                                                                                                                                                                                                                                                                                                                               |
+| GET    | `/readyz`      | none | Readiness probe (503 during preflight or drain)                                                                                                                                                                                                                                                                                            |
 
 ### Response envelope
 
@@ -575,20 +596,20 @@ text. `/stop-all` returns a custom `StopAllResponse` with per-card `results`.
 
 ### Error codes
 
-| Code               | Status | Endpoint(s)                                        | Meaning                                                 |
-| ------------------ | ------ | -------------------------------------------------- | ------------------------------------------------------- |
-| `invalid_json`     | 400    | all mutating endpoints                             | request body was not valid JSON                         |
-| `invalid_field`    | 400    | all mutating endpoints                             | a field failed validation (`message` names the field)   |
-| `unauthorized`     | 401    | all HMAC-guarded endpoints                         | HMAC auth failed (missing header, bad sig, expired, …)  |
-| `not_found`        | 404    | `/message`, `/promote`, `/end-session`             | no container tracked for (project, card_id)             |
-| `conflict`         | 409    | `/trigger`, `/message`, `/promote`, `/end-session` | state conflict (already tracked, non-interactive, …)    |
-| `duplicate`        | 409    | all HMAC-guarded endpoints                         | HMAC signature replay detected                          |
-| `stdin_closed`     | 410    | `/message`, `/promote`                             | session has ended (stdin was once attached, now closed) |
-| `too_large`        | 413    | `/message`                                         | `content` exceeds 8192 bytes                            |
-| `limit_reached`    | 429    | `/trigger`                                         | `max_concurrent` reached                                |
-| `internal`         | 500    | any                                                | server-side bug; details logged, never echoed           |
-| `upstream_failure` | 502    | `/promote`                                         | CM verify-autonomous call failed                        |
-| `draining`         | 503    | `/trigger`, `/message`, `/promote`, `/end-session` | graceful shutdown in progress                           |
+| Code               | Status    | Endpoint(s)                                        | Meaning                                                                                                                                                        |
+| ------------------ | --------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `invalid_json`     | 400       | all mutating endpoints                             | request body was not valid JSON                                                                                                                                |
+| `invalid_field`    | 400       | all mutating endpoints                             | a field failed validation (`message` names the field)                                                                                                          |
+| `unauthorized`     | 401       | all HMAC-guarded endpoints                         | HMAC auth failed (missing header, bad sig, expired, …)                                                                                                         |
+| `not_found`        | 404       | `/message`, `/promote`, `/end-session`             | no container tracked for (project, card_id)                                                                                                                    |
+| `conflict`         | 409 / 403 | `/trigger`, `/message`, `/promote`, `/end-session` | state conflict (already tracked, non-interactive, …). `/promote` returns 403 + `conflict` when CM reports the card's autonomous flag is not set (fail-closed). |
+| `duplicate`        | 409       | all HMAC-guarded endpoints                         | HMAC signature replay detected                                                                                                                                 |
+| `stdin_closed`     | 410       | `/message`, `/promote`                             | session has ended (stdin was once attached, now closed)                                                                                                        |
+| `too_large`        | 413       | `/message`                                         | `content` exceeds 8192 bytes                                                                                                                                   |
+| `limit_reached`    | 429       | `/trigger`                                         | `max_concurrent` reached                                                                                                                                       |
+| `internal`         | 500       | any                                                | server-side bug; details logged, never echoed                                                                                                                  |
+| `upstream_failure` | 502       | `/promote`                                         | CM verify-autonomous call failed                                                                                                                               |
+| `draining`         | 503       | `/trigger`, `/message`, `/promote`, `/end-session` | graceful shutdown in progress                                                                                                                                  |
 
 Raw `err.Error()` strings, HMAC-failure reasons, upstream response bodies, and
 unmarshal byte offsets are never echoed to clients — they are logged server-side
@@ -655,8 +676,8 @@ Every container is launched with the following restrictions:
 
 - Verify the repo URL in the ContextMatrix project config matches an installed
   repo
-- The container only authenticates over HTTPS. `https://github.com/org/repo`
-  is the supported form; `ssh://` URLs are accepted at webhook validation but
+- The container only authenticates over HTTPS. `https://github.com/org/repo` is
+  the supported form; `ssh://` URLs are accepted at webhook validation but
   rewritten to HTTPS before the container clones. SCP-style URLs
   (`git@github.com:org/repo`) are rejected at validation
 - Check that the GitHub App has "Contents: Read & Write" permission

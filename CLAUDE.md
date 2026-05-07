@@ -16,21 +16,36 @@ ContextMatrix repo.
 cmd/contextmatrix-runner/main.go  → entrypoint, wires dependencies
 internal/config/                  → YAML config + env overrides + validation
 internal/hmac/                    → HMAC-SHA256 signing/verification (shared)
-internal/webhook/                 → HTTP handlers (/trigger, /kill, /stop-all, /health)
+internal/webhook/                 → HTTP handlers (/trigger, /kill, /stop-all, /message,
+                                    /promote, /end-session, /logs, /containers,
+                                    /health, /readyz)
 internal/container/               → Docker SDK abstraction, container lifecycle
 internal/logparser/               → Parses Claude Code stream-json output, logs relevant events
+internal/logbroadcast/            → In-process LogEntry pub/sub for the /logs SSE stream
 internal/tracker/                 → Thread-safe card_id → container mapping
 internal/callback/                → HMAC-signed status callbacks to CM
-internal/github/                  → TokenGenerator interface; App (JWT → installation token) and PAT providers
+internal/metrics/                 → Prometheus metric vars + Register()
+internal/preflight/               → Startup readiness checks (dockerd reachability, etc.)
+internal/streammsg/               → Builders for Claude Code stream-json user messages
+internal/tracing/                 → OpenTelemetry tracer wiring (OTLP HTTP exporter)
 docker/                           → Dockerfile.worker + entrypoint.sh
 ```
+
+GitHub authentication is not an internal package: the runner imports the
+shared `github.com/mhersson/contextmatrix-githubauth` module from
+`cmd/contextmatrix-runner/main.go`. The same module is consumed by the
+contextmatrix server, so the App (JWT → installation token) and PAT
+providers stay in lockstep across the two repos.
 
 ## Tech stack
 
 - **Go 1.26+** — backend
 - **net/http** — stdlib HTTP router
 - **Docker SDK** (`github.com/docker/docker`) — container management
-- **golang-jwt** (`github.com/golang-jwt/jwt/v5`) — GitHub App JWT signing
+- **`github.com/mhersson/contextmatrix-githubauth`** — shared GitHub auth
+  module (App + PAT + caching). GitHub App JWT signing now lives inside
+  this module; `golang-jwt/jwt/v5` is only an indirect dependency of
+  the runner via the auth module.
 - **go-yaml v3** — config parsing
 - **testify** — test assertions
 
@@ -109,8 +124,15 @@ RSA keys generated per test.
 
 The runner must produce and verify HMAC signatures identical to ContextMatrix's
 `internal/runner/hmac.go`. The `internal/hmac/` package mirrors that code. Both
-sides sign as `HMAC-SHA256(key, timestamp + "." + body)`, hex-encoded. Headers:
-`X-Signature-256: sha256=<hex>`, `X-Webhook-Timestamp: <unix-ts>`.
+sides sign as
+`HMAC-SHA256(key, method + "\n" + uri + "\n" + timestamp + "." + body)`,
+hex-encoded, where `uri` is the request-target form (path plus `?rawquery`
+when present, matching `r.URL.RequestURI()` on the receiver). Binding the
+HTTP method and URI into the signature prevents a valid signature for one
+endpoint from being replayed against another, and prevents two same-second
+GETs to the same path with different query strings from colliding in the
+replay cache. Headers: `X-Signature-256: sha256=<hex>`,
+`X-Webhook-Timestamp: <unix-ts>`.
 
 ### Endpoints
 
@@ -123,7 +145,9 @@ sides sign as `HMAC-SHA256(key, timestamp + "." + body)`, hex-encoded. Headers:
 | POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Returns 404/409 on error, 202 `{ok:true}` on success.                                                                                                                              |
 | POST   | `/end-session` | HMAC | Close the stdin of an interactive container so claude exits on EOF. Payload: `{card_id, project}`. Returns 404 if no container, 409 if not interactive (or stdin already closed), 202 `{ok:true}` on success. Safe to call more than once (second call returns 409). |
 | GET    | `/logs`        | HMAC | SSE stream of `LogEntry` events for all active containers. Browser EventSource cannot send headers, so consumers must proxy through a server that attaches the HMAC signature.                                                                                       |
+| GET    | `/containers`  | HMAC | List currently-running worker containers (`ListContainersResponse`). Used by CM to age-cap runaway containers and detect tracker drift (`Tracked=false` while `State="running"`).                                                                                    |
 | GET    | `/health`      | none | Health probe; returns 200.                                                                                                                                                                                                                                           |
+| GET    | `/readyz`      | none | Readiness probe. Returns 200 only when preflight has passed and the runner is not draining; 503 otherwise. Unauthenticated so orchestrators / load balancers can poll without HMAC credentials.                                                                       |
 
 ### HITL (interactive) mode
 
