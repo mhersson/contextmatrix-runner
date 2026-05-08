@@ -244,7 +244,7 @@ func extractToolSummary(name string, input json.RawMessage) string {
 			return compactJSON(input)
 		}
 		// First line only.
-		first := strings.SplitN(args.Command, "\n", 2)[0]
+		first, _, _ := strings.Cut(args.Command, "\n")
 
 		return strings.TrimSpace(first)
 

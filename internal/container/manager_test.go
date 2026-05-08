@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,23 +37,14 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
-var (
-	cachedKey     *rsa.PrivateKey
-	cachedKeyOnce sync.Once
-)
+var testRSAKey = sync.OnceValue(func() *rsa.PrivateKey {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
 
-func testRSAKey() *rsa.PrivateKey {
-	cachedKeyOnce.Do(func() {
-		var err error
-
-		cachedKey, err = rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			panic(err)
-		}
-	})
-
-	return cachedKey
-}
+	return k
+})
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -212,13 +204,7 @@ func TestRun_Success(t *testing.T) {
 		statusMu.Lock()
 		defer statusMu.Unlock()
 
-		for _, s := range reportedStatuses {
-			if s == "running" {
-				return true
-			}
-		}
-
-		return false
+		return slices.Contains(reportedStatuses, "running")
 	}, 2*time.Second, 10*time.Millisecond, "running status must be reported")
 }
 
@@ -2536,8 +2522,7 @@ func TestIdleWatchdog_KillsOnSilence(t *testing.T) {
 
 	done := make(chan struct{})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() {
 		defer close(done)
@@ -2586,8 +2571,7 @@ func TestIdleWatchdog_DoesNotKillWhileActive(t *testing.T) {
 	now := time.Now()
 	lastOutputAt.Store(&now)
 
-	ctx, cancelCtx := context.WithCancel(context.Background())
-	defer cancelCtx()
+	ctx := t.Context()
 
 	stopFeed := make(chan struct{})
 

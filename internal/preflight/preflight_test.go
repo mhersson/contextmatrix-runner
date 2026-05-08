@@ -163,8 +163,7 @@ func TestLoop_RetriesUntilSuccess(t *testing.T) {
 
 	passed := &atomic.Bool{}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	Loop(ctx, probes, passed, 5*time.Millisecond, discardLogger(), nil)
 
@@ -221,8 +220,7 @@ func TestLoop_InvokesOnSuccessCallback(t *testing.T) {
 		}
 		passed := &atomic.Bool{}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 
 		Loop(ctx, probes, passed, 5*time.Millisecond, discardLogger(),
 			func() { calls.Add(1) })

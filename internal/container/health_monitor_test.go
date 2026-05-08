@@ -79,8 +79,7 @@ func TestMonitorDockerd_ExitsOnThreeConsecutiveFailures(t *testing.T) {
 		},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	done := make(chan struct{})
 

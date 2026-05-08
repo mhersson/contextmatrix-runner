@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -18,7 +19,6 @@ import (
 	"regexp"
 	"runtime/debug"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -509,12 +509,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	// `docker inspect` output. Validation in config.Validate ensures keys
 	// are well-formed and don't shadow secrets-file vars.
 	if len(m.cfg.WorkerExtraEnv) > 0 {
-		extraKeys := make([]string, 0, len(m.cfg.WorkerExtraEnv))
-		for k := range m.cfg.WorkerExtraEnv {
-			extraKeys = append(extraKeys, k)
-		}
-
-		sort.Strings(extraKeys)
+		extraKeys := slices.Sorted(maps.Keys(m.cfg.WorkerExtraEnv))
 
 		for _, k := range extraKeys {
 			env = append(env, k+"="+m.cfg.WorkerExtraEnv[k])
@@ -559,12 +554,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	// Collect secret values (deterministic order, sorted by key) for the
 	// per-container Redactor so output redacts literal values in addition
 	// to the static KEY=... patterns.
-	secretKeys := make([]string, 0, len(secrets))
-	for k := range secrets {
-		secretKeys = append(secretKeys, k)
-	}
-
-	sort.Strings(secretKeys)
+	secretKeys := slices.Sorted(maps.Keys(secrets))
 
 	secretValues := make([]string, 0, len(secrets))
 
@@ -737,12 +727,7 @@ func (m *Manager) prepareSecrets(payload RunConfig, secrets map[string]string) (
 	}
 
 	// Deterministic iteration for stable tests and reviewable diffs.
-	keys := make([]string, 0, len(secrets))
-	for k := range secrets {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(secrets))
 
 	for _, k := range keys {
 		if _, werr := fmt.Fprintf(f, "export %s='%s'\n", k, shellSingleQuoteEscape(secrets[k])); werr != nil {
@@ -765,12 +750,7 @@ func (m *Manager) prepareSecrets(payload RunConfig, secrets map[string]string) (
 // secretsToEnvVars converts a secrets map to a sorted slice of KEY=VALUE
 // strings suitable for appending to container.Config.Env.
 func secretsToEnvVars(secrets map[string]string) []string {
-	keys := make([]string, 0, len(secrets))
-	for k := range secrets {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(secrets))
 
 	vars := make([]string, 0, len(secrets))
 	for _, k := range keys {

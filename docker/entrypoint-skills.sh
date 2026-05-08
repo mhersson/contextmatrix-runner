@@ -33,9 +33,11 @@ if [ -d "$HOST_SKILLS_DIR" ]; then
         unset _cm_task_skills s
     else
         # No constraint — mount the full set.
+        # Strip the */ glob's trailing slash; BSD cp on macOS copies contents
+        # rather than the directory itself when the source ends in /.
         for d in "${HOST_SKILLS_DIR}"/*/; do
             [ -d "$d" ] || continue
-            cp -r "$d" "$HOME/.claude/skills/"
+            cp -r "${d%/}" "$HOME/.claude/skills/"
         done
         unset d
     fi

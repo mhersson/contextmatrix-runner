@@ -90,8 +90,7 @@ func TestMaintenanceLoop_ExitsOnDrain(t *testing.T) {
 	target := &stubMaintenanceTarget{}
 	health := &stubMaintenanceHealth{}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	done := make(chan struct{})
 
