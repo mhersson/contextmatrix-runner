@@ -450,6 +450,68 @@ func (r *strictRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int,
 	return 0, nil
 }
 
+// -----------------------------------------------------------------------------
+// ValidateRefreshKnowledge
+// -----------------------------------------------------------------------------
+
+func TestValidateRefreshKnowledge_RequiresProject(t *testing.T) {
+	err := ValidateRefreshKnowledge(&RefreshKnowledgePayload{
+		Repo: "core", RepoURL: "https://example.com/r.git", AgentID: "human:t",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "project")
+}
+
+func TestValidateRefreshKnowledge_RequiresRepo(t *testing.T) {
+	err := ValidateRefreshKnowledge(&RefreshKnowledgePayload{
+		Project: "p", RepoURL: "https://example.com/r.git", AgentID: "human:t",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "repo")
+}
+
+func TestValidateRefreshKnowledge_RequiresHumanAgent(t *testing.T) {
+	err := ValidateRefreshKnowledge(&RefreshKnowledgePayload{
+		Project: "p", Repo: "r", RepoURL: "https://example.com/r.git", AgentID: "agent-foo",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "human:")
+}
+
+func TestValidateRefreshKnowledge_AcceptsValid(t *testing.T) {
+	err := ValidateRefreshKnowledge(&RefreshKnowledgePayload{
+		Project: "p", Repo: "r", RepoURL: "https://example.com/r.git",
+		AgentID: "human:test", Model: "claude-sonnet-4-6",
+	})
+	assert.NoError(t, err)
+}
+
+func TestValidateRefreshKnowledge_RejectsNonHTTPSURL(t *testing.T) {
+	err := ValidateRefreshKnowledge(&RefreshKnowledgePayload{
+		Project: "p", Repo: "r", RepoURL: "git@example.com:r.git",
+		AgentID: "human:test",
+	})
+	require.Error(t, err, "non-https URLs must be rejected (matches /trigger policy)")
+}
+
+func TestValidateRefreshKnowledge_RejectsUnknownDocInOverwrite(t *testing.T) {
+	err := ValidateRefreshKnowledge(&RefreshKnowledgePayload{
+		Project: "p", Repo: "r", RepoURL: "https://example.com/r.git",
+		AgentID:       "human:test",
+		OverwriteDocs: []string{"made-up-doc.md"},
+	})
+	require.Error(t, err)
+}
+
+func TestValidateRefreshKnowledge_AcceptsKnownDocsInOverwrite(t *testing.T) {
+	err := ValidateRefreshKnowledge(&RefreshKnowledgePayload{
+		Project: "p", Repo: "r", RepoURL: "https://example.com/r.git",
+		AgentID:       "human:test",
+		OverwriteDocs: []string{"architecture.md", "api-documentation.md"},
+	})
+	assert.NoError(t, err)
+}
+
 func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	tr := tracker.New()
 	// maxConcurrent=3 so concurrency limit never fires; tracker must remain empty.

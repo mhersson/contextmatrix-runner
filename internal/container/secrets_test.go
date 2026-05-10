@@ -159,7 +159,7 @@ func TestPrepareSecrets(t *testing.T) {
 			cfg := tc.cfg(t)
 			m := testSecretsManager(t, cfg, tc.mkdirAll, tc.createFile)
 
-			payload := RunConfig{CardID: "TEST-001", Project: "proj"}
+			payload := RunConfig{Mode: ModeTask, CardID: "TEST-001", Project: "proj"}
 			delivery, err := m.prepareSecrets(payload, testSecrets)
 
 			if tc.wantErr {
@@ -275,7 +275,7 @@ func TestPrepareSecrets_WarnLogged(t *testing.T) {
 		},
 	}
 
-	payload := RunConfig{CardID: "WARN-001", Project: "proj"}
+	payload := RunConfig{Mode: ModeTask, CardID: "WARN-001", Project: "proj"}
 	delivery, err := m.prepareSecrets(payload, testSecrets)
 
 	require.NoError(t, err)
@@ -328,6 +328,7 @@ func TestSecretsDelivered_EnvVarMode_IntegrationStartContainer(t *testing.T) {
 	}
 
 	payload := RunConfig{
+		Mode:    ModeTask,
 		CardID:  "TEST-042",
 		Project: "envvar-proj",
 		RepoURL: "https://github.com/org/repo.git",

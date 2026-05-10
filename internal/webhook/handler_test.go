@@ -582,6 +582,7 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 			case cfg := <-fake.runCh:
 				assert.Equal(t, tt.interactive, cfg.Interactive)
 				assert.Equal(t, testMCPURL, cfg.MCPURL, "handler must inject config-derived MCP URL, not payload")
+				assert.Equal(t, container.ModeTask, cfg.Mode, "trigger handler must set Mode=ModeTask explicitly")
 			case <-time.After(5 * time.Second):
 				t.Fatal("timed out waiting for Run to be called")
 			}
@@ -2157,4 +2158,151 @@ func TestHandleEndSession_503WhenDraining(t *testing.T) {
 
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.False(t, fw.closed, "draining branch must short-circuit before any stdin close")
+}
+
+// --- /refresh-knowledge handler tests ---
+
+func TestHandleRefreshKnowledge_AcceptsValidPayload(t *testing.T) {
+	tr := tracker.New()
+	fake := newFakeRunner()
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	payload := RefreshKnowledgePayload{
+		Project:       "my-project",
+		Repo:          "my-repo",
+		RepoURL:       "https://github.com/org/my-repo.git",
+		BaseBranch:    "main",
+		AgentID:       "human:test",
+		OverwriteDocs: []string{"api-documentation.md"},
+		RunnerImage:   "runner:latest",
+		Model:         "claude-opus-4-5",
+	}
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/refresh-knowledge", payload)
+	h.hmacAuth(h.handleRefreshKnowledge)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	select {
+	case cfg := <-fake.runCh:
+		assert.Equal(t, container.ModeKnowledgeRefresh, cfg.Mode)
+		assert.Equal(t, "my-project", cfg.Project)
+		assert.Equal(t, "my-repo", cfg.KBRepo)
+		assert.Equal(t, "https://github.com/org/my-repo.git", cfg.RepoURL)
+		assert.Equal(t, "human:test", cfg.AgentID)
+		assert.Equal(t, []string{"api-documentation.md"}, cfg.OverwriteDocs)
+		assert.Equal(t, testMCPURL, cfg.MCPURL)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Run to be called")
+	}
+}
+
+func TestHandleRefreshKnowledge_RejectsInvalidPayload(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload RefreshKnowledgePayload
+	}{
+		{
+			name:    "missing project",
+			payload: RefreshKnowledgePayload{Repo: "r", RepoURL: "https://example.com/r.git", AgentID: "human:x"},
+		},
+		{
+			name:    "missing repo",
+			payload: RefreshKnowledgePayload{Project: "p", RepoURL: "https://example.com/r.git", AgentID: "human:x"},
+		},
+		{
+			name:    "missing repo_url",
+			payload: RefreshKnowledgePayload{Project: "p", Repo: "r", AgentID: "human:x"},
+		},
+		{
+			name:    "non-https repo_url",
+			payload: RefreshKnowledgePayload{Project: "p", Repo: "r", RepoURL: "ssh://example.com/r.git", AgentID: "human:x"},
+		},
+		{
+			name:    "missing human: prefix on agent_id",
+			payload: RefreshKnowledgePayload{Project: "p", Repo: "r", RepoURL: "https://example.com/r.git", AgentID: "bot:x"},
+		},
+	}
+
+	tr := tracker.New()
+	h := NewHandler(nil, tr, nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := signedRequest(t, "/refresh-knowledge", tc.payload)
+			h.hmacAuth(h.handleRefreshKnowledge)(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, tc.name)
+
+			var resp ErrorResponse
+			require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+			assert.False(t, resp.OK)
+		})
+	}
+}
+
+func TestHandleRefreshKnowledge_503WhenDraining(t *testing.T) {
+	health := NewHealthState()
+	health.Draining.Store(true)
+
+	h := NewHandler(nil, tracker.New(), nil, nil, testAPIKey, 3, testMCPURL, nil, 0, health)
+
+	payload := RefreshKnowledgePayload{
+		Project: "p",
+		Repo:    "r",
+		RepoURL: "https://example.com/r.git",
+		AgentID: "human:x",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/refresh-knowledge", payload)
+	h.hmacAuth(h.handleRefreshKnowledge)(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, CodeDraining, resp.Code)
+}
+
+func TestHandleRefreshKnowledge_429WhenAtLimit(t *testing.T) {
+	tr := tracker.New()
+	_ = tr.Add(&tracker.ContainerInfo{CardID: "BUSY-1", Project: "proj"})
+
+	h := NewHandler(&noopRunner{}, tr, nil, nil, testAPIKey, 1, testMCPURL, nil, 0, nil)
+
+	payload := RefreshKnowledgePayload{
+		Project: "proj",
+		Repo:    "my-repo",
+		RepoURL: "https://github.com/org/my-repo.git",
+		AgentID: "human:test",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/refresh-knowledge", payload)
+	h.hmacAuth(h.handleRefreshKnowledge)(w, req)
+
+	assert.Equal(t, http.StatusTooManyRequests, w.Code)
+}
+
+func TestHandleRefreshKnowledge_409WhenAlreadyRunning(t *testing.T) {
+	tr := tracker.New()
+	_ = tr.Add(&tracker.ContainerInfo{
+		CardID:  "kb-refresh:my-repo",
+		Project: "proj",
+	})
+
+	h := NewHandler(&noopRunner{}, tr, nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	payload := RefreshKnowledgePayload{
+		Project: "proj",
+		Repo:    "my-repo",
+		RepoURL: "https://github.com/org/my-repo.git",
+		AgentID: "human:test",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/refresh-knowledge", payload)
+	h.hmacAuth(h.handleRefreshKnowledge)(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
 }

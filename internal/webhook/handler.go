@@ -169,6 +169,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.Handle("POST /message", wrap(h.handleMessage, true))
 	mux.Handle("POST /promote", wrap(h.handlePromote, true))
 	mux.Handle("POST /end-session", wrap(h.handleEndSession, true))
+	mux.Handle("POST /refresh-knowledge", wrap(h.handleRefreshKnowledge, true))
 	mux.Handle("GET /logs", wrap(h.handleLogs, true))
 	mux.Handle("GET /containers", wrap(h.handleListContainers, true))
 	mux.Handle("GET /health", wrap(h.handleHealth, false))
@@ -263,6 +264,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.manager.Run(ctx, container.RunConfig{
+		Mode:          container.ModeTask,
 		CardID:        payload.CardID,
 		Project:       payload.Project,
 		RepoURL:       payload.RepoURL,
@@ -701,6 +703,93 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeSuccess(w, http.StatusAccepted, "")
+}
+
+// handleRefreshKnowledge starts a KB refresh container for (project, repo).
+// It follows the same drain-check / validate / tracker / Run discipline as
+// handleTrigger. The tracker key is (project, "kb-refresh:<repo>") so the
+// per-project one-container-per-key invariant applies to refresh jobs too.
+func (h *Handler) handleRefreshKnowledge(w http.ResponseWriter, r *http.Request) {
+	if h.isDraining() {
+		writeError(w, http.StatusServiceUnavailable, CodeDraining, "runner is draining")
+
+		return
+	}
+
+	body := r.Context().Value(bodyKey{}).([]byte)
+
+	var payload RefreshKnowledgePayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		h.logDebug("refresh-knowledge: invalid JSON", "error", err)
+		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
+
+		return
+	}
+
+	if err := ValidateRefreshKnowledge(&payload); err != nil {
+		writeValidationError(w, err)
+
+		return
+	}
+
+	// Detached context — the container must outlive the HTTP request.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Synthetic tracker key: (project, "kb-refresh:<repo>") keeps the
+	// one-container-per-key invariant for refresh jobs alongside task jobs.
+	syntheticCardID := "kb-refresh:" + payload.Repo
+
+	err := h.tracker.AddIfUnderLimit(&tracker.ContainerInfo{
+		CardID:    syntheticCardID,
+		Project:   payload.Project,
+		Image:     payload.RunnerImage,
+		StartedAt: time.Now(),
+		Cancel:    cancel,
+	}, h.maxConcurrent)
+	if err != nil {
+		cancel()
+
+		switch {
+		case errors.Is(err, tracker.ErrLimitReached):
+			if h.logger != nil {
+				h.logger.Warn("refresh-knowledge rejected: runner saturated",
+					"project", payload.Project,
+					"repo", payload.Repo,
+					"limit", h.maxConcurrent,
+					"correlation_id", correlationIDFromContext(r.Context()),
+				)
+			}
+
+			writeError(w, http.StatusTooManyRequests, CodeLimitReached, "concurrency limit reached")
+		case errors.Is(err, tracker.ErrAlreadyTracked):
+			h.logDebug("refresh-knowledge: already tracked",
+				"project", payload.Project, "repo", payload.Repo)
+			writeError(w, http.StatusConflict, CodeConflict, "conflicting container state")
+		default:
+			h.logWarn("refresh-knowledge: tracker add failed", "error", err.Error())
+			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
+		}
+
+		return
+	}
+
+	h.manager.Run(ctx, container.RunConfig{
+		Mode:          container.ModeKnowledgeRefresh,
+		CardID:        syntheticCardID,
+		Project:       payload.Project,
+		KBRepo:        payload.Repo,
+		RepoURL:       payload.RepoURL,
+		BaseBranch:    payload.BaseBranch,
+		AgentID:       payload.AgentID,
+		OverwriteDocs: payload.OverwriteDocs,
+		MCPURL:        h.mcpURL,
+		MCPAPIKey:     payload.MCPAPIKey,
+		RunnerImage:   payload.RunnerImage,
+		Model:         payload.Model,
+		CorrelationID: correlationIDFromContext(r.Context()),
+	})
+
+	writeSuccess(w, http.StatusAccepted, "container starting")
 }
 
 // handleEndSession closes the stdin of a tracked interactive container so

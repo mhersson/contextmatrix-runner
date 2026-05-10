@@ -30,21 +30,31 @@ fi
 
 # ----- Tool allowlist (CTXRUN-045) -----
 # Passed to `claude --allowed-tools` so the worker can only call pre-approved
-# tools. Split into two arrays keyed on run mode:
+# tools. Built from a shared base plus per-mode additions:
 #
-#   ALLOWED_TOOLS_COMMON — everything safe for both modes.
-#   ALLOWED_TOOLS_AUTO   — autonomous-only additions (currently just Task).
+#   ALLOWED_TOOLS_COMMON       — everything safe across all modes.
+#   ALLOWED_TOOLS_AUTO_EXTRAS  — autonomous-task-mode additions (Task).
+#   ALLOWED_TOOLS_KB           — knowledge-refresh mode (built inline below):
+#                                COMMON + Task + KB-specific MCP tools.
 #
-# Why split:
-#   Sub-agents (Task tool) are kept out of HITL mode because the user expects
-#   to review every change before a commit lands — sub-agents making
-#   autonomous commits during an interactive session would bypass that gate.
-#   In autonomous mode the top-level agent is already committing without
-#   human review, so sub-agents doing the same is fine and lets the orchestrator
-#   parallelise research/subtasks.
+# Why three axes (HITL vs autonomous vs knowledge-refresh):
+#   HITL (interactive task mode): Task (sub-agents) excluded — the user
+#     expects to review every change before a commit lands. Sub-agents
+#     making autonomous commits during an interactive session would bypass
+#     that gate.
+#   Autonomous (task mode with autonomous: true): Task included — the
+#     top-level agent is already committing without human review, so
+#     sub-agents doing the same is fine and lets the orchestrator
+#     parallelise research/subtasks.
+#   Knowledge-refresh: Task included — the refresh-knowledge skill spawns
+#     one sub-agent per doc by design (parallel doc generation), and the
+#     only write surface is commit_knowledge_docs which is server-side
+#     atomic. The skill never pushes or opens PRs against the cloned
+#     target repo, so sub-agents cannot land code changes from inside
+#     the container.
 #
 # Destructive ContextMatrix RPCs (delete_project, update_project) are
-# excluded in both modes — nothing spawned in a worker needs those.
+# excluded in all modes — nothing spawned in a worker needs those.
 #
 # Shell utilities are allowlisted by exact command prefix (e.g. "Bash(sed:*)")
 # so a compromised model can't promote "Bash(sed:*)" into "Bash(rm -rf /:*)"
@@ -115,6 +125,7 @@ ALLOWED_TOOLS_COMMON=(
     "mcp__contextmatrix__complete_task"
     "mcp__contextmatrix__create_card"
     "mcp__contextmatrix__get_card"
+    "mcp__contextmatrix__get_knowledge_base"
     "mcp__contextmatrix__get_ready_tasks"
     "mcp__contextmatrix__get_skill"
     "mcp__contextmatrix__get_subtask_summary"
@@ -122,8 +133,10 @@ ALLOWED_TOOLS_COMMON=(
     "mcp__contextmatrix__heartbeat"
     "mcp__contextmatrix__increment_review_attempts"
     "mcp__contextmatrix__list_cards"
+    "mcp__contextmatrix__list_knowledge_bases"
     "mcp__contextmatrix__list_projects"
     "mcp__contextmatrix__promote_to_autonomous"
+    "mcp__contextmatrix__read_knowledge_doc"
     "mcp__contextmatrix__recalculate_costs"
     "mcp__contextmatrix__release_card"
     "mcp__contextmatrix__report_push"
@@ -202,11 +215,49 @@ mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 # Validate CM_CARD_ID early — we interpolate it into prompts and container logs.
 # Use `case` (whole-string match) rather than grep (line-oriented) so embedded
 # newline/CR/NUL bytes fall into the reject pattern.
-if [ -n "${CM_CARD_ID:-}" ]; then
-    case "$CM_CARD_ID" in
-        -*|*[!A-Za-z0-9._-]*)
-            echo "ERROR: invalid CM_CARD_ID" >&2
+# Skip in knowledge-refresh mode: no card ID is set; the runner uses a synthetic
+# kb-refresh:<repo> key internally but does not pass it as CM_CARD_ID.
+if [ "${CM_MODE:-}" != "knowledge-refresh" ]; then
+    if [ -n "${CM_CARD_ID:-}" ]; then
+        case "$CM_CARD_ID" in
+            -*|*[!A-Za-z0-9._-]*)
+                echo "ERROR: invalid CM_CARD_ID" >&2
+                exit 1
+                ;;
+        esac
+    fi
+fi
+
+if [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
+    case "${CM_PROJECT:-}" in
+        ""|-*|*[!A-Za-z0-9._-]*)
+            echo "ERROR: invalid CM_PROJECT for knowledge-refresh mode" >&2
             exit 1
+            ;;
+    esac
+    case "${CM_KB_REPO:-}" in
+        ""|-*|*[!A-Za-z0-9._-]*)
+            echo "ERROR: invalid CM_KB_REPO for knowledge-refresh mode" >&2
+            exit 1
+            ;;
+    esac
+    case "${CM_AGENT_ID:-}" in
+        human:?*) ;;
+        *)
+            echo "ERROR: CM_AGENT_ID must start with human: and have a non-empty suffix in knowledge-refresh mode" >&2
+            exit 1
+            ;;
+    esac
+    # Defence-in-depth: webhook validator already enforces the doc allowlist,
+    # but if a future caller sets this env var directly (skipping the webhook
+    # path), the value would otherwise interpolate unchecked into the prompt.
+    # Empty value is permitted — most refresh runs have no overwrite_docs.
+    case "${CM_KB_OVERWRITE_DOCS:-}" in
+        ""|-*|*[!A-Za-z0-9._,-]*)
+            if [ -n "${CM_KB_OVERWRITE_DOCS:-}" ]; then
+                echo "ERROR: CM_KB_OVERWRITE_DOCS contains invalid characters" >&2
+                exit 1
+            fi
             ;;
     esac
 fi
@@ -343,14 +394,42 @@ unset CM_GIT_TOKEN CM_MCP_API_KEY
 # shellcheck source=docker/entrypoint-skills.sh
 . "$(dirname "$0")/entrypoint-skills.sh"
 
-echo "Starting Claude Code for card ${CM_CARD_ID}..."
 # Space-separated allowlist passed via a single --allowed-tools flag, per
 # `claude --help`: "--allowedTools, --allowed-tools <tools...>  Comma or
 # space-separated list of tool names to allow (e.g. \"Bash(git *) Edit\")".
-# HITL mode uses the common list only; autonomous mode appends the extras
-# (Task — sub-agent spawning).
-if [ "${CM_INTERACTIVE:-}" = "1" ]; then
+# Three-way dispatch:
+#   1. knowledge-refresh — KB refresh mode with its own tool allowlist and prompt.
+#   2. HITL (CM_INTERACTIVE=1) — common list only; sub-agents excluded.
+#   3. autonomous (default) — common list + Task sub-agent spawning.
+if [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
+    ALLOWED_TOOLS_KB=("${ALLOWED_TOOLS_COMMON[@]}"
+        "Task"
+        "mcp__contextmatrix__refresh_knowledge_base"
+        "mcp__contextmatrix__commit_knowledge_docs"
+        "mcp__contextmatrix__update_refresh_progress")
+
+    echo "Starting Claude Code in knowledge-refresh mode for ${CM_PROJECT}/${CM_KB_REPO}..."
+    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
+        --output-format stream-json --verbose \
+        --allowed-tools "${ALLOWED_TOOLS_KB[*]}" \
+        -- \
+        "You are running inside a contextmatrix-runner container in knowledge-refresh mode.
+
+Steps:
+1. Call get_skill(skill_name='refresh-knowledge', caller_model='sonnet')
+2. Follow the returned skill instructions exactly.
+   - project: ${CM_PROJECT}
+   - repo: ${CM_KB_REPO}
+   - target repo working tree: /home/user/workspace (already cloned)
+   - confirmed overwrite_docs: ${CM_KB_OVERWRITE_DOCS}
+   - agent_id for all MCP calls: ${CM_AGENT_ID}
+
+IMPORTANT:
+- Always use MCP tools for ContextMatrix interactions.
+- Do not modify the target repo working tree."
+elif [ "${CM_INTERACTIVE:-}" = "1" ]; then
     ALLOWED_TOOLS_HITL=("${ALLOWED_TOOLS_COMMON[@]}")
+    echo "Starting Claude Code for card ${CM_CARD_ID}..."
     # `--` terminates option parsing. Without it, claude's variadic
     # `--allowed-tools <tools...>` greedily consumes the following positional
     # prompt as yet another allowed-tool entry and exits with
@@ -372,6 +451,7 @@ IMPORTANT:
 ${BASE_BRANCH_CONTEXT}"
 else
     ALLOWED_TOOLS_AUTO=("${ALLOWED_TOOLS_COMMON[@]}" "${ALLOWED_TOOLS_AUTO_EXTRAS[@]}")
+    echo "Starting Claude Code for card ${CM_CARD_ID}..."
     # See HITL branch above for why `--` is required before the prompt.
     exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" --output-format stream-json --verbose --allowed-tools "${ALLOWED_TOOLS_AUTO[*]}" \
         -- \

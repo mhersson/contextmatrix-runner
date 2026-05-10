@@ -43,6 +43,18 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
+// Mode selects the entrypoint dispatch path inside the container.
+type Mode string
+
+const (
+	// ModeTask is the default — card execution. Callers must set this
+	// explicitly; the empty zero-value is not treated as a valid mode.
+	ModeTask Mode = "task"
+	// ModeKnowledgeRefresh runs the refresh-knowledge skill against a
+	// pre-cloned target repo at /home/user/workspace.
+	ModeKnowledgeRefresh Mode = "knowledge-refresh"
+)
+
 // RunConfig holds the parameters needed to start a container.
 // This mirrors the webhook TriggerPayload but avoids an import cycle.
 type RunConfig struct {
@@ -61,6 +73,22 @@ type RunConfig struct {
 	// set is explicit. The entrypoint uses CM_TASK_SKILLS_SET to distinguish
 	// the two cases.
 	TaskSkills *[]string
+
+	// Mode selects the entrypoint dispatch. Must be set explicitly to
+	// ModeTask or ModeKnowledgeRefresh; the empty zero-value is invalid.
+	Mode Mode
+
+	// KBRepo is the canonical repo name (the .meta.yaml key) for KB refresh.
+	// Required when Mode == ModeKnowledgeRefresh.
+	KBRepo string
+
+	// AgentID is forwarded into the container as CM_AGENT_ID for refresh
+	// MCP calls. Required when Mode == ModeKnowledgeRefresh.
+	AgentID string
+
+	// OverwriteDocs is the human-confirmed list of docs to rebuild even
+	// though their human_edited flag is true. Optional; refresh mode only.
+	OverwriteDocs []string
 }
 
 const (
@@ -397,6 +425,12 @@ func (m *Manager) run(ctx context.Context, payload RunConfig) string {
 // stuck. Panics are recovered and counted so one bad callback cannot take
 // down the runner.
 func (m *Manager) runningCallbackAsync(payload RunConfig, log *slog.Logger) {
+	// KB refresh containers don't have a card_id and don't use the running
+	// callback path — KnowledgeStatus is fired terminally only. Skip silently.
+	if payload.Mode == ModeKnowledgeRefresh {
+		return
+	}
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -502,6 +536,15 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	if m.cfg.TaskSkillsDir != "" && payload.TaskSkills != nil {
 		env = append(env, "CM_TASK_SKILLS_SET=1")
 		env = append(env, "CM_TASK_SKILLS="+strings.Join(*payload.TaskSkills, ","))
+	}
+
+	if payload.Mode == ModeKnowledgeRefresh {
+		env = append(env,
+			"CM_MODE=knowledge-refresh",
+			"CM_KB_REPO="+payload.KBRepo,
+			"CM_AGENT_ID="+payload.AgentID,
+			"CM_KB_OVERWRITE_DOCS="+strings.Join(payload.OverwriteDocs, ","),
+		)
 	}
 
 	// Worker-extra env vars (deployment-wide, see Config.WorkerExtraEnv).
@@ -1144,6 +1187,14 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 		}
 
 		onSkillEngaged := func(evt *logparser.SkillEngagedEvent) {
+			// KB refresh containers use a synthetic "kb-refresh:<repo>"
+			// CardID which CM rejects as 4xx on /api/runner/skill-engaged,
+			// triggering retry log spam. Mirror the running-status guard
+			// (efa9412) and skip the callback silently for refresh mode.
+			if payload.Mode == ModeKnowledgeRefresh {
+				return
+			}
+
 			go func() {
 				cbCtx, cancel := context.WithTimeout(context.Background(), callbackTimeout)
 				defer cancel()
@@ -1334,6 +1385,12 @@ func (m *Manager) writePrimingWithTimeout(payload RunConfig, containerID string,
 }
 
 func (m *Manager) reportFailure(ctx context.Context, payload RunConfig, message string) {
+	if payload.Mode == ModeKnowledgeRefresh {
+		m.reportKnowledgeRefreshTerminal(ctx, payload, "failed", message)
+
+		return
+	}
+
 	if err := m.callback.ReportStatus(ctx, payload.CardID, payload.Project, "failed", message); err != nil {
 		m.logger.Error("failed to report failure callback", "card_id", payload.CardID, "error", err)
 	}
@@ -1343,8 +1400,35 @@ func (m *Manager) reportFailure(ctx context.Context, payload RunConfig, message 
 // This acts as a safety net: if Claude didn't call complete_task, the claim
 // is still released server-side when ContextMatrix receives the "completed" status.
 func (m *Manager) reportCompleted(ctx context.Context, payload RunConfig) {
+	if payload.Mode == ModeKnowledgeRefresh {
+		m.reportKnowledgeRefreshTerminal(ctx, payload, "succeeded", "")
+
+		return
+	}
+
 	if err := m.callback.ReportStatus(ctx, payload.CardID, payload.Project, "completed", "container exited normally"); err != nil {
 		m.logger.Error("failed to report completed callback", "card_id", payload.CardID, "error", err)
+	}
+}
+
+// reportKnowledgeRefreshTerminal sends the terminal callback for a
+// knowledge-refresh container. State is "succeeded" or "failed"; errMsg is
+// empty on success.
+func (m *Manager) reportKnowledgeRefreshTerminal(ctx context.Context, payload RunConfig, state, errMsg string) {
+	req := callback.KnowledgeStatusRequest{
+		Project: payload.Project,
+		Repo:    payload.KBRepo,
+		State:   state,
+		Error:   errMsg,
+	}
+
+	if err := m.callback.KnowledgeStatus(ctx, req); err != nil {
+		m.logger.Error("failed to report knowledge-refresh terminal callback",
+			"project", payload.Project,
+			"repo", payload.KBRepo,
+			"state", state,
+			"error", err,
+		)
 	}
 }
 
