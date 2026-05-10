@@ -328,3 +328,52 @@ func validateEndSession(p *EndSessionPayload) error {
 
 	return validateIdent("project", p.Project)
 }
+
+// ValidateRefreshKnowledge mirrors ValidatePayload's rules for the refresh
+// webhook: project + repo + https repo URL + human-prefixed agent_id.
+// overwrite_docs is optional; if present, every entry must be a known KB
+// doc filename to prevent the runner-side allowlist from being bypassed.
+func ValidateRefreshKnowledge(p *RefreshKnowledgePayload) error {
+	if p == nil {
+		return fmt.Errorf("payload required")
+	}
+
+	if p.Project == "" {
+		return fmt.Errorf("project required")
+	}
+
+	if p.Repo == "" {
+		return fmt.Errorf("repo required")
+	}
+
+	if p.RepoURL == "" {
+		return fmt.Errorf("repo_url required")
+	}
+
+	if !strings.HasPrefix(p.RepoURL, "https://") {
+		return fmt.Errorf("repo_url must be https://")
+	}
+
+	if !strings.HasPrefix(p.AgentID, "human:") {
+		return fmt.Errorf(`agent_id must start with "human:"`)
+	}
+
+	for _, d := range p.OverwriteDocs {
+		if !isKnownKBDoc(d) {
+			return fmt.Errorf("overwrite_docs entry %q is not a known KB doc", d)
+		}
+	}
+
+	return nil
+}
+
+// isKnownKBDoc enumerates the v1 doc set. Update if the spec adds docs.
+func isKnownKBDoc(name string) bool {
+	switch name {
+	case "architecture.md", "code-structure.md",
+		"api-documentation.md", "glossary.md":
+		return true
+	}
+
+	return false
+}

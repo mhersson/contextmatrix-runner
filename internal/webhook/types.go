@@ -48,6 +48,22 @@ type EndSessionPayload struct {
 	Project string `json:"project"`
 }
 
+// RefreshKnowledgePayload is received from ContextMatrix to start a KB
+// refresh container for (project, repo). Mirrors runner.RefreshKnowledgePayload
+// on the CM side; the JSON wire format is the contract. No card_id — the
+// (project, repo) pair is the job key.
+type RefreshKnowledgePayload struct {
+	Project       string   `json:"project"`
+	Repo          string   `json:"repo"`
+	RepoURL       string   `json:"repo_url"`
+	BaseBranch    string   `json:"base_branch,omitempty"`
+	AgentID       string   `json:"agent_id"`
+	OverwriteDocs []string `json:"overwrite_docs,omitempty"`
+	MCPAPIKey     string   `json:"mcp_api_key,omitempty"`
+	RunnerImage   string   `json:"runner_image,omitempty"`
+	Model         string   `json:"model,omitempty"`
+}
+
 // SuccessResponse is the body returned for any 2xx webhook response. `OK` is
 // always true; `Message` is a short, free-form human-readable label (never
 // derived from user input); `MessageID` is only populated by /message acks so
