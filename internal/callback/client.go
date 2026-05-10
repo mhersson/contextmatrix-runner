@@ -41,6 +41,14 @@ type skillEngagedRequest struct {
 	SkillName string `json:"skill_name"`
 }
 
+// KnowledgeStatusRequest is the body of POST /api/runner/knowledge-status.
+type KnowledgeStatusRequest struct {
+	Project string `json:"project"`
+	Repo    string `json:"repo"`
+	State   string `json:"state"` // "succeeded" or "failed"
+	Error   string `json:"error,omitempty"`
+}
+
 // Client sends signed status callbacks to ContextMatrix.
 //
 // NOTE on apiKey usage: apiKey is the shared HMAC-SHA256 secret used for
@@ -254,6 +262,88 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 	return fmt.Errorf("skill-engaged callback failed after %d attempts: %w", maxRetries, lastErr)
 }
 
+// KnowledgeStatus posts the runner's terminal callback for a knowledge-refresh
+// job. Same HMAC scheme and retry policy as ReportStatus / ReportSkillEngaged.
+func (c *Client) KnowledgeStatus(ctx context.Context, req KnowledgeStatusRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal knowledge-status: %w", err)
+	}
+
+	uri, err := callbackKnowledgeStatusURI(c.contextMatrixURL)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+
+	for attempt := range maxRetries {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, uri, body, ts)
+
+		reqURL := c.contextMatrixURL + "/api/runner/knowledge-status"
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create knowledge-status request: %w", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
+		httpReq.Header.Set(cmhmac.TimestampHeader, ts)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("send knowledge-status request: %w", err)
+		} else {
+			func() {
+				defer func() { _ = resp.Body.Close() }()
+
+				respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				if readErr != nil {
+					lastErr = fmt.Errorf("read knowledge-status response: %w", readErr)
+
+					return
+				}
+
+				if resp.StatusCode >= 400 {
+					lastErr = newError(reqURL, resp.StatusCode, respBody)
+				} else {
+					lastErr = nil
+				}
+			}()
+		}
+
+		if lastErr == nil {
+			return nil
+		}
+
+		if isClientError(lastErr) {
+			return lastErr
+		}
+
+		c.logger.Warn("knowledge-status callback failed, retrying",
+			"attempt", attempt+1,
+			"project", req.Project,
+			"repo", req.Repo,
+			"error", lastErr.Error(),
+		)
+
+		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		timer := time.NewTimer(backoff)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("knowledge-status callback failed after %d attempts: %w", maxRetries, lastErr)
+}
+
 // Ping checks that ContextMatrix is reachable at the configured URL via a
 // TCP dial to host:port. The runner does not assume CM exposes a dedicated
 // readiness endpoint (and several deployments rewrite /api/* paths at an
@@ -421,6 +511,12 @@ func callbackStatusURI(contextMatrixURL string) (string, error) {
 // skill-engaged callback URL.
 func callbackSkillEngagedURI(contextMatrixURL string) (string, error) {
 	return deriveURI(contextMatrixURL + "/api/runner/skill-engaged")
+}
+
+// callbackKnowledgeStatusURI returns the request-target of the CM
+// /api/runner/knowledge-status endpoint, derived from the configured base URL.
+func callbackKnowledgeStatusURI(contextMatrixURL string) (string, error) {
+	return deriveURI(contextMatrixURL + "/api/runner/knowledge-status")
 }
 
 // verifyAutonomousURI returns the request-target of the constructed

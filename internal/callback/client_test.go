@@ -517,3 +517,33 @@ func TestClient_ReportSkillEngaged(t *testing.T) {
 	assert.Contains(t, string(receivedBody), `"card_id":"ALPHA-001"`)
 	assert.Contains(t, string(receivedBody), `"skill_name":"go-development"`)
 }
+
+func TestClient_KnowledgeStatus_PostsSignedRequest(t *testing.T) {
+	var (
+		received KnowledgeStatusRequest
+		rawBody  []byte
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/runner/knowledge-status", r.URL.Path)
+		assert.NotEmpty(t, r.Header.Get(cmhmac.SignatureHeader))
+		assert.NotEmpty(t, r.Header.Get(cmhmac.TimestampHeader))
+
+		rawBody, _ = io.ReadAll(r.Body)
+		assert.NoError(t, json.Unmarshal(rawBody, &received))
+
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "secret-key-that-is-at-least-32-chars-long", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, c.KnowledgeStatus(context.Background(), KnowledgeStatusRequest{
+		Project: "p", Repo: "r", State: "succeeded",
+	}))
+	assert.Equal(t, "succeeded", received.State)
+	assert.Equal(t, "p", received.Project)
+	assert.Equal(t, "r", received.Repo)
+	assert.NotContains(t, string(rawBody), "commit_sha",
+		"marshalled body must not contain commit_sha field")
+}
