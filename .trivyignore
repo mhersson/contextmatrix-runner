@@ -15,6 +15,29 @@ CVE-2026-33252
 CVE-2026-34742
 GHSA-q382-vc8q-7jhj
 
+# --- /usr/bin/gh from GitHub's apt repo is compiled against Go stdlib
+# 1.26.2; the fixes landed in 1.26.3. Upstream gh releases lag behind
+# Go patch releases and we don't control their build pipeline. We invoke
+# gh as a short-lived CLI for git/GitHub API calls against github.com on
+# Linux — none of these CVEs are reachable in that usage:
+#   * CVE-2026-33811 (LookupCNAME with cgo resolver, long CNAME): gh
+#     resolves only github.com hosts, no attacker-controlled DNS.
+#   * CVE-2026-33814 (HTTP/2 SETTINGS frame infinite loop in Transport):
+#     requires a malicious server; gh talks to github.com only.
+#   * CVE-2026-39820 (mail.ParseAddress/ParseAddressList DoS): gh does
+#     not parse RFC5322 addresses from untrusted input.
+#   * CVE-2026-39836 (Dial/LookupPort NUL byte panic on Windows): worker
+#     image is Linux-only.
+#   * CVE-2026-42499 (consumePhrase DoS in mail parsing): same as above,
+#     no untrusted RFC5322 input path.
+# Accepted until upstream gh ships a release built with Go >= 1.26.3.
+# Re-check on every worker-image bump.
+CVE-2026-33811
+CVE-2026-33814
+CVE-2026-39820
+CVE-2026-39836
+CVE-2026-42499
+
 # --- @anthropic-ai/claude-code@2.1.116 pulls picomatch 4.0.3 as an npm
 # transitive; 4.0.4 fixes the ReDoS. Upstream claude-code has not yet
 # published a version that picks up the newer picomatch. Worker
