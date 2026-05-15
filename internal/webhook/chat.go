@@ -173,6 +173,25 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If CM shipped a chat-mode primer, write it to stdin BEFORE any
+	// rehydration priming so the agent learns the MCP tool surface and
+	// CM concepts before being asked to re-establish workspace state.
+	// Failures are fail-open (matching the rehydration block below) —
+	// a broken primer write must not break /chat/start.
+	if p.Primer != "" {
+		envelope, buildErr := streammsg.BuildUserMessage(p.Primer)
+		if buildErr != nil {
+			h.logWarn("chat/start: build primer failed",
+				"session_id", p.SessionID, "error", buildErr.Error())
+		} else if writeErr := h.tracker.WriteStdinChat(p.SessionID, envelope); writeErr != nil {
+			h.logWarn("chat/start: write primer failed",
+				"session_id", p.SessionID, "error", writeErr.Error())
+		} else {
+			h.logInfo("chat/start: primer written",
+				"session_id", p.SessionID, "bytes", len(envelope))
+		}
+	}
+
 	// If CM signalled a rehydration phase, prime the agent via stdin with the
 	// rehydration instructions. The -p positional prompt is ignored by Claude
 	// when --input-format stream-json is set (the model treats it as system
