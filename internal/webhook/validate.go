@@ -385,6 +385,14 @@ const (
 	// 40k-token budget makes the per-turn average far smaller; this cap is a
 	// defense-in-depth ceiling, not the binding factor for payload size.
 	chatResumeMaxContentBytes = 4 * 1024
+
+	// chatPrimerMaxBytes caps the chat-mode orientation primer text. The
+	// current shipped primer (CM's workflow-skills/chat-mode.md) is ~4 KiB;
+	// 64 KiB leaves ample room for operator edits while bounding the stdin
+	// write well below hmacAuth's 1 MiB body cap. Hitting this cap returns
+	// 400 so CM gets a clear "primer too large" signal rather than a 401
+	// from a truncated body.
+	chatPrimerMaxBytes = 64 * 1024
 )
 
 func validateChatStart(p *ChatStartPayload) error {
@@ -418,6 +426,23 @@ func validateChatStart(p *ChatStartPayload) error {
 	if p.Resume != nil {
 		if err := validateChatResume(p.Resume); err != nil {
 			return err
+		}
+	}
+
+	if p.Primer != "" {
+		if len(p.Primer) > chatPrimerMaxBytes {
+			return &ValidationError{
+				Field: "primer",
+				Reason: fmt.Sprintf("too long: %d > %d bytes",
+					len(p.Primer), chatPrimerMaxBytes),
+			}
+		}
+
+		if !utf8.ValidString(p.Primer) {
+			return &ValidationError{
+				Field:  "primer",
+				Reason: "must be valid UTF-8",
+			}
 		}
 	}
 
