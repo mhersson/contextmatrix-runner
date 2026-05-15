@@ -966,3 +966,47 @@ func TestAddChatIfUnderLimit_Concurrent(t *testing.T) {
 	assert.Equal(t, int64(0), otherErrors.Load())
 	assert.Equal(t, limit, tr.Count())
 }
+
+func TestWriteStdinChat_NotTracked(t *testing.T) {
+	t.Parallel()
+
+	tr := New()
+	err := tr.WriteStdinChat("01ABSENT", []byte("hello"))
+	require.ErrorIs(t, err, ErrNotTracked)
+}
+
+func TestWriteStdinChat_NoStdinAttached(t *testing.T) {
+	t.Parallel()
+
+	tr := New()
+	require.NoError(t, tr.AddChat(&ContainerInfo{
+		ContainerID: "ctr-1",
+		SessionID:   "01SESS",
+		Image:       "test:latest",
+		StartedAt:   time.Now(),
+	}))
+	err := tr.WriteStdinChat("01SESS", []byte("hello"))
+	require.ErrorIs(t, err, ErrNoStdinAttached)
+}
+
+func TestWriteStdinChat_StdinClosed(t *testing.T) {
+	t.Parallel()
+
+	tr := New()
+	require.NoError(t, tr.AddChat(&ContainerInfo{
+		ContainerID: "ctr-1",
+		SessionID:   "01SESS",
+		Image:       "test:latest",
+		StartedAt:   time.Now(),
+	}))
+
+	// Attach and immediately close stdin.
+	pr, pw := io.Pipe()
+	_ = pr.Close()
+
+	tr.SetStdinChat("01SESS", pw, nil)
+	require.NoError(t, tr.CloseStdinChat("01SESS"))
+
+	err := tr.WriteStdinChat("01SESS", []byte("hello"))
+	require.ErrorIs(t, err, ErrStdinClosed)
+}

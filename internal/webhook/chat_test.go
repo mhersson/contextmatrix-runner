@@ -3,8 +3,10 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,6 +26,11 @@ type chatFakeRunner struct {
 	stopFn func(ctx context.Context, containerID string) error
 	// workerImage is returned by WorkerImage.
 	workerImage string
+
+	// Captured state for test assertions.
+	mu            sync.Mutex
+	LastStartOpts container.StartChatOpts
+	PrimingWrites [][]byte
 }
 
 func (f *chatFakeRunner) Run(_ context.Context, _ container.RunConfig) {}
@@ -39,6 +46,10 @@ func (f *chatFakeRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (in
 }
 
 func (f *chatFakeRunner) StartChat(ctx context.Context, opts container.StartChatOpts) (string, error) {
+	f.mu.Lock()
+	f.LastStartOpts = opts
+	f.mu.Unlock()
+
 	if f.startChatFn != nil {
 		return f.startChatFn(ctx, opts)
 	}
@@ -349,3 +360,126 @@ type nopWriteCloser struct{}
 
 func (n *nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
 func (n *nopWriteCloser) Close() error                { return nil }
+
+// chatTrackerWrapper wraps a tracker and injects errors into WriteStdinChat
+// for testing error paths. It also captures priming writes.
+type chatTrackerWrapper struct {
+	*tracker.Tracker
+	mu            sync.Mutex
+	PrimingWrites [][]byte
+	ForceWriteErr bool
+}
+
+func (w *chatTrackerWrapper) WriteStdinChat(sessionID string, b []byte) error {
+	w.mu.Lock()
+	if w.ForceWriteErr {
+		w.mu.Unlock()
+
+		return errors.New("forced write failure")
+	}
+
+	w.PrimingWrites = append(w.PrimingWrites, append([]byte(nil), b...))
+	w.mu.Unlock()
+
+	return w.Tracker.WriteStdinChat(sessionID, b)
+}
+
+// TestChatStart_PrimingWrittenWhenResumeSet verifies that when Resume is
+// provided, the handler writes a rehydration priming message to stdin and
+// returns 202 Accepted.
+func TestChatStart_PrimingWrittenWhenResumeSet(t *testing.T) {
+	t.Parallel()
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			// Simulate the real manager behavior: attach stdin to the tracker.
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS",
+		Project:   "p",
+		Resume: &ChatResumeContext{
+			Turns: []ChatResumeTurn{
+				{Seq: 1, Role: "user", Content: "hi"},
+			},
+		},
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.Len(t, tr.PrimingWrites, 1, "priming write must be captured")
+	require.Contains(t, string(tr.PrimingWrites[0]), "chat_rehydration_complete",
+		"priming message must contain chat_rehydration_complete")
+}
+
+// TestChatStart_NoPrimingWhenResumeNil verifies that when Resume is nil,
+// no priming message is written and the handler returns 202 Accepted.
+func TestChatStart_NoPrimingWhenResumeNil(t *testing.T) {
+	t.Parallel()
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS",
+		Project:   "p",
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.Empty(t, tr.PrimingWrites, "no priming writes when Resume is nil")
+}
+
+// TestChatStart_WriteStdinFailureDoesNotTearDown verifies that if writing
+// the rehydration priming message fails (e.g., stdin write error), the handler
+// still returns 202 Accepted and does NOT tear down the container.
+func TestChatStart_WriteStdinFailureDoesNotTearDown(t *testing.T) {
+	t.Parallel()
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	tr.ForceWriteErr = true
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			// Simulate the real manager behavior: attach stdin to the tracker.
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS",
+		Project:   "p",
+		Resume: &ChatResumeContext{
+			Turns: []ChatResumeTurn{
+				{Seq: 1, Role: "user", Content: "hi"},
+			},
+		},
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code,
+		"handler returns 202 even when WriteStdinChat fails")
+	require.True(t, tr.HasChat("01SESS"),
+		"container must still be tracked (write failure is non-fatal)")
+}

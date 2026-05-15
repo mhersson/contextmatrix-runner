@@ -49,10 +49,35 @@ type ContainerRunner interface {
 	BuildChatAuthEnv(ctx context.Context) map[string]string
 }
 
+// TrackerService is the interface to the task/chat tracker used by the webhook handler.
+// Using an interface enables handler tests to inject wrappers without needing
+// to modify the real tracker implementation.
+type TrackerService interface {
+	Add(info *tracker.ContainerInfo) error
+	AddIfUnderLimit(info *tracker.ContainerInfo, limit int) error
+	AddChat(info *tracker.ContainerInfo) error
+	AddChatIfUnderLimit(info *tracker.ContainerInfo, limit int) error
+	Has(project, cardID string) bool
+	HasChat(sessionID string) bool
+	Count() int
+	Remove(project, cardID string)
+	RemoveChat(sessionID string)
+	Snapshot(project, cardID string) (tracker.ContainerSnapshot, bool)
+	SnapshotChat(sessionID string) (tracker.ContainerSnapshot, bool)
+	AllSnapshots() []tracker.ContainerSnapshot
+	ListSnapshotsByProject(project string) []tracker.ContainerSnapshot
+	WriteStdin(project, cardID string, b []byte) error
+	WriteStdinChat(sessionID string, b []byte) error
+	CloseStdin(project, cardID string) error
+	CloseStdinChat(sessionID string) error
+	SetStdin(project, cardID string, w io.WriteCloser, onClose func())
+	SetStdinChat(sessionID string, w io.WriteCloser, onClose func())
+}
+
 // Handler processes incoming webhooks from ContextMatrix.
 type Handler struct {
 	manager       ContainerRunner
-	tracker       *tracker.Tracker
+	tracker       TrackerService
 	broadcaster   *logbroadcast.Broadcaster
 	cmClient      *callback.Client // contextmatrix callback client for promote API call
 	apiKey        string
@@ -96,7 +121,7 @@ type Handler struct {
 // atomic flags.
 func NewHandler(
 	manager ContainerRunner,
-	tracker *tracker.Tracker,
+	tracker TrackerService,
 	broadcaster *logbroadcast.Broadcaster,
 	cmClient *callback.Client,
 	apiKey string,

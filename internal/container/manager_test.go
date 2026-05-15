@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -4677,4 +4678,312 @@ func TestBuildChatAuthEnv_FallsBackToOAuthThenAPIKey(t *testing.T) {
 	require.Equal(t, "key", env2["ANTHROPIC_API_KEY"])
 	_, hasOAuth2 := env2["CLAUDE_CODE_OAUTH_TOKEN"]
 	require.False(t, hasOAuth2, "CLAUDE_CODE_OAUTH_TOKEN must not appear when only API key is set")
+}
+
+// TestManager_StartChat_ResumeMountReadOnly verifies that StartChat binds
+// /run/cm-chat with ReadOnly: true so the container cannot overwrite the
+// rehydration payload.
+func TestManager_StartChat_ResumeMountReadOnly(t *testing.T) {
+	t.Parallel()
+
+	var capturedHostCfg *container.HostConfig
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, hostCfg *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedHostCfg = hostCfg
+
+		return container.CreateResponse{ID: "chat-resume-ro"}, nil
+	}
+
+	cfg := testConfig()
+	cfg.SecretsDir = t.TempDir()
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "01CHATRESUMERO",
+		Project:   "p",
+		Resume: &ChatResume{
+			Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hi"}},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, capturedHostCfg)
+
+	found := false
+
+	for _, m := range capturedHostCfg.Mounts {
+		if m.Target == chatResumeMountTarget {
+			found = true
+
+			require.True(t, m.ReadOnly, "resume mount must be ReadOnly: true")
+			require.Equal(t, mount.TypeBind, m.Type, "resume mount must be a bind mount")
+		}
+	}
+
+	require.True(t, found, "resume mount (%s) not found in HostConfig.Mounts", chatResumeMountTarget)
+}
+
+// TestStartChat_ModelEnvForwarded verifies that StartChatOpts.Model becomes
+// CM_ORCHESTRATOR_MODEL=<id> in the container's Config.Env.
+func TestStartChat_ModelEnvForwarded(t *testing.T) {
+	t.Parallel()
+
+	var capturedEnv []string
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedEnv = cfg.Env
+
+		return container.CreateResponse{ID: "chat-model-test"}, nil
+	}
+
+	cfg := testConfig()
+	cfg.SecretsDir = t.TempDir()
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "01CHATMODEL",
+		Project:   "p",
+		Model:     "claude-opus-4-7",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, capturedEnv)
+	require.Contains(t, capturedEnv, "CM_ORCHESTRATOR_MODEL=claude-opus-4-7")
+}
+
+// TestStartChat_ResumeEnvOnlyWhenSucceeded verifies that CM_CHAT_RESUME=1
+// is set in the container's Config.Env only when prepareChatResume succeeds.
+// When prepareChatResume fails, the container still starts but CM_CHAT_RESUME=1
+// is not present in the env.
+func TestStartChat_ResumeEnvOnlyWhenSucceeded(t *testing.T) {
+	t.Parallel()
+
+	// Success path: CM_CHAT_RESUME=1 is present.
+	{
+		var capturedEnv []string
+
+		mock := successfulMock()
+		mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			capturedEnv = cfg.Env
+
+			return container.CreateResponse{ID: "chat-resume-success"}, nil
+		}
+
+		cfg := testConfig()
+		cfg.SecretsDir = t.TempDir()
+
+		tr := tracker.New()
+		cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		_, err := mgr.StartChat(context.Background(), StartChatOpts{
+			SessionID: "01CHATRESUME",
+			Project:   "p",
+			Resume: &ChatResume{
+				Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hi"}},
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, capturedEnv)
+		require.Contains(t, capturedEnv, "CM_CHAT_RESUME=1")
+	}
+
+	// Failure path: prepareChatResume fails. Container still starts; CM_CHAT_RESUME=1
+	// is not in env. We inject the failure by mocking mkdirAll to reject calls after
+	// secrets setup has succeeded (second mkdir call is for the per-container
+	// resume directory).
+	{
+		var (
+			capturedEnv []string
+			mkdirCount  atomic.Int32
+		)
+
+		mock := successfulMock()
+		mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			capturedEnv = cfg.Env
+
+			return container.CreateResponse{ID: "chat-resume-fail"}, nil
+		}
+
+		cfg := testConfig()
+		cfg.SecretsDir = t.TempDir()
+		cfg.DeploymentProfile = config.ProfileProduction
+
+		tr := tracker.New()
+		cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+		tp := testPATProvider(t)
+
+		mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+		// Mock mkdirAll to succeed for the first couple calls (secrets prep) but
+		// fail for the per-container resume directory. This isolates the
+		// prepareChatResume failure from secrets prep.
+		mgr.mkdirAll = func(path string, perm os.FileMode) error {
+			count := mkdirCount.Add(1)
+			// Allow the first few calls (baseDir + container name dirs), but fail
+			// the per-container resume directory creation.
+			if count > 2 {
+				return fmt.Errorf("injected mkdir failure for resume dir")
+			}
+
+			return os.MkdirAll(path, perm)
+		}
+
+		_, err := mgr.StartChat(context.Background(), StartChatOpts{
+			SessionID: "01CHATRESUMEFAIL",
+			Project:   "p",
+			Resume: &ChatResume{
+				Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hi"}},
+			},
+		})
+		require.NoError(t, err, "container still starts despite prepareChatResume failure")
+		require.NotNil(t, capturedEnv)
+		require.NotContains(t, capturedEnv, "CM_CHAT_RESUME=1", "CM_CHAT_RESUME must not be set when prepareChatResume fails")
+	}
+}
+
+// TestManager_PrepareChatResume_FilePerms verifies that prepareChatResume
+// creates the host directory with 0700 permissions and resume.jsonl with
+// 0600 permissions.
+func TestManager_PrepareChatResume_FilePerms(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.SecretsDir = t.TempDir()
+
+	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+
+	resume := &ChatResume{
+		Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hi"}},
+	}
+
+	delivery, err := mgr.PrepareChatResumeForTest("ctr-perms-test", "01SESS", "proj", resume)
+	require.NoError(t, err)
+	require.NotEmpty(t, delivery.DirPath)
+
+	t.Cleanup(func() { _ = os.RemoveAll(delivery.DirPath) })
+
+	info, err := os.Stat(delivery.DirPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "host dir must have 0700 permissions")
+
+	info, err = os.Stat(filepath.Join(delivery.DirPath, "resume.jsonl"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "resume.jsonl must have 0600 permissions")
+}
+
+// TestManager_PrepareChatResume_NonceUniqueness verifies that repeated calls to
+// prepareChatResume produce unique host directories even for the same container
+// name and session, preventing one call from colliding with or overwriting another.
+func TestManager_PrepareChatResume_NonceUniqueness(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.SecretsDir = t.TempDir()
+
+	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+
+	resume := &ChatResume{
+		Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hi"}},
+	}
+
+	seen := make(map[string]struct{})
+
+	for i := range 50 {
+		d, err := mgr.PrepareChatResumeForTest("ctr-nonce-test", "01SESS", "proj", resume)
+		require.NoError(t, err)
+
+		_, collision := seen[d.DirPath]
+		require.False(t, collision, "host dir nonce collision at iteration %d: %s", i, d.DirPath)
+
+		seen[d.DirPath] = struct{}{}
+		_ = os.RemoveAll(d.DirPath)
+	}
+}
+
+// TestManager_PrepareChatResume_CleansUpOnWriteFailure verifies that when
+// createFile fails (e.g., write fails), the host directory is cleaned up and
+// not left behind.
+func TestManager_PrepareChatResume_CleansUpOnWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.SecretsDir = t.TempDir()
+
+	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+
+	// Inject a createFile that fails for resume.jsonl but succeeds for others
+	mgr.SetCreateFileForTest(func(path string) (*os.File, error) {
+		if strings.HasSuffix(path, "resume.jsonl") {
+			return nil, errors.New("forced write failure")
+		}
+
+		return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
+	})
+
+	resume := &ChatResume{
+		Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hello"}},
+	}
+
+	_, err := mgr.PrepareChatResumeForTest("ctr-cleanup-test", "01SESS", "proj", resume)
+	require.Error(t, err, "prepareChatResume should fail when createFile fails")
+	require.ErrorContains(t, err, "forced write failure")
+
+	// Verify that the host directory was cleaned up (no leaked dir)
+	matches, err := filepath.Glob(filepath.Join(cfg.SecretsDir, "cmr-chat-resume-ctr-cleanup-test-*"))
+	require.NoError(t, err)
+	require.Empty(t, matches, "failed write must clean up the host directory, got %v", matches)
+}
+
+// TestManager_PrepareChatResume_FallsBackToTmpInDevMode verifies that when the
+// configured secrets dir is not writable and the manager is in dev mode, the
+// function falls back to writing under os.TempDir().
+func TestManager_PrepareChatResume_FallsBackToTmpInDevMode(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	// Use a non-existent directory that will fail on mkdir
+	cfg.SecretsDir = "/nonexistent/path/that/cannot/be/created"
+	cfg.DeploymentProfile = "dev"
+
+	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+
+	resume := &ChatResume{
+		Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "fallback test"}},
+	}
+
+	delivery, err := mgr.PrepareChatResumeForTest("ctr-fallback-test", "01SESS", "proj", resume)
+	require.NoError(t, err, "prepareChatResume should succeed with tmp fallback in dev mode")
+	require.NotEmpty(t, delivery.DirPath)
+
+	t.Cleanup(func() { _ = os.RemoveAll(delivery.DirPath) })
+
+	// Verify the directory was created under TempDir, not under the configured (inaccessible) secrets dir
+	require.True(t,
+		strings.HasPrefix(delivery.DirPath, os.TempDir()),
+		"dev fallback must write under TempDir, got %s", delivery.DirPath,
+	)
+
+	// Verify the directory actually exists and contains resume files
+	info, err := os.Stat(delivery.DirPath)
+	require.NoError(t, err)
+	require.True(t, info.IsDir(), "delivery.DirPath must be a directory")
+
+	_, err = os.Stat(filepath.Join(delivery.DirPath, "resume.jsonl"))
+	require.NoError(t, err, "resume.jsonl must exist in the fallback directory")
+
+	_, err = os.Stat(filepath.Join(delivery.DirPath, "resume.meta.json"))
+	require.NoError(t, err, "resume.meta.json must exist in the fallback directory")
 }
