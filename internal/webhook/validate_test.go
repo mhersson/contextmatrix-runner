@@ -406,6 +406,63 @@ func TestValidatePayload_ChatStart(t *testing.T) {
 	}
 }
 
+func TestChatStartPayload_PrimerUnmarshal(t *testing.T) {
+	// Field present → populated.
+	const withPrimer = `{"session_id":"S1","primer":"ORIENT"}`
+
+	var p1 ChatStartPayload
+	require.NoError(t, json.Unmarshal([]byte(withPrimer), &p1))
+	assert.Equal(t, "ORIENT", p1.Primer)
+	assert.Equal(t, "S1", p1.SessionID)
+
+	// Field absent → empty string (zero value).
+	const withoutPrimer = `{"session_id":"S2"}`
+
+	var p2 ChatStartPayload
+	require.NoError(t, json.Unmarshal([]byte(withoutPrimer), &p2))
+	assert.Empty(t, p2.Primer, "missing primer field must decode to empty string")
+}
+
+func TestValidatePayload_ChatStart_Primer(t *testing.T) {
+	// Happy paths: empty (back-compat), short, near-cap.
+	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1"}))
+	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1", Primer: "ORIENT"}))
+	require.NoError(t, ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Primer:    strings.Repeat("a", 64*1024),
+	}))
+
+	// Over-cap → rejected with field="primer".
+	t.Run("reject:over-cap", func(t *testing.T) {
+		err := ValidatePayload(&ChatStartPayload{
+			SessionID: "sess-1",
+			Primer:    strings.Repeat("a", 64*1024+1),
+		})
+		require.Error(t, err)
+
+		var ve *ValidationError
+
+		require.ErrorAs(t, err, &ve)
+		assert.Equal(t, "primer", ve.Field)
+		assert.Contains(t, ve.Reason, "too long")
+	})
+
+	// Invalid UTF-8 → rejected with field="primer".
+	t.Run("reject:invalid-utf8", func(t *testing.T) {
+		err := ValidatePayload(&ChatStartPayload{
+			SessionID: "sess-1",
+			Primer:    "\xff\xfe not utf-8",
+		})
+		require.Error(t, err)
+
+		var ve *ValidationError
+
+		require.ErrorAs(t, err, &ve)
+		assert.Equal(t, "primer", ve.Field)
+		assert.Contains(t, ve.Reason, "UTF-8")
+	})
+}
+
 func TestValidatePayload_ChatStart_Model(t *testing.T) {
 	// Happy paths.
 	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1", Model: ""}))

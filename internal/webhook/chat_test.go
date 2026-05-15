@@ -682,3 +682,134 @@ func TestChatStart_WriteStdinFailureDoesNotTearDown(t *testing.T) {
 	require.True(t, tr.HasChat("01SESS"),
 		"container must still be tracked (write failure is non-fatal)")
 }
+
+// TestChatStart_WritesPrimerBeforeRehydration verifies that when both
+// primer and resume are set, the primer envelope is written to stdin
+// FIRST, then the rehydration priming envelope.
+func TestChatStart_WritesPrimerBeforeRehydration(t *testing.T) {
+	t.Parallel()
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS",
+		Project:   "p",
+		Primer:    "PRIMER-TEXT",
+		Resume: &ChatResumeContext{
+			Turns: []ChatResumeTurn{
+				{Seq: 1, Role: "user", Content: "hi"},
+			},
+		},
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.Len(t, tr.PrimingWrites, 2,
+		"expected 2 stdin writes: primer then rehydration priming")
+	assert.Contains(t, string(tr.PrimingWrites[0]), "PRIMER-TEXT",
+		"first stdin write must be the primer envelope")
+	assert.Contains(t, string(tr.PrimingWrites[1]), "chat_rehydration_complete",
+		"second stdin write must be the rehydration priming envelope")
+}
+
+// TestChatStart_WritesPrimerOnly_NoResume verifies that with primer set
+// and resume nil, only the primer envelope is written.
+func TestChatStart_WritesPrimerOnly_NoResume(t *testing.T) {
+	t.Parallel()
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS",
+		Project:   "p",
+		Primer:    "PRIMER-TEXT",
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.Len(t, tr.PrimingWrites, 1, "expected 1 stdin write: primer only")
+	assert.Contains(t, string(tr.PrimingWrites[0]), "PRIMER-TEXT")
+	assert.NotContains(t, string(tr.PrimingWrites[0]), "chat_rehydration_complete",
+		"no rehydration text when Resume is nil")
+}
+
+// TestChatStart_NoPrimerNoResume verifies that with both fields empty,
+// no stdin writes occur — preserves the existing fresh-cold-open
+// behavior for backward compat with old CMs that don't send a primer.
+func TestChatStart_NoPrimerNoResume(t *testing.T) {
+	t.Parallel()
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS",
+		Project:   "p",
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+	assert.Empty(t, tr.PrimingWrites,
+		"no stdin writes when both primer and resume are empty")
+}
+
+// TestChatStart_PrimerWriteError_DoesNotFailRequest verifies that a
+// failure to write the primer envelope is logged but does NOT fail the
+// /chat/start request or tear down the container. Matches the existing
+// fail-open posture for rehydration priming writes.
+func TestChatStart_PrimerWriteError_DoesNotFailRequest(t *testing.T) {
+	t.Parallel()
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	tr.ForceWriteErr = true
+
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS",
+		Project:   "p",
+		Primer:    "PRIMER-TEXT",
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	assert.Equal(t, http.StatusAccepted, w.Code,
+		"handler must return 202 even when primer stdin write fails")
+}
