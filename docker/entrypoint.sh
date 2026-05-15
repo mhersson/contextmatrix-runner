@@ -145,6 +145,7 @@ ALLOWED_TOOLS_COMMON=(
     "mcp__contextmatrix__start_workflow"
     "mcp__contextmatrix__transition_card"
     "mcp__contextmatrix__update_card"
+    "mcp__contextmatrix__chat_rehydration_complete"
 )
 
 # Autonomous-mode-only additions. Task (sub-agent spawning) is allowed here
@@ -184,6 +185,16 @@ fi
 MCP_HEADERS="{}"
 if [ -n "${CM_MCP_API_KEY:-}" ]; then
     MCP_HEADERS=$(jq -n --arg key "$CM_MCP_API_KEY" '{"Authorization": ("Bearer " + $key)}')
+fi
+# Chat-mode containers forward CM_CHAT_SESSION so CM can gate session-scoped
+# tools (chat_rehydration_complete) to the caller's own session. Card-mode
+# workers leave CM_CHAT_SESSION unset, so the header is omitted and the
+# server-side gate is skipped.
+if [ -n "${CM_CHAT_SESSION:-}" ]; then
+    MCP_HEADERS=$(jq -n \
+        --argjson base "$MCP_HEADERS" \
+        --arg session "$CM_CHAT_SESSION" \
+        '$base + {"X-CM-Chat-Session": $session}')
 fi
 
 MCP_ENTRY=$(jq -n \
@@ -267,6 +278,46 @@ if [ -n "${CM_BASE_BRANCH:-}" ]; then
     case "$CM_BASE_BRANCH" in
         -*|*[!A-Za-z0-9._/-]*)
             echo "ERROR: invalid CM_BASE_BRANCH" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+# Validate CM_CHAT_SESSION (interpolated into prompt + workspace paths).
+if [ -n "${CM_CHAT_SESSION:-}" ]; then
+    case "$CM_CHAT_SESSION" in
+        -*|*[!A-Za-z0-9._-]*)
+            echo "ERROR: invalid CM_CHAT_SESSION" >&2
+            exit 1
+            ;;
+    esac
+fi
+# Validate CM_CHAT_PROJECT (used as directory name).
+if [ -n "${CM_CHAT_PROJECT:-}" ]; then
+    case "$CM_CHAT_PROJECT" in
+        -*|*[!A-Za-z0-9._-]*)
+            echo "ERROR: invalid CM_CHAT_PROJECT" >&2
+            exit 1
+            ;;
+    esac
+fi
+# CM_CHAT_REPO_URL: same validation as CM_REPO_URL — must start with https://
+# and contain only safe chars. Skip the GIT_HOST extraction since chat mode
+# doesn't piggy-back on the existing GIT_HOST var.
+if [ -n "${CM_CHAT_REPO_URL:-}" ]; then
+    case "$CM_CHAT_REPO_URL" in
+        https://*)
+            _rest="${CM_CHAT_REPO_URL#https://}"
+            case "$_rest" in
+                -*|*[!A-Za-z0-9._/:@-]*)
+                    echo "ERROR: invalid CM_CHAT_REPO_URL" >&2
+                    exit 1
+                    ;;
+            esac
+            unset _rest
+            ;;
+        *)
+            echo "ERROR: CM_CHAT_REPO_URL must be https://" >&2
             exit 1
             ;;
     esac
@@ -365,13 +416,22 @@ fi
 # `--` stops git from interpreting later args as options even if CM_REPO_URL
 # ever begins with "-" (the case-based validators above already reject that,
 # but defense in depth is cheap).
-if [ -n "${CM_BASE_BRANCH:-}" ]; then
-    echo "Cloning ${CM_REPO_URL} (branch: ${CM_BASE_BRANCH})..."
-    git clone -b "${CM_BASE_BRANCH}" -- "${CM_REPO_URL}" /home/user/workspace
-else
-    echo "Cloning ${CM_REPO_URL}..."
-    git clone -- "${CM_REPO_URL}" /home/user/workspace
+# Chat-mode containers handle their own clone inside the dispatch branch
+# (CM_CHAT_REPO_URL / CM_CHAT_PROJECT) and don't set CM_REPO_URL, so skip
+# the git-clone step under `set -u`. The cd into /home/user/workspace runs
+# in both modes — chat will override it from its dispatch branch but the
+# code between here and the dispatch (skills source, secret scrub) is
+# happier with a known cwd that exists.
+if [ -z "${CM_CHAT_SESSION:-}" ]; then
+    if [ -n "${CM_BASE_BRANCH:-}" ]; then
+        echo "Cloning ${CM_REPO_URL} (branch: ${CM_BASE_BRANCH})..."
+        git clone -b "${CM_BASE_BRANCH}" -- "${CM_REPO_URL}" /home/user/workspace
+    else
+        echo "Cloning ${CM_REPO_URL}..."
+        git clone -- "${CM_REPO_URL}" /home/user/workspace
+    fi
 fi
+mkdir -p /home/user/workspace
 cd /home/user/workspace
 
 BASE_BRANCH_CONTEXT=""
@@ -397,11 +457,48 @@ unset CM_GIT_TOKEN CM_MCP_API_KEY
 # Space-separated allowlist passed via a single --allowed-tools flag, per
 # `claude --help`: "--allowedTools, --allowed-tools <tools...>  Comma or
 # space-separated list of tool names to allow (e.g. \"Bash(git *) Edit\")".
-# Three-way dispatch:
-#   1. knowledge-refresh — KB refresh mode with its own tool allowlist and prompt.
-#   2. HITL (CM_INTERACTIVE=1) — common list only; sub-agents excluded.
-#   3. autonomous (default) — common list + Task sub-agent spawning.
-if [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
+# Four-way dispatch:
+#   1. chat (CM_CHAT_SESSION set) — non-card-bound interactive session.
+#   2. knowledge-refresh — KB refresh mode with its own tool allowlist and prompt.
+#   3. HITL (CM_INTERACTIVE=1) — common list only; sub-agents excluded.
+#   4. autonomous (default) — common list + Task sub-agent spawning.
+if [ -n "${CM_CHAT_SESSION:-}" ]; then
+    # Chat mode — non-card-bound interactive session.
+    # /home/user/workspace is already created+cd'd above; chat sub-clones land
+    # underneath it. Using a path under $HOME keeps writes inside the non-root
+    # user's writable tree (the container can't mkdir /workspace at the root).
+    if [ -n "${CM_CHAT_REPO_URL:-}" ] && [ -n "${CM_CHAT_PROJECT:-}" ]; then
+        if ! git clone --depth=1 -- "$CM_CHAT_REPO_URL" "/home/user/workspace/$CM_CHAT_PROJECT"; then
+            echo "[entrypoint] initial clone failed" >&2
+            exit 1
+        fi
+        cd "/home/user/workspace/$CM_CHAT_PROJECT" || exit 1
+    fi
+
+    ALLOWED_TOOLS_CHAT=("${ALLOWED_TOOLS_COMMON[@]}" "${ALLOWED_TOOLS_AUTO_EXTRAS[@]}")
+
+    # When CM signals a rehydration phase, the runner side primes the agent
+    # via stdin AFTER attach (see runner internal/webhook/chat.go) — the -p
+    # positional prompt is ignored by Claude in --input-format stream-json
+    # mode, so the rehydration instructions have to come over stdin. We
+    # still log that the rehydration file is present so an operator
+    # debugging the container can see it landed correctly.
+    if [ "${CM_CHAT_RESUME:-0}" = "1" ]; then
+        if [ -r /run/cm-chat/resume.jsonl ]; then
+            echo "[entrypoint] rehydration payload detected at /run/cm-chat/resume.jsonl" >&2
+        else
+            echo "[entrypoint] WARN: CM_CHAT_RESUME=1 but /run/cm-chat/resume.jsonl is missing or unreadable; runner-side priming may fail" >&2
+        fi
+    fi
+
+    echo "Starting Claude Code in chat mode (session ${CM_CHAT_SESSION})..."
+    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
+        --input-format stream-json \
+        --output-format stream-json \
+        --verbose --allowed-tools "${ALLOWED_TOOLS_CHAT[*]}" \
+        -- \
+        "Chat session ${CM_CHAT_SESSION}. Wait for the operator's first message."
+elif [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
     ALLOWED_TOOLS_KB=("${ALLOWED_TOOLS_COMMON[@]}"
         "Task"
         "mcp__contextmatrix__refresh_knowledge_base"

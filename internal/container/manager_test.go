@@ -4069,3 +4069,612 @@ func TestRun_KnowledgeRefreshMode_DoesNotCallReportSkillEngaged(t *testing.T) {
 	assert.Empty(t, skillEngagedCallBodies,
 		"ReportSkillEngaged must not fire for knowledge-refresh containers")
 }
+
+// TestManager_StartChat_SetsEnvAndWorkspace verifies that StartChat injects the
+// correct CM_CHAT_* env vars, merges non-secret values, sets OpenStdin, and
+// does NOT inject card-mode vars (CM_CARD_ID, CM_INTERACTIVE). Secrets are
+// covered by TestManager_StartChat_SecretsViaTmpfs.
+func TestManager_StartChat_SetsEnvAndWorkspace(t *testing.T) {
+	var capturedCfg *container.Config
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedCfg = cfg
+
+		return container.CreateResponse{ID: "chat-ctr-abc123"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	containerID, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "S1",
+		Project:   "alpha",
+		RepoURL:   "https://example.com/alpha.git",
+		MCPURL:    "http://host.docker.internal:8080/mcp",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "chat-ctr-abc123", containerID)
+	require.NotNil(t, capturedCfg)
+
+	env := capturedCfg.Env
+
+	// Required chat env vars must be present.
+	assert.Contains(t, env, "CM_CHAT_SESSION=S1")
+	assert.Contains(t, env, "CM_CHAT_PROJECT=alpha")
+	assert.Contains(t, env, "CM_CHAT_REPO_URL=https://example.com/alpha.git")
+	assert.Contains(t, env, "CM_MCP_URL=http://host.docker.internal:8080/mcp",
+		"CM_MCP_URL must be set in chat mode so claude can reach CM's MCP endpoint")
+
+	// Card-mode vars must NOT be present.
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "CM_CARD_ID="), "CM_CARD_ID must not be set in chat mode")
+		assert.False(t, strings.HasPrefix(e, "CM_INTERACTIVE="), "CM_INTERACTIVE must not be set in chat mode")
+	}
+
+	// Container must be configured for stdin streaming.
+	assert.True(t, capturedCfg.OpenStdin, "OpenStdin must be true for chat containers")
+	assert.True(t, capturedCfg.AttachStdin, "AttachStdin must be true for chat containers")
+	assert.False(t, capturedCfg.Tty, "Tty must be false for chat containers")
+
+	// Label must carry the session ID.
+	assert.Equal(t, "S1", capturedCfg.Labels[LabelSessionID])
+	assert.Equal(t, "true", capturedCfg.Labels[LabelRunner])
+	assert.Equal(t, "alpha", capturedCfg.Labels[LabelProject])
+}
+
+// TestManager_StartChat_SecretsViaTmpfs verifies that chat-mode secrets
+// (CM_MCP_API_KEY + AuthEnv contents like CM_GIT_TOKEN, CLAUDE_CODE_OAUTH_TOKEN)
+// are delivered via the same tmpfs bind-mount the card-mode path uses, and do
+// not appear in container.Config.Env where `docker inspect` would surface them.
+func TestManager_StartChat_SecretsViaTmpfs(t *testing.T) {
+	var (
+		capturedCfg     *container.Config
+		capturedHostCfg *container.HostConfig
+	)
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, hostCfg *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedCfg = cfg
+		capturedHostCfg = hostCfg
+
+		return container.CreateResponse{ID: "chat-ctr-secrets"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	// Production profile + writable temp SecretsDir → file-mode delivery.
+	cfg := testConfig()
+	cfg.DeploymentProfile = config.ProfileProduction
+	cfg.SecretsDir = t.TempDir()
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "S-secrets",
+		Project:   "alpha",
+		RepoURL:   "https://example.com/alpha.git",
+		MCPAPIKey: "mcp-secret-key",
+		AuthEnv: map[string]string{
+			"CM_GIT_TOKEN":            "gh-token-secret",
+			"CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, capturedCfg)
+	require.NotNil(t, capturedHostCfg)
+
+	// Secret env vars must NOT appear in container.Config.Env.
+	for _, e := range capturedCfg.Env {
+		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="),
+			"CM_MCP_API_KEY must not be set as a container env var")
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="),
+			"CM_GIT_TOKEN must not be set as a container env var")
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="),
+			"CLAUDE_CODE_OAUTH_TOKEN must not be set as a container env var")
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="),
+			"ANTHROPIC_API_KEY must not be set as a container env var")
+	}
+
+	// Mounts must include the secrets tmpfs file at the canonical target.
+	var hasSecretsMount bool
+
+	for _, m := range capturedHostCfg.Mounts {
+		if m.Target == secretsMountTarget {
+			hasSecretsMount = true
+
+			assert.True(t, m.ReadOnly, "secrets mount must be read-only")
+			assert.Equal(t, mount.TypeBind, m.Type, "secrets mount must be a bind")
+		}
+	}
+
+	assert.True(t, hasSecretsMount, "chat container HostConfig must bind-mount the secrets file at %s", secretsMountTarget)
+}
+
+// TestManager_StartChat_RequiresSessionID verifies that an empty SessionID
+// is rejected before any Docker call is attempted.
+func TestManager_StartChat_RequiresSessionID(t *testing.T) {
+	mock := &MockDockerClient{} // No Fns set — any call will panic.
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SessionID is required")
+}
+
+// TestManager_StartChat_UsesBaseImage verifies that chat containers spawn from
+// cfg.BaseImage. There is intentionally no per-spawn image override on the
+// chat path — the runner's allowlist policy lives behind cfg.BaseImage / the
+// startContainer allowlist for card-mode and chat-mode shares it implicitly.
+func TestManager_StartChat_UsesBaseImage(t *testing.T) {
+	var usedImage string
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		usedImage = cfg.Image
+
+		return container.CreateResponse{ID: "chat-fallback-ctr"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	cfg := testConfig() // BaseImage is "test-image:latest"
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "S2",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "test-image:latest", usedImage, "chat containers must spawn from cfg.BaseImage")
+}
+
+// TestManager_StartChat_OptionalFieldsOmitted verifies that when Project and
+// RepoURL are empty, their corresponding env vars are absent.
+func TestManager_StartChat_OptionalFieldsOmitted(t *testing.T) {
+	var capturedEnv []string
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedEnv = cfg.Env
+
+		return container.CreateResponse{ID: "chat-minimal-ctr"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "S3",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, capturedEnv, "CM_CHAT_SESSION=S3")
+
+	for _, e := range capturedEnv {
+		assert.False(t, strings.HasPrefix(e, "CM_CHAT_PROJECT="), "CM_CHAT_PROJECT must be absent when Project is empty")
+		assert.False(t, strings.HasPrefix(e, "CM_CHAT_REPO_URL="), "CM_CHAT_REPO_URL must be absent when RepoURL is empty")
+	}
+}
+
+// TestManager_StreamChatLogs_PublishesAssistantText verifies that
+// StreamChatLogs reads the chat container's stdout, parses claude
+// stream-json, and republishes assistant text events to the broadcaster
+// with SessionID set. Without this wiring, browser SSE never sees a reply.
+func TestManager_StreamChatLogs_PublishesAssistantText(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+		var buf strings.Builder
+
+		w := stdcopy.NewStdWriter(&buf, stdcopy.Stdout)
+		_, _ = w.Write([]byte(
+			`{"type":"assistant","message":{"content":[{"type":"text","text":"Hello back."}]}}` + "\n",
+		))
+
+		return io.NopCloser(strings.NewReader(buf.String())), nil
+	}
+
+	rec := newRecordingBroadcaster()
+	defer rec.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, rec.Broadcaster(), testConfig(), testLogger())
+
+	mgr.StreamChatLogs(context.Background(), "S-stream", "chat-ctr-1", "alpha")
+	mgr.Wait()
+
+	// mgr.Wait drains the streaming goroutine, but Broadcaster.Publish is
+	// async: events are queued onto a channel that the recording drain
+	// goroutine consumes. Poll briefly until the drain catches up.
+	var entries []logbroadcast.LogEntry
+
+	require.Eventually(t, func() bool {
+		entries = rec.filterType("text")
+
+		return len(entries) > 0
+	}, time.Second, 5*time.Millisecond, "expected at least one text LogEntry")
+
+	assert.Equal(t, "S-stream", entries[0].SessionID)
+	assert.Empty(t, entries[0].CardID, "chat LogEntry must not carry a CardID")
+	assert.Equal(t, "alpha", entries[0].Project)
+	assert.Contains(t, entries[0].Content, "Hello back.")
+}
+
+// TestListManaged_IncludesChatContainers verifies that chat-mode containers
+// (labelled with LabelSessionID but no LabelCardID) are surfaced by the
+// /containers operator endpoint. Without this CM cannot reconcile orphan
+// chat sessions because it never learns about the containers.
+func TestListManaged_IncludesChatContainers(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return []DockerContainer{
+			{
+				ID:      "card-ctr-1",
+				Names:   []string{"/cmr-proj-a-001"},
+				State:   "running",
+				Created: time.Now().Add(-5 * time.Minute).Unix(),
+				Labels: map[string]string{
+					LabelRunner:  "true",
+					LabelProject: "proj",
+					LabelCardID:  "A-001",
+				},
+			},
+			{
+				ID:      "chat-ctr-tracked",
+				Names:   []string{"/cmr-chat-s-known"},
+				State:   "running",
+				Created: time.Now().Add(-2 * time.Minute).Unix(),
+				Labels: map[string]string{
+					LabelRunner:    "true",
+					LabelProject:   "proj",
+					LabelSessionID: "S-known",
+				},
+			},
+			{
+				ID:      "chat-ctr-untracked",
+				Names:   []string{"/cmr-chat-s-orphan"},
+				State:   "running",
+				Created: time.Now().Add(-1 * time.Minute).Unix(),
+				Labels: map[string]string{
+					LabelRunner:    "true",
+					LabelSessionID: "S-orphan",
+				},
+			},
+			{
+				// Neither cardID nor sessionID — must still be skipped.
+				ID:     "mislabeled",
+				Labels: map[string]string{LabelRunner: "true", LabelProject: "proj"},
+				State:  "running",
+			},
+		}, nil
+	}
+
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		Project: "proj", CardID: "A-001", ContainerID: "card-ctr-1",
+	}))
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+		SessionID: "S-known", Project: "proj", ContainerID: "chat-ctr-tracked",
+	}))
+
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	got, err := mgr.ListManaged(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 3,
+		"card container + tracked chat + orphan chat must be listed; mislabeled must be skipped")
+
+	byID := make(map[string]ManagedContainer, len(got))
+	for _, c := range got {
+		byID[c.ContainerID] = c
+	}
+
+	require.Contains(t, byID, "card-ctr-1")
+	assert.Equal(t, "A-001", byID["card-ctr-1"].CardID)
+	assert.Empty(t, byID["card-ctr-1"].SessionID, "card container must have empty SessionID")
+	assert.True(t, byID["card-ctr-1"].Tracked)
+
+	require.Contains(t, byID, "chat-ctr-tracked")
+	assert.Empty(t, byID["chat-ctr-tracked"].CardID, "chat container must have empty CardID")
+	assert.Equal(t, "S-known", byID["chat-ctr-tracked"].SessionID)
+	assert.True(t, byID["chat-ctr-tracked"].Tracked, "tracked chat must report Tracked=true")
+
+	require.Contains(t, byID, "chat-ctr-untracked")
+	assert.Equal(t, "S-orphan", byID["chat-ctr-untracked"].SessionID)
+	assert.False(t, byID["chat-ctr-untracked"].Tracked,
+		"chat container missing from tracker (divergence) must report Tracked=false")
+}
+
+// TestCleanupOrphans_SkipsTrackedChat guards against the regression where the
+// maintenance loop would kill every active chat container on every tick: chat
+// containers carry LabelSessionID (not LabelCardID), so the (project, cardID)
+// tracker check fell through and classified them as orphans.
+func TestCleanupOrphans_SkipsTrackedChat(t *testing.T) {
+	var removedIDs []string
+
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return []DockerContainer{
+			{ID: "live-chat", Labels: map[string]string{
+				LabelRunner: "true", LabelProject: "proj", LabelSessionID: "S-live",
+			}},
+			{ID: "orphan-chat", Labels: map[string]string{
+				LabelRunner: "true", LabelProject: "proj", LabelSessionID: "S-orphan",
+			}},
+		}, nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, _ container.RemoveOptions) error {
+		removedIDs = append(removedIDs, id)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+		SessionID: "S-live", Project: "proj", ContainerID: "live-chat",
+	}))
+
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	err := mgr.CleanupOrphans(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orphan-chat"}, removedIDs,
+		"only the untracked chat container must be removed; tracked live-chat must survive")
+}
+
+// TestManager_StartChat_WaitCleanupRemovesTrackerOnExit verifies that StartChat
+// launches a wg-tracked goroutine which waits for the container to exit and
+// then removes the tracker entry plus force-removes the container. This covers
+// the implicit-exit paths (claude crash, OOM, external kill) where /chat/end
+// is NOT called by the user but the container exits anyway.
+func TestManager_StartChat_WaitCleanupRemovesTrackerOnExit(t *testing.T) {
+	waitCh := make(chan container.WaitResponse, 1)
+	errCh := make(chan error, 1)
+
+	var (
+		removeCalls atomic.Int32
+		removedIDs  sync.Map
+	)
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		return container.CreateResponse{ID: "chat-ctr-wait"}, nil
+	}
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		return waitCh, errCh
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, _ container.RemoveOptions) error {
+		removeCalls.Add(1)
+		removedIDs.Store(id, true)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	containerID, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "S-wait",
+		Project:   "alpha",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "chat-ctr-wait", containerID)
+
+	// Simulate the webhook handler registering the tracker entry after
+	// StartChat returns. Without this, the cleanup goroutine has nothing
+	// to remove.
+	_, streamCancel := context.WithCancel(context.Background())
+	t.Cleanup(streamCancel)
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+		ContainerID: containerID,
+		SessionID:   "S-wait",
+		Project:     "alpha",
+		StartedAt:   time.Now(),
+		Cancel:      streamCancel,
+	}))
+
+	require.True(t, tr.HasChat("S-wait"), "tracker entry should exist before container exit")
+
+	// Fire the container exit. The cleanup goroutine launched inside
+	// StartChat must observe this, remove the tracker entry, and
+	// force-remove the container.
+	waitCh <- container.WaitResponse{StatusCode: 0}
+
+	mgr.Wait()
+
+	assert.False(t, tr.HasChat("S-wait"), "tracker entry must be removed after container exit")
+	assert.GreaterOrEqual(t, int(removeCalls.Load()), 1, "ContainerRemove must be called at least once on the chat container")
+
+	if _, ok := removedIDs.Load("chat-ctr-wait"); !ok {
+		t.Fatalf("expected ContainerRemove to be called with chat-ctr-wait, removed IDs: %v", &removedIDs)
+	}
+}
+
+// stdinCloseSpy is a WriteCloser that records whether Close() was called.
+type stdinCloseSpy struct {
+	closed atomic.Bool
+}
+
+func (s *stdinCloseSpy) Write(p []byte) (int, error) { return len(p), nil }
+func (s *stdinCloseSpy) Close() error {
+	s.closed.Store(true)
+
+	return nil
+}
+
+// TestKillChat_ClosesStdinThenStops verifies that KillChat:
+//  1. closes the container's stdin so claude can flush its final stream-json batch,
+//  2. calls ContainerStop (SIGTERM + grace) on the chat container,
+//  3. calls ContainerRemove to clean up.
+//
+// This mirrors the graceful kill path that card-mode containers already receive
+// via Kill + the context-cancel chain; KillChat gives chat containers the same
+// treatment.
+func TestKillChat_ClosesStdinThenStops(t *testing.T) {
+	t.Parallel()
+
+	var (
+		stoppedID atomic.Value
+		removedID atomic.Value
+	)
+
+	mock := successfulMock()
+	mock.ContainerStopFn = func(_ context.Context, id string, _ container.StopOptions) error {
+		stoppedID.Store(id)
+
+		return nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, _ container.RemoveOptions) error {
+		removedID.Store(id)
+
+		return nil
+	}
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	const (
+		sessionID   = "01TESTCHAT"
+		containerID = "ctr-xyz"
+	)
+
+	spy := &stdinCloseSpy{}
+
+	_, streamCancel := context.WithCancel(context.Background())
+	t.Cleanup(streamCancel)
+
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+		ContainerID: containerID,
+		SessionID:   sessionID,
+		Project:     "global",
+		StartedAt:   time.Now(),
+		Cancel:      streamCancel,
+	}))
+
+	// Attach the spy stdin so CloseStdinChat has something to close.
+	tr.SetStdinChat(sessionID, spy, nil)
+
+	require.NoError(t, mgr.KillChat(context.Background(), sessionID))
+
+	assert.True(t, spy.closed.Load(), "KillChat must close container stdin")
+	assert.Equal(t, containerID, stoppedID.Load(), "KillChat must call ContainerStop on the chat container")
+	assert.Equal(t, containerID, removedID.Load(), "KillChat must call ContainerRemove on the chat container")
+}
+
+// TestKillChat_NotFound verifies that KillChat returns an error when no chat
+// container is tracked for the given session ID.
+func TestKillChat_NotFound(t *testing.T) {
+	t.Parallel()
+
+	mock := successfulMock()
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+
+	err := mgr.KillChat(context.Background(), "no-such-session")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no-such-session")
+}
+
+// TestKillChat_NoStdinAttached verifies that KillChat succeeds (still calls
+// ContainerStop/Remove) even when no stdin has been attached yet to the chat
+// container — covering the race window between tracker.AddChat and
+// tracker.SetStdinChat.
+func TestKillChat_NoStdinAttached(t *testing.T) {
+	t.Parallel()
+
+	var stopped atomic.Bool
+
+	mock := successfulMock()
+	mock.ContainerStopFn = func(_ context.Context, _ string, _ container.StopOptions) error {
+		stopped.Store(true)
+
+		return nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, _ container.RemoveOptions) error {
+		return nil
+	}
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+
+	_, streamCancel := context.WithCancel(context.Background())
+	t.Cleanup(streamCancel)
+
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+		ContainerID: "ctr-nostdin",
+		SessionID:   "no-stdin-session",
+		Project:     "global",
+		StartedAt:   time.Now(),
+		Cancel:      streamCancel,
+	}))
+
+	// No SetStdinChat call — stdin is nil.
+	require.NoError(t, mgr.KillChat(context.Background(), "no-stdin-session"))
+	assert.True(t, stopped.Load(), "ContainerStop must be called even when stdin is not attached")
+}
+
+// TestBuildChatAuthEnv_AuthDirSuppressesEnv verifies that when ClaudeAuthDir is
+// configured alongside a token and API key, BuildChatAuthEnv does NOT inject
+// env-based credentials — the bind-mount is the sole auth mechanism.
+func TestBuildChatAuthEnv_AuthDirSuppressesEnv(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	cfg := &config.Config{
+		ClaudeAuthDir:    dir,
+		ClaudeOAuthToken: "should-not-be-used",
+		AnthropicAPIKey:  "neither",
+	}
+
+	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+	env := mgr.BuildChatAuthEnv(context.Background())
+
+	_, hasOAuth := env["CLAUDE_CODE_OAUTH_TOKEN"]
+	_, hasAPI := env["ANTHROPIC_API_KEY"]
+
+	require.False(t, hasOAuth, "CLAUDE_CODE_OAUTH_TOKEN must not be set when ClaudeAuthDir is configured")
+	require.False(t, hasAPI, "ANTHROPIC_API_KEY must not be set when ClaudeAuthDir is configured")
+}
+
+// TestBuildChatAuthEnv_FallsBackToOAuthThenAPIKey verifies the fallback cascade
+// when ClaudeAuthDir is absent: oauth token takes priority over API key.
+func TestBuildChatAuthEnv_FallsBackToOAuthThenAPIKey(t *testing.T) {
+	t.Parallel()
+
+	// Only oauth token set — must land in env.
+	mgr1 := NewManager(nil, tracker.New(), nil, nil, nil, &config.Config{
+		ClaudeOAuthToken: "tok",
+	}, testLogger())
+	env1 := mgr1.BuildChatAuthEnv(context.Background())
+	require.Equal(t, "tok", env1["CLAUDE_CODE_OAUTH_TOKEN"])
+	_, hasAPI1 := env1["ANTHROPIC_API_KEY"]
+	require.False(t, hasAPI1, "ANTHROPIC_API_KEY must not appear when oauth token is set")
+
+	// Only API key set — must land in env.
+	mgr2 := NewManager(nil, tracker.New(), nil, nil, nil, &config.Config{
+		AnthropicAPIKey: "key",
+	}, testLogger())
+	env2 := mgr2.BuildChatAuthEnv(context.Background())
+	require.Equal(t, "key", env2["ANTHROPIC_API_KEY"])
+	_, hasOAuth2 := env2["CLAUDE_CODE_OAUTH_TOKEN"]
+	require.False(t, hasOAuth2, "CLAUDE_CODE_OAUTH_TOKEN must not appear when only API key is set")
+}

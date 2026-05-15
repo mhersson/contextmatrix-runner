@@ -39,6 +39,14 @@ type ContainerRunner interface {
 	Kill(project, cardID string) error
 	ListManaged(ctx context.Context) ([]container.ManagedContainer, error)
 	ForceRemoveByLabels(ctx context.Context, project, cardID string) (int, error)
+
+	// Chat-mode methods (added for global-chat milestone).
+	StartChat(ctx context.Context, opts container.StartChatOpts) (string, error)
+	AttachChatStdin(ctx context.Context, sessionID, containerID string) error
+	StreamChatLogs(ctx context.Context, sessionID, containerID, project string)
+	Stop(ctx context.Context, containerID string) error
+	WorkerImage() string
+	BuildChatAuthEnv(ctx context.Context) map[string]string
 }
 
 // Handler processes incoming webhooks from ContextMatrix.
@@ -170,6 +178,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.Handle("POST /promote", wrap(h.handlePromote, true))
 	mux.Handle("POST /end-session", wrap(h.handleEndSession, true))
 	mux.Handle("POST /refresh-knowledge", wrap(h.handleRefreshKnowledge, true))
+	mux.Handle("POST /chat/start", wrap(h.handleChatStart, true))
+	mux.Handle("POST /chat/end", wrap(h.handleChatEnd, true))
 	mux.Handle("GET /logs", wrap(h.handleLogs, true))
 	mux.Handle("GET /containers", wrap(h.handleListContainers, true))
 	mux.Handle("GET /health", wrap(h.handleHealth, false))
@@ -367,6 +377,7 @@ func (h *Handler) handleListContainers(w http.ResponseWriter, r *http.Request) {
 			ContainerID:   c.ContainerID,
 			ContainerName: c.ContainerName,
 			CardID:        c.CardID,
+			SessionID:     c.SessionID,
 			Project:       c.Project,
 			State:         c.State,
 			StartedAt:     c.StartedAt.UTC().Format(time.RFC3339),
@@ -492,6 +503,57 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
+
+		return
+	}
+
+	// Chat path: session_id is set — route to the chat tracker.
+	// Dedup cache is keyed on (project, card_id, message_id) which does not fit
+	// the chat model; dedup for chat sessions is deferred to a future iteration.
+	if payload.IsChat() {
+		if !h.tracker.HasChat(payload.SessionID) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "no chat container tracked")
+
+			return
+		}
+
+		b, err := streammsg.BuildUserMessage(payload.Content)
+		if err != nil {
+			h.logWarn("message: BuildUserMessage failed", "error", err.Error())
+			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
+
+			return
+		}
+
+		if err := h.tracker.WriteStdinChat(payload.SessionID, b); err != nil {
+			switch {
+			case errors.Is(err, tracker.ErrNotTracked):
+				writeError(w, http.StatusNotFound, CodeNotFound, "no chat container tracked")
+			case errors.Is(err, tracker.ErrStdinClosed):
+				writeError(w, http.StatusGone, CodeStdinClosed, "session ended")
+			case errors.Is(err, tracker.ErrNoStdinAttached):
+				writeError(w, http.StatusConflict, CodeConflict, "container is not interactive")
+			default:
+				h.logWarn("message: chat stdin write failed", "session_id", payload.SessionID, "error", err.Error())
+				writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
+			}
+
+			return
+		}
+
+		if h.broadcaster != nil {
+			h.broadcaster.Publish(logbroadcast.LogEntry{
+				Timestamp: time.Now(),
+				SessionID: payload.SessionID,
+				Type:      "user",
+				Content:   payload.Content,
+			})
+		}
+
+		h.logInfo("message: chat stdin written",
+			"session_id", payload.SessionID, "message_id", payload.MessageID, "content_len", len(payload.Content))
+
+		writeJSON(w, http.StatusAccepted, SuccessResponse{OK: true, MessageID: payload.MessageID})
 
 		return
 	}
@@ -868,6 +930,13 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	project := r.URL.Query().Get("project")
+	sessionID := r.URL.Query().Get("session_id")
+
+	if project != "" && sessionID != "" {
+		writeError(w, http.StatusBadRequest, CodeInvalidField, "project and session_id are mutually exclusive")
+
+		return
+	}
 
 	// Clear the write deadline — the server has a 30s WriteTimeout that would
 	// otherwise terminate the long-lived SSE connection. This depends on every
@@ -887,7 +956,17 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	// Subscribe before writing ": connected" so receiving that line is a
 	// client-observable guarantee that the subscription is live.
-	ch, unsubscribe := h.broadcaster.Subscribe(project)
+	var (
+		ch          <-chan logbroadcast.LogEntry
+		unsubscribe func()
+	)
+
+	if sessionID != "" {
+		ch, unsubscribe = h.broadcaster.SubscribeWithSessionID(sessionID)
+	} else {
+		ch, unsubscribe = h.broadcaster.Subscribe(project)
+	}
+
 	defer unsubscribe()
 
 	// Flush headers and send initial keepalive to trigger client onopen.
@@ -909,6 +988,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.Info("SSE log client connected",
 			"project_filter", project,
+			"session_id_filter", sessionID,
 			"remote_addr", r.RemoteAddr,
 		)
 	}
@@ -919,6 +999,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 			if h.logger != nil {
 				h.logger.Info("SSE log client disconnected",
 					"project_filter", project,
+					"session_id_filter", sessionID,
 					"remote_addr", r.RemoteAddr,
 				)
 			}
@@ -1018,7 +1099,8 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		if !cmhmac.VerifySignatureWithTimestamp(h.apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, skew) {
-			h.logWarn("webhook authentication failed", "remote_addr", r.RemoteAddr)
+			h.logWarn("webhook authentication failed",
+				"remote_addr", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
 			writeUnauthorized(w)
 
 			return

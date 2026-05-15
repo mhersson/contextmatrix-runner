@@ -308,6 +308,7 @@ func main() {
 // needing the full Manager dependency graph.
 type managerShutdowner interface {
 	Kill(project, cardID string) error
+	KillChat(ctx context.Context, sessionID string) error
 	Wait()
 	ForceKillContainer(ctx context.Context, containerID string) error
 }
@@ -383,6 +384,16 @@ func shutdown(d shutdownDeps) {
 
 	if d.tracker != nil && d.manager != nil {
 		for _, info := range d.tracker.AllSnapshots() {
+			if info.SessionID != "" {
+				d.logger.Info("killing chat container on shutdown", "session_id", info.SessionID)
+
+				if err := d.manager.KillChat(shutdownCtx, info.SessionID); err != nil {
+					d.logger.Warn("failed to kill chat container", "session_id", info.SessionID, "error", err)
+				}
+
+				continue
+			}
+
 			d.logger.Info("killing container on shutdown", "card_id", info.CardID, "project", info.Project)
 
 			if err := d.manager.Kill(info.Project, info.CardID); err != nil {

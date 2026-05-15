@@ -249,6 +249,24 @@ func ValidatePayload(p any) error {
 		return validateEndSession(v)
 	case EndSessionPayload:
 		return validateEndSession(&v)
+
+	case *ChatStartPayload:
+		if v == nil {
+			return nil
+		}
+
+		return validateChatStart(v)
+	case ChatStartPayload:
+		return validateChatStart(&v)
+
+	case *ChatEndPayload:
+		if v == nil {
+			return nil
+		}
+
+		return validateChatEnd(v)
+	case ChatEndPayload:
+		return validateChatEnd(&v)
 	}
 
 	return nil
@@ -298,12 +316,24 @@ func validateStopAll(p *StopAllPayload) error {
 }
 
 func validateMessage(p *MessagePayload) error {
-	if err := validateIdent("card_id", p.CardID); err != nil {
-		return err
-	}
+	if p.SessionID != "" {
+		// Chat mode: session_id only, card_id/project must be empty.
+		if p.CardID != "" || p.Project != "" {
+			return &ValidationError{Field: "session_id", Reason: "must not coexist with card_id/project"}
+		}
 
-	if err := validateIdent("project", p.Project); err != nil {
-		return err
+		if err := validateIdent("session_id", p.SessionID); err != nil {
+			return err
+		}
+	} else {
+		// Card mode: card_id + project required (existing behaviour).
+		if err := validateIdent("card_id", p.CardID); err != nil {
+			return err
+		}
+
+		if err := validateIdent("project", p.Project); err != nil {
+			return err
+		}
 	}
 
 	if err := validateContent(p.Content); err != nil {
@@ -327,6 +357,97 @@ func validateEndSession(p *EndSessionPayload) error {
 	}
 
 	return validateIdent("project", p.Project)
+}
+
+// chatModelPattern is the defense-in-depth allowlist for chat model IDs.
+// The authoritative allowlist (label, max_tokens) lives in CM config; this
+// pattern is the syntactic guardrail on the runner side so a malformed
+// model string never reaches docker.ContainerCreate as an env value.
+var chatModelPattern = regexp.MustCompile(`^claude-[a-z0-9.-]{1,64}$`)
+
+// chatResumeRolePattern restricts ResumeTurn.Role to the four shapes the
+// transcript builder emits.
+var chatResumeRolePattern = regexp.MustCompile(`^(user|assistant_text|tool_call|tool_result_summary)$`)
+
+const (
+	chatResumeMaxTurns        = 500
+	chatResumeMaxContentBytes = 4 * 1024
+)
+
+func validateChatStart(p *ChatStartPayload) error {
+	if err := validateIdent("session_id", p.SessionID); err != nil {
+		return err
+	}
+
+	// Project and repo_url are optional on /chat/start (the client may open a
+	// session without yet binding a project). Validate only when present.
+	if p.Project != "" {
+		if err := validateIdent("project", p.Project); err != nil {
+			return err
+		}
+	}
+
+	if p.RepoURL != "" {
+		if err := validateRepoURL(p.RepoURL); err != nil {
+			return err
+		}
+	}
+
+	if p.Model != "" {
+		if !chatModelPattern.MatchString(p.Model) {
+			return &ValidationError{
+				Field:  "model",
+				Reason: "must match " + chatModelPattern.String(),
+			}
+		}
+	}
+
+	if p.Resume != nil {
+		if err := validateChatResume(p.Resume); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateChatResume(r *ChatResumeContext) error {
+	if len(r.Turns) > chatResumeMaxTurns {
+		return &ValidationError{
+			Field:  "resume.turns",
+			Reason: fmt.Sprintf("too many turns: %d > %d", len(r.Turns), chatResumeMaxTurns),
+		}
+	}
+
+	for i, t := range r.Turns {
+		if !chatResumeRolePattern.MatchString(t.Role) {
+			return &ValidationError{
+				Field:  fmt.Sprintf("resume.turns[%d].role", i),
+				Reason: "must match " + chatResumeRolePattern.String(),
+			}
+		}
+
+		if len(t.Content) > chatResumeMaxContentBytes {
+			return &ValidationError{
+				Field: fmt.Sprintf("resume.turns[%d].content", i),
+				Reason: fmt.Sprintf("too long: %d > %d bytes",
+					len(t.Content), chatResumeMaxContentBytes),
+			}
+		}
+
+		if !utf8.ValidString(t.Content) {
+			return &ValidationError{
+				Field:  fmt.Sprintf("resume.turns[%d].content", i),
+				Reason: "must be valid UTF-8",
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateChatEnd(p *ChatEndPayload) error {
+	return validateIdent("session_id", p.SessionID)
 }
 
 // ValidateRefreshKnowledge mirrors ValidatePayload's rules for the refresh

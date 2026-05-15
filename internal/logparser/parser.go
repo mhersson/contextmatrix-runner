@@ -183,9 +183,21 @@ type event struct {
 	Message message `json:"message"`
 }
 
-// message holds the assistant's response content.
+// message holds the assistant's response content plus the model + usage
+// block Claude emits on each assistant turn. The chat-mode bridge in CM
+// uses these to drive the context-window indicator.
 type message struct {
+	Model   string         `json:"model"`
 	Content []contentBlock `json:"content"`
+	Usage   *usageBlock    `json:"usage,omitempty"`
+}
+
+// usageBlock mirrors Claude Code's assistant.message.usage JSON shape.
+type usageBlock struct {
+	InputTokens       int64 `json:"input_tokens"`
+	OutputTokens      int64 `json:"output_tokens"`
+	CacheReadTokens   int64 `json:"cache_read_input_tokens"`
+	CacheCreateTokens int64 `json:"cache_creation_input_tokens"`
 }
 
 // contentBlock represents a single block within a message.
@@ -422,6 +434,19 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 
 		if ev.Type != "assistant" {
 			continue
+		}
+
+		if ev.Message.Usage != nil && emit != nil {
+			emit(logbroadcast.LogEntry{
+				Type:  "usage",
+				Model: ev.Message.Model,
+				Usage: &logbroadcast.TokenUsage{
+					InputTokens:       ev.Message.Usage.InputTokens,
+					OutputTokens:      ev.Message.Usage.OutputTokens,
+					CacheReadTokens:   ev.Message.Usage.CacheReadTokens,
+					CacheCreateTokens: ev.Message.Usage.CacheCreateTokens,
+				},
+			})
 		}
 
 		for _, block := range ev.Message.Content {

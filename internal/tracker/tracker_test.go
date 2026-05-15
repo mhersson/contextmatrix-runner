@@ -862,3 +862,107 @@ func TestSetStdin_RemoveRace(t *testing.T) {
 		require.Error(t, err, "iter=%d WriteStdin must fail after Remove", iter)
 	}
 }
+
+func TestTracker_ChatLifecycle(t *testing.T) {
+	tr := New()
+	info := &ContainerInfo{
+		ContainerID: "c1",
+		SessionID:   "01HFK0",
+		Image:       "img",
+		StartedAt:   time.Now(),
+	}
+	require.NoError(t, tr.AddChat(info))
+	assert.True(t, tr.HasChat("01HFK0"))
+	snap, ok := tr.SnapshotChat("01HFK0")
+	require.True(t, ok)
+	assert.Equal(t, "c1", snap.ContainerID)
+	assert.Equal(t, "01HFK0", snap.SessionID)
+
+	// Duplicate Add fails.
+	err := tr.AddChat(info)
+	require.ErrorIs(t, err, ErrAlreadyTracked)
+
+	tr.RemoveChat("01HFK0")
+	assert.False(t, tr.HasChat("01HFK0"))
+}
+
+func TestTracker_ChatAndCardCoexist(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(&ContainerInfo{ContainerID: "card-1", CardID: "ALPHA-001", Project: "alpha"}))
+	require.NoError(t, tr.AddChat(&ContainerInfo{ContainerID: "chat-1", SessionID: "S1"}))
+	assert.Equal(t, 2, tr.Count())
+	assert.True(t, tr.Has("alpha", "ALPHA-001"))
+	assert.True(t, tr.HasChat("S1"))
+}
+
+func TestAddChatIfUnderLimit_Basic(t *testing.T) {
+	tr := New()
+
+	require.NoError(t, tr.AddChatIfUnderLimit(&ContainerInfo{SessionID: "S1"}, 3))
+	require.NoError(t, tr.AddChatIfUnderLimit(&ContainerInfo{SessionID: "S2"}, 3))
+	require.NoError(t, tr.AddChatIfUnderLimit(&ContainerInfo{SessionID: "S3"}, 3))
+
+	// At capacity.
+	err := tr.AddChatIfUnderLimit(&ContainerInfo{SessionID: "S4"}, 3)
+	require.ErrorIs(t, err, ErrLimitReached)
+
+	// Duplicate session.
+	err = tr.AddChatIfUnderLimit(&ContainerInfo{SessionID: "S1"}, 10)
+	require.ErrorIs(t, err, ErrAlreadyTracked)
+}
+
+// TestAddChatIfUnderLimit_SharesLimitWithCards ensures the chat concurrency
+// cap is enforced against the same total container count as card-mode, so a
+// runner cannot exceed its declared capacity by mixing both kinds.
+func TestAddChatIfUnderLimit_SharesLimitWithCards(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(&ContainerInfo{CardID: "C1", Project: "p"}))
+	require.NoError(t, tr.Add(&ContainerInfo{CardID: "C2", Project: "p"}))
+
+	// limit=2, already at capacity from card-mode adds → chat should be rejected.
+	err := tr.AddChatIfUnderLimit(&ContainerInfo{SessionID: "S1"}, 2)
+	require.ErrorIs(t, err, ErrLimitReached)
+}
+
+func TestAddChatIfUnderLimit_Concurrent(t *testing.T) {
+	const (
+		limit = 5
+		total = 50
+	)
+
+	tr := New()
+
+	var (
+		wg          sync.WaitGroup
+		successes   atomic.Int64
+		limitErrors atomic.Int64
+		otherErrors atomic.Int64
+	)
+
+	for i := range total {
+		wg.Go(func() {
+			ci := &ContainerInfo{
+				SessionID: "S-" + strconv.Itoa(i),
+				StartedAt: time.Now(),
+			}
+
+			err := tr.AddChatIfUnderLimit(ci, limit)
+			switch {
+			case err == nil:
+				successes.Add(1)
+			case strings.Contains(err.Error(), "limit reached"):
+				limitErrors.Add(1)
+			default:
+				otherErrors.Add(1)
+			}
+		})
+	}
+
+	wg.Wait()
+
+	assert.Equal(t, int64(limit), successes.Load(),
+		"exactly %d concurrent callers should succeed, got %d", limit, successes.Load())
+	assert.Equal(t, int64(total-limit), limitErrors.Load())
+	assert.Equal(t, int64(0), otherErrors.Load())
+	assert.Equal(t, limit, tr.Count())
+}

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -98,6 +99,8 @@ const (
 	LabelCardID = "contextmatrix.card_id"
 	// LabelProject stores the project name on the container.
 	LabelProject = "contextmatrix.project"
+	// LabelSessionID stores the chat session ID on chat-mode containers.
+	LabelSessionID = "contextmatrix.session_id"
 
 	imagePullTimeout = 5 * time.Minute
 	stopGracePeriod  = 10 // seconds
@@ -561,21 +564,20 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	// Apply highest-priority Claude auth method only.
 	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
+	// The auth-dir bind is shared with chat-mode via claudeAuthMount(); the
+	// env-based modes go through the secrets file (card-mode only — chat
+	// uses BuildChatAuthEnv to put them straight into HostConfig.Env).
 	var mounts []mount.Mount
 
-	switch {
-	case m.cfg.ClaudeAuthDir != "":
-		// Mount the auth directory; no auth env vars injected.
-		mounts = append(mounts, mount.Mount{
-			Type:     mount.TypeBind,
-			Source:   m.cfg.ClaudeAuthDir,
-			Target:   "/claude-auth",
-			ReadOnly: true,
-		})
-	case m.cfg.ClaudeOAuthToken != "":
-		secrets["CLAUDE_CODE_OAUTH_TOKEN"] = m.cfg.ClaudeOAuthToken
-	case m.cfg.AnthropicAPIKey != "":
-		secrets["ANTHROPIC_API_KEY"] = m.cfg.AnthropicAPIKey
+	if authMount, ok := m.claudeAuthMount(); ok {
+		mounts = append(mounts, authMount)
+	} else {
+		switch {
+		case m.cfg.ClaudeOAuthToken != "":
+			secrets["CLAUDE_CODE_OAUTH_TOKEN"] = m.cfg.ClaudeOAuthToken
+		case m.cfg.AnthropicAPIKey != "":
+			secrets["ANTHROPIC_API_KEY"] = m.cfg.AnthropicAPIKey
+		}
 	}
 
 	if m.cfg.TaskSkillsDir != "" {
@@ -607,7 +609,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	// Prepare secret delivery: try writing to a tmpfs file first. In dev mode,
 	// fall back to env-var delivery if the secrets dir is not writable.
-	delivery, err := m.prepareSecrets(payload, secrets)
+	delivery, err := m.prepareSecrets(sanitizeContainerName(payload.Project, payload.CardID), secrets)
 	if err != nil {
 		return "", secretDelivery{}, nil, fmt.Errorf("prepare secrets: %w", err)
 	}
@@ -645,16 +647,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	resp, err := m.docker.ContainerCreate(ctx,
 		containerCfg,
-		&container.HostConfig{
-			Mounts:      mounts,
-			ExtraHosts:  m.buildExtraHosts(ctx, payload.MCPURL),
-			CapDrop:     strslice.StrSlice{"ALL"},
-			SecurityOpt: []string{"no-new-privileges"},
-			Resources: container.Resources{
-				Memory:    m.cfg.ContainerMemoryLimit,
-				PidsLimit: &m.cfg.ContainerPidsLimit,
-			},
-		},
+		m.baseHostConfig(ctx, payload.MCPURL, mounts),
 		nil, nil, name,
 	)
 	if err != nil {
@@ -730,7 +723,10 @@ func isPermissionDenied(err error) bool {
 //     back to env-var delivery with a WARN log.
 //   - Any other error, or the same permission error in production mode, is
 //     returned unchanged so the caller fails closed.
-func (m *Manager) prepareSecrets(payload RunConfig, secrets map[string]string) (secretDelivery, error) {
+//
+// containerName is used (with a random nonce) to make the on-disk filename
+// human-recognisable and unique; it is not load-bearing for security.
+func (m *Manager) prepareSecrets(containerName string, secrets map[string]string) (secretDelivery, error) {
 	dir := m.cfg.SecretsDir
 	if dir == "" {
 		dir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
@@ -747,14 +743,14 @@ func (m *Manager) prepareSecrets(payload RunConfig, secrets map[string]string) (
 		return secretDelivery{}, fmt.Errorf("create secrets dir: %w", err)
 	}
 
-	// A 16-byte random nonce avoids collisions if the same card_id is
-	// re-triggered while a previous file is still being unlinked.
+	// A 16-byte random nonce avoids collisions if the same name is reused
+	// while a previous file is still being unlinked.
 	var nonce [8]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return secretDelivery{}, fmt.Errorf("generate secrets nonce: %w", err)
 	}
 
-	base := sanitizeContainerName(payload.Project, payload.CardID) + "-" + hex.EncodeToString(nonce[:]) + ".env"
+	base := containerName + "-" + hex.EncodeToString(nonce[:]) + ".env"
 	path := filepath.Join(dir, base)
 
 	f, err := m.createFile(path)
@@ -819,6 +815,166 @@ func (m *Manager) removeSecretsFile(d secretDelivery, log *slog.Logger) {
 
 	if err := os.Remove(d.FilePath); err != nil && !os.IsNotExist(err) {
 		log.Warn("failed to remove secrets file", "path", d.FilePath, "error", err)
+	}
+}
+
+// chatResumeMountTarget is the in-container path where the rehydration
+// payload files are bind-mounted. The entrypoint reads resume.jsonl from
+// here when CM_CHAT_RESUME=1 is set.
+const chatResumeMountTarget = "/run/cm-chat"
+
+// chatResumeDelivery is the result of prepareChatResume. DirPath is the
+// host directory that should be bind-mounted at chatResumeMountTarget;
+// empty when rehydration was not requested or could not be materialised.
+type chatResumeDelivery struct {
+	DirPath string
+}
+
+// chatResumeMeta is the JSON payload written to resume.meta.json. The
+// entrypoint surfaces this in the rehydration prompt so the agent knows
+// whether older turns were clipped.
+type chatResumeMeta struct {
+	PromptVersion int    `json:"prompt_version"`
+	Clipped       bool   `json:"clipped"`
+	TurnCount     int    `json:"turn_count"`
+	OrigSeqMax    int64  `json:"original_seq_max"`
+	SessionID     string `json:"session_id"`
+	Project       string `json:"project,omitempty"`
+}
+
+// prepareChatResume materialises the rehydration payload on disk so the
+// container can bind-mount it at /run/cm-chat/. Returns an empty
+// chatResumeDelivery on success when resume is nil. Errors bubble up so
+// the caller can degrade to a non-rehydrating start.
+//
+// Files written:
+//   - resume.jsonl: one JSON object per turn (Seq, Role, Content).
+//   - resume.meta.json: {prompt_version, clipped, turn_count, ...}
+//
+// Directory strategy: try SecretsDir (matches the secrets-file approach).
+// In dev mode SecretsDir is typically not writable on Linux because the
+// default is /var/run/cm-runner/secrets and the runner runs as a regular
+// user — fall back to a subdir of os.TempDir() with a WARN log. The
+// resume payload is operator-supplied transcript text (not a credential),
+// so a tmpfs/tmp-based mount is fine.
+func (m *Manager) prepareChatResume(containerName, sessionID, project string, resume *ChatResume) (chatResumeDelivery, error) {
+	if resume == nil {
+		return chatResumeDelivery{}, nil
+	}
+
+	baseDir := m.cfg.SecretsDir
+	if baseDir == "" {
+		baseDir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
+	}
+
+	if err := m.mkdirAll(baseDir, 0o700); err != nil {
+		if isPermissionDenied(err) && m.cfg.IsDev() {
+			tmpBase := filepath.Join(os.TempDir(), "cm-runner-chat-resume")
+			if mkErr := m.mkdirAll(tmpBase, 0o700); mkErr != nil {
+				return chatResumeDelivery{}, fmt.Errorf("create resume base dir (tmp fallback): %w", mkErr)
+			}
+
+			m.logger.Warn("dev profile: secrets_dir not writable, falling back to tmp for resume files",
+				"secrets_dir", baseDir, "tmp_dir", tmpBase, "error", err)
+
+			baseDir = tmpBase
+		} else {
+			return chatResumeDelivery{}, fmt.Errorf("create resume base dir: %w", err)
+		}
+	}
+
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return chatResumeDelivery{}, fmt.Errorf("generate resume nonce: %w", err)
+	}
+
+	dir := filepath.Join(baseDir, "cmr-chat-resume-"+containerName+"-"+hex.EncodeToString(nonce[:]))
+	if err := m.mkdirAll(dir, 0o700); err != nil {
+		return chatResumeDelivery{}, fmt.Errorf("create resume dir: %w", err)
+	}
+
+	jsonlPath := filepath.Join(dir, "resume.jsonl")
+	metaPath := filepath.Join(dir, "resume.meta.json")
+
+	jf, err := m.createFile(jsonlPath)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+
+		return chatResumeDelivery{}, fmt.Errorf("create resume.jsonl: %w", err)
+	}
+
+	for _, t := range resume.Turns {
+		line, err := json.Marshal(t)
+		if err != nil {
+			_ = jf.Close()
+			_ = os.RemoveAll(dir)
+
+			return chatResumeDelivery{}, fmt.Errorf("marshal resume turn seq=%d: %w", t.Seq, err)
+		}
+
+		if _, err := jf.Write(append(line, '\n')); err != nil {
+			_ = jf.Close()
+			_ = os.RemoveAll(dir)
+
+			return chatResumeDelivery{}, fmt.Errorf("write resume turn seq=%d: %w", t.Seq, err)
+		}
+	}
+
+	if err := jf.Close(); err != nil {
+		_ = os.RemoveAll(dir)
+
+		return chatResumeDelivery{}, fmt.Errorf("close resume.jsonl: %w", err)
+	}
+
+	meta := chatResumeMeta{
+		PromptVersion: 1,
+		Clipped:       resume.Clipped,
+		TurnCount:     len(resume.Turns),
+		OrigSeqMax:    resume.OrigSeq,
+		SessionID:     sessionID,
+		Project:       project,
+	}
+
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+
+		return chatResumeDelivery{}, fmt.Errorf("marshal resume meta: %w", err)
+	}
+
+	mf, err := m.createFile(metaPath)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+
+		return chatResumeDelivery{}, fmt.Errorf("create resume.meta.json: %w", err)
+	}
+
+	if _, err := mf.Write(metaBytes); err != nil {
+		_ = mf.Close()
+		_ = os.RemoveAll(dir)
+
+		return chatResumeDelivery{}, fmt.Errorf("write resume.meta.json: %w", err)
+	}
+
+	if err := mf.Close(); err != nil {
+		_ = os.RemoveAll(dir)
+
+		return chatResumeDelivery{}, fmt.Errorf("close resume.meta.json: %w", err)
+	}
+
+	return chatResumeDelivery{DirPath: dir}, nil
+}
+
+// removeChatResume best-effort unlinks the per-container resume directory.
+// No-op when the delivery is empty (rehydration wasn't requested or prep
+// failed before any files were written).
+func (m *Manager) removeChatResume(d chatResumeDelivery, log *slog.Logger) {
+	if d.DirPath == "" {
+		return
+	}
+
+	if err := os.RemoveAll(d.DirPath); err != nil && !os.IsNotExist(err) {
+		log.Warn("failed to remove resume dir", "path", d.DirPath, "error", err)
 	}
 }
 
@@ -1459,6 +1615,25 @@ func (m *Manager) Kill(project, cardID string) error {
 	return nil
 }
 
+// KillChat is the chat-mode equivalent of Kill. It closes the container's
+// stdin (so claude has a chance to flush its final stream-json batch) and then
+// calls Stop, giving the container its normal SIGTERM grace period before
+// SIGKILL. If no stdin has been attached yet (the window between AddChat and
+// SetStdinChat) the close is skipped and Stop is still called.
+func (m *Manager) KillChat(ctx context.Context, sessionID string) error {
+	snap, ok := m.tracker.SnapshotChat(sessionID)
+	if !ok {
+		return fmt.Errorf("KillChat: no chat container tracked for %s", sessionID)
+	}
+
+	if err := m.tracker.CloseStdinChat(sessionID); err != nil &&
+		!errors.Is(err, tracker.ErrNoStdinAttached) {
+		m.logger.Warn("KillChat: close stdin", "session_id", sessionID, "error", err)
+	}
+
+	return m.Stop(ctx, snap.ContainerID)
+}
+
 // ManagedContainer describes a Docker container labeled as runner-managed. It
 // is the ground-truth unit consumed by CM's reconcile sweep: a container is
 // listed here iff docker ps says so, regardless of whether the runner's
@@ -1468,6 +1643,7 @@ type ManagedContainer struct {
 	ContainerID   string
 	ContainerName string
 	CardID        string
+	SessionID     string
 	Project       string
 	State         string
 	StartedAt     time.Time
@@ -1479,11 +1655,12 @@ type ManagedContainer struct {
 // tracker currently has a matching entry; consumers can use the field to
 // detect tracker/Docker divergence without needing a second round-trip.
 //
-// Containers missing the card_id or project label are skipped — they are
-// neither reachable via /kill (which routes by labels) nor the sweep's
-// responsibility (the sweep correlates against CM cards, not arbitrary
-// docker containers). Such containers still exist in Docker and are caught
-// by CleanupOrphans on the next maintenance tick.
+// Two kinds are surfaced: card-mode containers (LabelCardID + LabelProject)
+// and chat-mode containers (LabelSessionID, LabelProject optional — a global
+// chat may have no project label). Containers with neither identifier set are
+// skipped — they are neither reachable via /kill (which routes by labels) nor
+// the sweep's responsibility. Such containers still exist in Docker and are
+// caught by CleanupOrphans on the next maintenance tick.
 func (m *Manager) ListManaged(ctx context.Context) ([]ManagedContainer, error) {
 	containers, err := m.docker.ContainerList(ctx, container.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("label", LabelRunner+"=true")),
@@ -1498,8 +1675,15 @@ func (m *Manager) ListManaged(ctx context.Context) ([]ManagedContainer, error) {
 	for _, ctr := range containers {
 		project := ctr.Labels[LabelProject]
 		cardID := ctr.Labels[LabelCardID]
+		sessionID := ctr.Labels[LabelSessionID]
 
-		if project == "" || cardID == "" {
+		// Card containers must carry project + card_id (chat containers may
+		// omit project for global chats).
+		if cardID != "" && project == "" {
+			continue
+		}
+		// At least one identifier must be present.
+		if cardID == "" && sessionID == "" {
 			continue
 		}
 
@@ -1510,14 +1694,25 @@ func (m *Manager) ListManaged(ctx context.Context) ([]ManagedContainer, error) {
 			name = strings.TrimPrefix(ctr.Names[0], "/")
 		}
 
+		tracked := false
+
+		if m.tracker != nil {
+			if sessionID != "" {
+				tracked = m.tracker.HasChat(sessionID)
+			} else {
+				tracked = m.tracker.Has(project, cardID)
+			}
+		}
+
 		result = append(result, ManagedContainer{
 			ContainerID:   ctr.ID,
 			ContainerName: name,
 			CardID:        cardID,
+			SessionID:     sessionID,
 			Project:       project,
 			State:         ctr.State,
 			StartedAt:     time.Unix(ctr.Created, 0).UTC(),
-			Tracked:       m.tracker != nil && m.tracker.Has(project, cardID),
+			Tracked:       tracked,
 		})
 	}
 
@@ -1614,15 +1809,23 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 
 	// Filter out containers still present in the in-memory tracker. Without
 	// this, the maintenance loop would kill every active worker container
-	// on every tick.
+	// on every tick. Chat containers are tracked by LabelSessionID instead
+	// of LabelCardID, so the chat path is checked separately.
 	orphans := make([]DockerContainer, 0, len(containers))
 	skipped := 0
 
 	for _, ctr := range containers {
 		project := ctr.Labels[LabelProject]
 		cardID := ctr.Labels[LabelCardID]
+		sessionID := ctr.Labels[LabelSessionID]
 
 		if m.tracker != nil && project != "" && cardID != "" && m.tracker.Has(project, cardID) {
+			skipped++
+
+			continue
+		}
+
+		if m.tracker != nil && sessionID != "" && m.tracker.HasChat(sessionID) {
 			skipped++
 
 			continue
@@ -1638,6 +1841,7 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 		m.logger.Info("cleaning up orphan container",
 			"container_id", idShort,
 			"card_id", ctr.Labels[LabelCardID],
+			"session_id", ctr.Labels[LabelSessionID],
 			"project", ctr.Labels[LabelProject],
 		)
 
@@ -1654,6 +1858,7 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 			m.logger.Warn("orphan stop failed",
 				"container_id", idShort,
 				"card_id", ctr.Labels[LabelCardID],
+				"session_id", ctr.Labels[LabelSessionID],
 				"project", ctr.Labels[LabelProject],
 				"error", stopErr,
 			)
@@ -1668,6 +1873,7 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 			m.logger.Warn("orphan remove failed",
 				"container_id", idShort,
 				"card_id", ctr.Labels[LabelCardID],
+				"session_id", ctr.Labels[LabelSessionID],
 				"project", ctr.Labels[LabelProject],
 				"error", rmErr,
 			)
@@ -1840,4 +2046,468 @@ func (m *Manager) buildExtraHosts(_ context.Context, mcpURL string) []string {
 	m.logger.Info("added MCP host to container", "hostname", hostname, "ip", addrs[0])
 
 	return hosts
+}
+
+// StartChatOpts configures a chat-mode container spawn.
+type StartChatOpts struct {
+	// SessionID is required; the container is labelled and the CM_CHAT_SESSION
+	// env var is set to this value.
+	SessionID string
+	// Project is optional; sets CM_CHAT_PROJECT when non-empty.
+	Project string
+	// RepoURL is optional; sets CM_CHAT_REPO_URL when non-empty.
+	RepoURL string
+	// MCPURL is the URL the in-container claude uses to reach CM's MCP
+	// endpoint (e.g. http://host.docker.internal:8080/mcp). Sets
+	// CM_MCP_URL. Without this, the entrypoint skips the MCP merge and
+	// chat sessions cannot call ContextMatrix tools.
+	MCPURL string
+	// MCPAPIKey authenticates MCP calls. Sets CM_MCP_API_KEY. Empty is
+	// permitted when CM's MCP listener has no auth (loopback dev mode).
+	MCPAPIKey string
+	// AuthEnv contains Claude auth and git token vars (e.g. ANTHROPIC_API_KEY,
+	// CM_GIT_TOKEN). The caller builds this map — typically via buildAuthEnv or
+	// equivalent — and all entries are merged into the container env.
+	AuthEnv map[string]string
+	// Model is the Claude model the chat container should run. Sets
+	// CM_ORCHESTRATOR_MODEL; the entrypoint passes this to `claude --model`.
+	// Empty falls back to the entrypoint default (claude-sonnet-4-6).
+	Model string
+	// Resume, when non-nil, makes the runner write /run/cm-chat/resume.jsonl
+	// and /run/cm-chat/resume.meta.json into the container and set
+	// CM_CHAT_RESUME=1. The entrypoint switches to the rehydration prompt
+	// branch when this flag is present.
+	Resume *ChatResume
+}
+
+// ChatResume mirrors the wire shape of the rehydration payload. Defined
+// here (rather than re-using webhook.ChatResumeContext) so the container
+// package has no upward dependency on webhook types.
+type ChatResume struct {
+	Turns   []ChatResumeTurn
+	Clipped bool
+	OrigSeq int64
+}
+
+// ChatResumeTurn is one filtered, possibly summarized transcript entry.
+type ChatResumeTurn struct {
+	Seq     int64  `json:"seq"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// StartChat creates and starts a chat-mode worker container. The container
+// runs claude in stream-json mode; the entrypoint dispatches on
+// CM_CHAT_SESSION. Returns the container ID. The caller is responsible for
+// (1) registering the container in the tracker via AddChat, and (2) attaching
+// stdin via AttachChatStdin so /message webhooks can route user turns in.
+func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, error) {
+	if opts.SessionID == "" {
+		return "", fmt.Errorf("StartChat: SessionID is required")
+	}
+
+	img := m.cfg.BaseImage
+
+	m.logger.Info("chat container: starting",
+		"session_id", opts.SessionID,
+		"project", opts.Project,
+		"image", img)
+
+	// Pull image according to policy.
+	if err := m.pullImage(ctx, img); err != nil {
+		return "", fmt.Errorf("StartChat: pull image: %w", err)
+	}
+
+	// Build env — chat-specific, non-secret values only. Secrets
+	// (CM_MCP_API_KEY plus every entry of opts.AuthEnv) are routed through
+	// prepareSecrets so they land on a tmpfs file bind-mounted into the
+	// container at /run/cm-secrets/env. This keeps them out of
+	// container.Config.Env where `docker inspect` would leak them.
+	env := []string{
+		"CM_CHAT_SESSION=" + opts.SessionID,
+	}
+	if opts.Project != "" {
+		env = append(env, "CM_CHAT_PROJECT="+opts.Project)
+	}
+
+	if opts.RepoURL != "" {
+		env = append(env, "CM_CHAT_REPO_URL="+opts.RepoURL)
+	}
+
+	if opts.MCPURL != "" {
+		env = append(env, "CM_MCP_URL="+opts.MCPURL)
+	}
+
+	if opts.Model != "" {
+		env = append(env, "CM_ORCHESTRATOR_MODEL="+opts.Model)
+	}
+
+	// Build the chat-mode secrets map. AuthEnv is treated as opaque-but-
+	// sensitive: the runner only ever populates it via BuildChatAuthEnv which
+	// puts auth credentials (git token, Claude OAuth, Anthropic API key) in
+	// there. Anything the caller passes is moved to tmpfs alongside MCPAPIKey.
+	secrets := make(map[string]string, len(opts.AuthEnv)+1)
+
+	for k, v := range opts.AuthEnv {
+		if v != "" {
+			secrets[k] = v
+		}
+	}
+
+	if opts.MCPAPIKey != "" {
+		secrets["CM_MCP_API_KEY"] = opts.MCPAPIKey
+	}
+
+	// Sanitise a container name from session ID (may contain arbitrary chars).
+	name := "cmr-chat-" + containerNameRe.ReplaceAllString(strings.ToLower(opts.SessionID), "-")
+
+	delivery, err := m.prepareSecrets(name, secrets)
+	if err != nil {
+		return "", fmt.Errorf("StartChat: prepare secrets: %w", err)
+	}
+
+	// Materialise the rehydration payload (resume.jsonl + resume.meta.json)
+	// into a per-container directory so it can be bind-mounted at
+	// /run/cm-chat/. Failure here is non-fatal — the container starts
+	// without rehydration and the entrypoint detects the missing file.
+	var resumeDelivery chatResumeDelivery
+
+	if opts.Resume != nil {
+		var resumeErr error
+
+		resumeDelivery, resumeErr = m.prepareChatResume(name, opts.SessionID, opts.Project, opts.Resume)
+		if resumeErr != nil {
+			m.logger.Warn("StartChat: rehydration file prep failed; starting fresh agent",
+				"session_id", opts.SessionID, "error", resumeErr)
+		} else {
+			env = append(env, "CM_CHAT_RESUME=1")
+		}
+	}
+
+	containerCfg := &container.Config{
+		Image: img,
+		Env:   env,
+		Labels: map[string]string{
+			LabelRunner:    "true",
+			LabelSessionID: opts.SessionID,
+		},
+		OpenStdin:   true,
+		AttachStdin: true,
+		// Tty and StdinOnce intentionally left false.
+	}
+	if opts.Project != "" {
+		containerCfg.Labels[LabelProject] = opts.Project
+	}
+
+	// Auth-dir bind mount is shared with card-mode. Env-based Claude modes
+	// (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) now flow through the
+	// secrets file, not env.
+	var mounts []mount.Mount
+	if authMount, ok := m.claudeAuthMount(); ok {
+		mounts = append(mounts, authMount)
+	}
+
+	switch delivery.Mode {
+	case secretModeFile:
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   delivery.FilePath,
+			Target:   secretsMountTarget,
+			ReadOnly: true,
+		})
+	case secretModeEnvVar:
+		env = append(env, delivery.EnvVars...)
+		containerCfg.Env = env
+	}
+
+	if resumeDelivery.DirPath != "" {
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   resumeDelivery.DirPath,
+			Target:   chatResumeMountTarget,
+			ReadOnly: true,
+		})
+	}
+
+	// Keep containerCfg.Env in sync with env (in case secretModeEnvVar or
+	// CM_CHAT_RESUME mutations happened after the initial assignment).
+	containerCfg.Env = env
+
+	resp, err := m.docker.ContainerCreate(ctx, containerCfg, m.baseHostConfig(ctx, opts.MCPURL, mounts), nil, nil, name)
+	if err != nil {
+		m.removeSecretsFile(delivery, m.logger)
+		m.removeChatResume(resumeDelivery, m.logger)
+
+		return "", fmt.Errorf("StartChat: create container: %w", err)
+	}
+
+	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		// Clean up the created-but-not-started container.
+		rmCtx, rmCancel := withDockerCleanupTimeout(ctx)
+		defer rmCancel()
+
+		if rmErr := m.docker.ContainerRemove(rmCtx, resp.ID, container.RemoveOptions{Force: true}); rmErr != nil {
+			m.logger.Warn("StartChat: failed to remove container after start failure",
+				"container_id", resp.ID, "error", rmErr)
+		}
+
+		m.removeSecretsFile(delivery, m.logger)
+		m.removeChatResume(resumeDelivery, m.logger)
+
+		return "", fmt.Errorf("StartChat: start container: %w", err)
+	}
+
+	m.logger.Info("chat container: started",
+		"session_id", opts.SessionID, "container_id", resp.ID, "name", name,
+		"resume_active", resumeDelivery.DirPath != "")
+
+	m.waitAndCleanupChat(opts.SessionID, resp.ID, opts.Project, delivery, resumeDelivery)
+
+	return resp.ID, nil
+}
+
+// waitAndCleanupChat launches a wg-tracked goroutine that waits for the chat
+// container to exit (any reason — claude crash, OOM, external kill, or a
+// /chat/end-triggered Stop) and then unconditionally removes the tracker
+// entry and force-removes the container.
+//
+// /chat/end already performs this teardown explicitly, so the goroutine
+// races it; that's fine — every step is idempotent (RemoveChat tolerates
+// missing entries; ContainerRemove on a removed container is logged and
+// swallowed). The point of this goroutine is to catch the *implicit* exit
+// paths where /chat/end is never called: claude crash, OOM, exec failure,
+// or `docker kill` from outside the runner. Without it those paths would
+// leak the tracker entry until the runner restarts.
+//
+// Uses context.Background() so the wait survives the request ctx that
+// kicked off /chat/start. The associated log-stream goroutine (from
+// StreamChatLogs) exits on its own when ContainerLogs EOFs on container
+// removal, so no explicit cancel is required here.
+func (m *Manager) waitAndCleanupChat(sessionID, containerID, project string, delivery secretDelivery, resumeDelivery chatResumeDelivery) {
+	m.wg.Add(1)
+
+	go func() {
+		defer m.wg.Done()
+
+		log := m.logger.With("session_id", sessionID, "container_id", containerID, "project", project)
+
+		ctx := context.Background()
+
+		waitCh, errCh := m.docker.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+
+		select {
+		case result := <-waitCh:
+			log.Info("chat container: exited",
+				"exit_code", result.StatusCode)
+		case err := <-errCh:
+			log.Warn("chat container: wait error", "error", err)
+		}
+
+		m.tracker.RemoveChat(sessionID)
+
+		rmCtx, cancel := withDockerCleanupTimeout(ctx)
+		defer cancel()
+
+		m.removeContainer(rmCtx, containerID, log)
+
+		// Unlink the per-container secrets file (no-op in env-fallback mode).
+		m.removeSecretsFile(delivery, log)
+		m.removeChatResume(resumeDelivery, log)
+	}()
+}
+
+// AttachChatStdin opens the chat container's stdin and registers the writer
+// with the tracker under the given sessionID. Without this, /message webhooks
+// cannot route user turns into the running claude process. Must be called
+// AFTER tracker.AddChat for the session.
+func (m *Manager) AttachChatStdin(ctx context.Context, sessionID, containerID string) error {
+	attached, err := m.docker.ContainerAttach(ctx, containerID, container.AttachOptions{
+		Stream: true,
+		Stdin:  true,
+		Stdout: false,
+		Stderr: false,
+	})
+	if err != nil {
+		return fmt.Errorf("AttachChatStdin: %w", err)
+	}
+
+	m.tracker.SetStdinChat(sessionID, attached.Conn, attached.Close)
+	m.logger.Info("chat container: stdin attached",
+		"session_id", sessionID, "container_id", containerID)
+
+	return nil
+}
+
+// StreamChatLogs follows the chat container's stdout/stderr in a background
+// goroutine and republishes claude stream-json events as LogEntry values on
+// the broadcaster, keyed by sessionID. The goroutine exits when ctx is
+// cancelled or the log reader EOFs (container exit). Caller must hold a
+// reference to ctx and cancel it on session end or shutdown; the goroutine is
+// tracked by m.wg so Wait() drains it.
+func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, project string) {
+	m.wg.Add(1)
+
+	go func() {
+		defer m.wg.Done()
+
+		log := m.logger.With("session_id", sessionID, "container_id", containerID)
+
+		reader, err := m.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
+			ShowStdout: true,
+			ShowStderr: true,
+			Follow:     true,
+		})
+		if err != nil {
+			log.Warn("chat container: ContainerLogs failed", "error", err)
+
+			return
+		}
+
+		defer func() { _ = reader.Close() }()
+
+		stdoutPr, stdoutPw := io.Pipe()
+		stderrPr, stderrPw := io.Pipe()
+
+		go func() {
+			defer func() { _ = stdoutPw.Close(); _ = stderrPw.Close() }()
+
+			_, _ = stdcopy.StdCopy(stdoutPw, stderrPw, reader)
+		}()
+
+		go func() {
+			scanner := bufio.NewScanner(stderrPr)
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+			for scanner.Scan() {
+				line := scanner.Text()
+				log.Warn("chat container stderr", "line", line)
+
+				if m.broadcaster != nil {
+					m.broadcaster.Publish(logbroadcast.LogEntry{
+						Timestamp: time.Now(),
+						SessionID: sessionID,
+						Project:   project,
+						Type:      "stderr",
+						Content:   line,
+					})
+				}
+			}
+		}()
+
+		emit := func(e logbroadcast.LogEntry) {
+			if m.broadcaster == nil {
+				return
+			}
+
+			e.Timestamp = time.Now()
+			e.SessionID = sessionID
+			e.Project = project
+			e.CardID = ""
+			m.broadcaster.Publish(e)
+		}
+
+		logparser.ProcessStream(stdoutPr, log, emit)
+
+		log.Info("chat container: log stream ended")
+	}()
+}
+
+// Stop stops and force-removes a container by ID. It is a thin wrapper used
+// for rollback on /chat/start when tracker registration fails after the
+// container is already running. Errors are collected but not fatal — the
+// caller logs and moves on.
+func (m *Manager) Stop(ctx context.Context, containerID string) error {
+	stopCtx, stopCancel := withDockerCleanupTimeout(ctx)
+	defer stopCancel()
+
+	grace := stopGracePeriod
+
+	var errs []error
+
+	if err := m.docker.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace}); err != nil {
+		errs = append(errs, fmt.Errorf("stop: %w", err))
+	}
+
+	rmCtx, rmCancel := withDockerCleanupTimeout(ctx)
+	defer rmCancel()
+
+	if err := m.docker.ContainerRemove(rmCtx, containerID, container.RemoveOptions{Force: true}); err != nil {
+		errs = append(errs, fmt.Errorf("remove: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
+// WorkerImage returns the configured base image name. Used by the webhook
+// handler to record which image a chat container was started from.
+func (m *Manager) WorkerImage() string {
+	return m.cfg.BaseImage
+}
+
+// claudeAuthMount returns the read-only bind for the host's Claude auth dir
+// when m.cfg.ClaudeAuthDir is configured, plus true; otherwise the zero
+// Mount and false. Both card-mode and chat-mode use this so the auth
+// priority cascade (claude_auth_dir > claude_oauth_token > anthropic_api_key)
+// stays consistent across modes.
+func (m *Manager) claudeAuthMount() (mount.Mount, bool) {
+	if m.cfg.ClaudeAuthDir == "" {
+		return mount.Mount{}, false
+	}
+
+	return mount.Mount{
+		Type:     mount.TypeBind,
+		Source:   m.cfg.ClaudeAuthDir,
+		Target:   "/claude-auth",
+		ReadOnly: true,
+	}, true
+}
+
+// baseHostConfig assembles the HostConfig pieces every spawned worker shares:
+// security (CapDrop ALL, no-new-privileges), resource limits, ExtraHosts
+// (host.docker.internal + the resolved MCP host), and the caller-supplied
+// mount set. Card-mode and chat-mode both call this so future changes to
+// the security/resource posture land in one place.
+func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mount.Mount) *container.HostConfig {
+	return &container.HostConfig{
+		Mounts:      mounts,
+		ExtraHosts:  m.buildExtraHosts(ctx, mcpURL),
+		CapDrop:     strslice.StrSlice{"ALL"},
+		SecurityOpt: []string{"no-new-privileges"},
+		Resources: container.Resources{
+			Memory:    m.cfg.ContainerMemoryLimit,
+			PidsLimit: &m.cfg.ContainerPidsLimit,
+		},
+	}
+}
+
+// BuildChatAuthEnv builds the auth environment map for chat containers. It
+// generates a GitHub token (for git operations) and selects the Claude auth
+// method from config. The returned map is merged into StartChatOpts.AuthEnv.
+func (m *Manager) BuildChatAuthEnv(ctx context.Context) map[string]string {
+	env := make(map[string]string)
+
+	if m.token != nil {
+		tok, _, err := m.token.GenerateToken(ctx)
+		if err == nil && tok != "" {
+			env["CM_GIT_TOKEN"] = tok
+		} else if err != nil && m.logger != nil {
+			m.logger.Warn("BuildChatAuthEnv: github token generation failed", "error", err)
+		}
+	}
+
+	// Apply Claude auth priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
+	// The auth-dir bind is added by claudeAuthMount(); if it is in play, do
+	// NOT also inject env-based credentials — matches card-mode cascade.
+	if m.cfg.ClaudeAuthDir != "" {
+		return env
+	}
+
+	switch {
+	case m.cfg.ClaudeOAuthToken != "":
+		env["CLAUDE_CODE_OAUTH_TOKEN"] = m.cfg.ClaudeOAuthToken
+	case m.cfg.AnthropicAPIKey != "":
+		env["ANTHROPIC_API_KEY"] = m.cfg.AnthropicAPIKey
+	}
+
+	return env
 }

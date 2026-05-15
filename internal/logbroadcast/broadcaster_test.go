@@ -234,16 +234,16 @@ func TestProjectFiltering(t *testing.T) {
 	b.Publish(makeEntry("proj-gamma"))
 
 	// All-projects subscriber should get 3 entries.
-	gotAll := drainWithTimeout(t, chAll, 3, time.Second)
+	gotAll := drainWithTimeout(t, chAll, 3)
 	assert.Len(t, gotAll, 3)
 
 	// proj-alpha subscriber should get exactly 1 entry.
-	gotA := drainWithTimeout(t, chA, 1, time.Second)
+	gotA := drainWithTimeout(t, chA, 1)
 	require.Len(t, gotA, 1)
 	assert.Equal(t, "proj-alpha", gotA[0].Project)
 
 	// proj-beta subscriber should get exactly 1 entry.
-	gotB := drainWithTimeout(t, chB, 1, time.Second)
+	gotB := drainWithTimeout(t, chB, 1)
 	require.Len(t, gotB, 1)
 	assert.Equal(t, "proj-beta", gotB[0].Project)
 
@@ -256,11 +256,13 @@ func TestProjectFiltering(t *testing.T) {
 	}
 }
 
-// drainWithTimeout reads up to n entries from ch within the given timeout.
-func drainWithTimeout(t *testing.T, ch <-chan logbroadcast.LogEntry, n int, timeout time.Duration) []logbroadcast.LogEntry {
+// drainWithTimeout reads up to n entries from ch within a 1-second budget.
+// All callers in this file use the same budget; if a future caller needs a
+// different one, restore the timeout parameter.
+func drainWithTimeout(t *testing.T, ch <-chan logbroadcast.LogEntry, n int) []logbroadcast.LogEntry {
 	t.Helper()
 
-	deadline := time.After(timeout)
+	deadline := time.After(time.Second)
 
 	out := make([]logbroadcast.LogEntry, 0, n)
 	for range n {
@@ -338,6 +340,62 @@ func TestUserEntryNotRedacted(t *testing.T) {
 			"user entry content must not be redacted by the broadcaster")
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for user entry")
+	}
+}
+
+// TestLogBroadcaster_SessionIDFilter verifies that a SubscribeWithSessionID
+// subscriber only receives entries whose SessionID matches the registered value,
+// while a project subscriber and an all-entries subscriber behave normally.
+func TestLogBroadcaster_SessionIDFilter(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+
+	chAll, unsubAll := b.Subscribe("")                        // receives all
+	chSessA, unsubA := b.SubscribeWithSessionID("sess-alpha") // only sess-alpha
+	chSessB, unsubB := b.SubscribeWithSessionID("sess-beta")  // only sess-beta
+	chProj, unsubProj := b.Subscribe("proj-card")             // only proj-card entries
+
+	defer unsubAll()
+	defer unsubA()
+	defer unsubB()
+	defer unsubProj()
+
+	// Publish three entries: one for sess-alpha, one for sess-beta, one card entry.
+	b.Publish(logbroadcast.LogEntry{SessionID: "sess-alpha", Type: "text", Content: "from alpha"})
+	b.Publish(logbroadcast.LogEntry{SessionID: "sess-beta", Type: "text", Content: "from beta"})
+	b.Publish(logbroadcast.LogEntry{Project: "proj-card", CardID: "CARD-1", Type: "text", Content: "from card"})
+
+	// All-entries subscriber gets all three.
+	gotAll := drainWithTimeout(t, chAll, 3)
+	assert.Len(t, gotAll, 3)
+
+	// sess-alpha subscriber gets exactly the alpha entry.
+	gotA := drainWithTimeout(t, chSessA, 1)
+	require.Len(t, gotA, 1)
+	assert.Equal(t, "sess-alpha", gotA[0].SessionID)
+	assert.Equal(t, "from alpha", gotA[0].Content)
+
+	// sess-beta subscriber gets exactly the beta entry.
+	gotB := drainWithTimeout(t, chSessB, 1)
+	require.Len(t, gotB, 1)
+	assert.Equal(t, "sess-beta", gotB[0].SessionID)
+	assert.Equal(t, "from beta", gotB[0].Content)
+
+	// proj-card subscriber gets only the card entry.
+	gotProj := drainWithTimeout(t, chProj, 1)
+	require.Len(t, gotProj, 1)
+	assert.Equal(t, "proj-card", gotProj[0].Project)
+
+	// Verify no extra entries leaked to session subscribers.
+	select {
+	case extra := <-chSessA:
+		t.Fatalf("sess-alpha subscriber received unexpected entry: %+v", extra)
+	default:
+	}
+
+	select {
+	case extra := <-chSessB:
+		t.Fatalf("sess-beta subscriber received unexpected entry: %+v", extra)
+	default:
 	}
 }
 
