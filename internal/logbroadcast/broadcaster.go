@@ -27,17 +27,33 @@ const (
 // LogEntry represents a single log entry emitted by a runner container.
 type LogEntry struct {
 	Timestamp time.Time `json:"ts"`
-	CardID    string    `json:"card_id"`
-	Project   string    `json:"project"`
-	// Type is one of: text, thinking, tool_call, stderr, system, user.
+	CardID    string    `json:"card_id,omitempty"`
+	Project   string    `json:"project,omitempty"`
+	SessionID string    `json:"session_id,omitempty"`
+	// Type is one of: text, thinking, tool_call, stderr, system, user, usage.
 	// "user" is a message submitted via the HITL chat input — published
 	// directly by the /message webhook handler, bypassing logparser.Redact.
-	Type    string `json:"type"`
-	Content string `json:"content"`
+	// "usage" carries Claude's stream-json usage block (Usage field) and
+	// the responding model (Model field); Content is empty for these.
+	Type    string      `json:"type"`
+	Content string      `json:"content,omitempty"`
+	Usage   *TokenUsage `json:"usage,omitempty"`
+	Model   string      `json:"model,omitempty"`
+}
+
+// TokenUsage carries the per-turn context window accounting reported by
+// Claude in its stream-json output. Wire shape consumed by CM's chat
+// manager: input + cache_read + cache_create ≈ the prompt size Claude
+// actually processed.
+type TokenUsage struct {
+	InputTokens       int64 `json:"input_tokens"`
+	OutputTokens      int64 `json:"output_tokens"`
+	CacheReadTokens   int64 `json:"cache_read_tokens"`
+	CacheCreateTokens int64 `json:"cache_creation_tokens"`
 }
 
 // subscriber represents a single log subscriber with a buffered channel and
-// an optional project filter.
+// an optional project or session filter.
 //
 // Concurrency: once Publish releases the broadcaster's RWMutex (see below)
 // it sends to sub.ch without the broadcaster lock. A concurrent Unsubscribe
@@ -49,15 +65,23 @@ type LogEntry struct {
 // channel op) the per-subscriber mutex does not reintroduce the starvation
 // the broadcaster-wide lock caused. See CTXRUN-059 (H25).
 type subscriber struct {
-	ch      chan LogEntry
-	project string // empty means "all projects"
+	ch        chan LogEntry
+	project   string // empty means "all projects" (when sessionID is also empty)
+	sessionID string // non-empty means filter on entry.SessionID
 
 	closeMu sync.RWMutex
 	closed  bool
 }
 
 // matches reports whether this subscriber should receive the given entry.
+// If sessionID is set, only entries with a matching SessionID are delivered.
+// If project is set, only entries with a matching Project are delivered.
+// If both are empty, all entries are delivered.
 func (s *subscriber) matches(entry LogEntry) bool {
+	if s.sessionID != "" {
+		return entry.SessionID == s.sessionID
+	}
+
 	return s.project == "" || s.project == entry.Project
 }
 
@@ -190,6 +214,38 @@ func (b *Broadcaster) Subscribe(project string) (<-chan LogEntry, func()) {
 		// locks is the whole reason the broadcaster-wide RLock can be
 		// dropped before the send without re-introducing a send-on-closed
 		// race.
+		sub.closeMu.Lock()
+		sub.closed = true
+		close(sub.ch)
+		sub.closeMu.Unlock()
+	}
+}
+
+// SubscribeWithSessionID registers a new subscriber filtered to a single chat
+// session. Only entries whose SessionID equals sessionID are delivered. The
+// returned channel and unsubscribe function follow the same semantics as
+// Subscribe.
+func (b *Broadcaster) SubscribeWithSessionID(sessionID string) (<-chan LogEntry, func()) {
+	sub := &subscriber{
+		ch:        make(chan LogEntry, subscriberBufferSize),
+		sessionID: sessionID,
+	}
+
+	b.mu.Lock()
+	b.subscribers[sub] = struct{}{}
+	b.mu.Unlock()
+
+	return sub.ch, func() {
+		b.mu.Lock()
+		if _, ok := b.subscribers[sub]; !ok {
+			b.mu.Unlock()
+
+			return
+		}
+
+		delete(b.subscribers, sub)
+		b.mu.Unlock()
+
 		sub.closeMu.Lock()
 		sub.closed = true
 		close(sub.ch)

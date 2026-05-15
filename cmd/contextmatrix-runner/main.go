@@ -308,6 +308,7 @@ func main() {
 // needing the full Manager dependency graph.
 type managerShutdowner interface {
 	Kill(project, cardID string) error
+	KillChat(ctx context.Context, sessionID string) error
 	Wait()
 	ForceKillContainer(ctx context.Context, containerID string) error
 }
@@ -383,6 +384,16 @@ func shutdown(d shutdownDeps) {
 
 	if d.tracker != nil && d.manager != nil {
 		for _, info := range d.tracker.AllSnapshots() {
+			if info.SessionID != "" {
+				d.logger.Info("killing chat container on shutdown", "session_id", info.SessionID)
+
+				if err := d.manager.KillChat(shutdownCtx, info.SessionID); err != nil {
+					d.logger.Warn("failed to kill chat container", "session_id", info.SessionID, "error", err)
+				}
+
+				continue
+			}
+
 			d.logger.Info("killing container on shutdown", "card_id", info.CardID, "project", info.Project)
 
 			if err := d.manager.Kill(info.Project, info.CardID); err != nil {
@@ -446,6 +457,7 @@ func shutdown(d shutdownDeps) {
 type maintenanceTarget interface {
 	CleanupOrphans(ctx context.Context) error
 	PruneImages(ctx context.Context) error
+	SweepStaleChatResumeDirs(maxAge time.Duration)
 }
 
 // maintenanceHealth narrows *webhook.HealthState down to what the loop
@@ -472,6 +484,7 @@ func (a healthDrainAdapter) DrainingLoad() bool {
 var (
 	maintenanceCleanupTimeout = 30 * time.Second
 	maintenancePruneTimeout   = 60 * time.Second
+	maintenanceSweepResumeAge = time.Hour
 )
 
 // runMaintenanceLoop ticks every interval and runs CleanupOrphans + PruneImages.
@@ -512,9 +525,9 @@ func runMaintenanceLoopWithHealth(ctx context.Context, mgr maintenanceTarget, in
 	}
 }
 
-// runMaintenanceTick executes one pass of CleanupOrphans + PruneImages. Each
-// Docker call gets a fresh bounded child of ctx so a wedged daemon cannot
-// stall the loop past the next tick.
+// runMaintenanceTick executes one pass of CleanupOrphans + PruneImages +
+// SweepStaleChatResumeDirs. Each Docker call gets a fresh bounded child of ctx
+// so a wedged daemon cannot stall the loop past the next tick.
 func runMaintenanceTick(ctx context.Context, mgr maintenanceTarget, logger *slog.Logger) {
 	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, maintenanceCleanupTimeout)
 
@@ -531,6 +544,8 @@ func runMaintenanceTick(ctx context.Context, mgr maintenanceTarget, logger *slog
 	}
 
 	pruneCancel()
+
+	mgr.SweepStaleChatResumeDirs(maintenanceSweepResumeAge)
 }
 
 // buildProbes returns the preflight Probes wired to the real

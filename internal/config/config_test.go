@@ -1534,7 +1534,6 @@ func TestValidate_WorkerExtraEnv(t *testing.T) {
 
 		cfg := baseCfg()
 		cfg.WorkerExtraEnv = map[string]string{
-			"GIT_SSL_NO_VERIFY":   "1",
 			"NPM_CONFIG_REGISTRY": "https://npm.internal/",
 			"_LEADING_UNDERSCORE": "ok",
 			"WITH_DIGITS_123":     "v",
@@ -1580,4 +1579,68 @@ func TestValidate_WorkerExtraEnv(t *testing.T) {
 				"key %q should collide with secrets file", k)
 		}
 	})
+}
+
+// minimalValidConfig returns a fully-populated minimal Config that passes
+// Validate(). Tests that exercise a single field mutate the returned value.
+func minimalValidConfig(t *testing.T) *Config {
+	t.Helper()
+
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	return &Config{
+		ContextMatrixURL: "http://cm.lan:8080",
+		APIKey:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		BaseImage:        testDigestImage,
+		ImagePullPolicy:  PullAlways,
+		MaxConcurrent:    1,
+		ContainerTimeout: "1h",
+		AnthropicAPIKey:  "sk-ant-test",
+		GitHub: GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
+		},
+	}
+}
+
+func TestValidate_WorkerExtraEnv_RejectsDangerousKeys(t *testing.T) {
+	dangerous := []string{
+		"GIT_SSL_NO_VERIFY",
+		"GIT_TERMINAL_PROMPT",
+		"LD_PRELOAD",
+		"LD_LIBRARY_PATH",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"NO_PROXY",
+		"NODE_OPTIONS",
+		"PATH",
+		"GOPROXY",
+		"GOSUMDB",
+		"PYTHONPATH",
+	}
+
+	for _, key := range dangerous {
+		t.Run(key, func(t *testing.T) {
+			c := minimalValidConfig(t)
+			c.WorkerExtraEnv = map[string]string{key: "1"}
+
+			err := c.Validate()
+			require.Error(t, err, "Validate must reject worker_extra_env[%q]", key)
+			require.Contains(t, err.Error(), "worker_extra_env")
+		})
+	}
+}
+
+func TestValidate_WorkerExtraEnv_AllowsBenignKeys(t *testing.T) {
+	c := minimalValidConfig(t)
+	c.WorkerExtraEnv = map[string]string{
+		"MY_APP_FEATURE_FLAG": "on",
+		"CI":                  "false",
+	}
+	require.NoError(t, c.Validate())
 }

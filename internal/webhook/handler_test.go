@@ -351,6 +351,24 @@ func (f *reconcileFakeRunner) ForceRemoveByLabels(_ context.Context, project, ca
 	return f.forceRet, f.forceErr
 }
 
+func (f *reconcileFakeRunner) StartChat(_ context.Context, _ container.StartChatOpts) (string, error) {
+	return "", nil
+}
+
+func (f *reconcileFakeRunner) Stop(_ context.Context, _ string) error { return nil }
+
+func (f *reconcileFakeRunner) WorkerImage() string { return "" }
+
+func (f *reconcileFakeRunner) BuildChatAuthEnv(_ context.Context) map[string]string { return nil }
+
+func (f *reconcileFakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
+
+func (f *reconcileFakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (f *reconcileFakeRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (f *reconcileFakeRunner) DeleteChatCleanup(_ string) {}
+
 // TestHandleListContainers_ReturnsDockerAuthoritativeList confirms that the
 // endpoint surfaces every ManagedContainer returned by the manager, including
 // the tracked/untracked split. The tracker state is reflected on each entry so
@@ -548,6 +566,24 @@ func (f *fakeRunner) ListManaged(_ context.Context) ([]container.ManagedContaine
 func (f *fakeRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int, error) {
 	return 0, nil
 }
+
+func (f *fakeRunner) StartChat(_ context.Context, _ container.StartChatOpts) (string, error) {
+	return "", nil
+}
+
+func (f *fakeRunner) Stop(_ context.Context, _ string) error { return nil }
+
+func (f *fakeRunner) WorkerImage() string { return "" }
+
+func (f *fakeRunner) BuildChatAuthEnv(_ context.Context) map[string]string { return nil }
+
+func (f *fakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
+
+func (f *fakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (f *fakeRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (f *fakeRunner) DeleteChatCleanup(_ string) {}
 
 // TestHandleTrigger_InteractivePropagated verifies that the Interactive field from the
 // JSON trigger body is correctly propagated into the RunConfig passed to the manager.
@@ -1754,6 +1790,24 @@ func (s *stopAllFakeRunner) ForceRemoveByLabels(_ context.Context, _, _ string) 
 	return 0, nil
 }
 
+func (s *stopAllFakeRunner) StartChat(_ context.Context, _ container.StartChatOpts) (string, error) {
+	return "", nil
+}
+
+func (s *stopAllFakeRunner) Stop(_ context.Context, _ string) error { return nil }
+
+func (s *stopAllFakeRunner) WorkerImage() string { return "" }
+
+func (s *stopAllFakeRunner) BuildChatAuthEnv(_ context.Context) map[string]string { return nil }
+
+func (s *stopAllFakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
+
+func (s *stopAllFakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (s *stopAllFakeRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (s *stopAllFakeRunner) DeleteChatCleanup(_ string) {}
+
 func (s *stopAllFakeRunner) killedIDs() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2305,4 +2359,232 @@ func TestHandleRefreshKnowledge_409WhenAlreadyRunning(t *testing.T) {
 	h.hmacAuth(h.handleRefreshKnowledge)(w, req)
 
 	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+// --- /message chat path tests ---
+
+// setupChatMessageHandler builds a Handler with a tracker that has a chat
+// container registered (optionally with stdin attached) and a broadcaster.
+func setupChatMessageHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.Broadcaster, *fakeWriteCloser) {
+	t.Helper()
+
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+		SessionID: "sess-chat-001",
+	}))
+
+	var fw *fakeWriteCloser
+	if withStdin {
+		fw = &fakeWriteCloser{}
+		tr.SetStdinChat("sess-chat-001", fw, nil)
+	}
+
+	return h, b, fw
+}
+
+// TestMessage_ChatPath_Success verifies that a /message with session_id
+// (and no card_id/project) returns 202 and writes to the chat container stdin.
+func TestMessage_ChatPath_Success(t *testing.T) {
+	h, b, fw := setupChatMessageHandler(t, true)
+
+	ch, unsub := b.SubscribeWithSessionID("sess-chat-001")
+	defer unsub()
+
+	payload := MessagePayload{
+		SessionID: "sess-chat-001",
+		Content:   "hello from chat",
+		MessageID: "msg-chat-001",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/message", payload)
+	h.hmacAuth(h.handleMessage)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var resp SuccessResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+	assert.Equal(t, "msg-chat-001", resp.MessageID)
+
+	// Stdin must have been written.
+	require.NotNil(t, fw)
+	require.NotEmpty(t, fw.buf)
+
+	// Broadcaster must have a "user" entry with session_id set.
+	select {
+	case entry := <-ch:
+		assert.Equal(t, "user", entry.Type)
+		assert.Equal(t, "sess-chat-001", entry.SessionID)
+		assert.Equal(t, "hello from chat", entry.Content)
+		assert.Empty(t, entry.CardID, "chat entry must not carry card_id")
+		assert.Empty(t, entry.Project, "chat entry must not carry project")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for chat broadcaster entry")
+	}
+}
+
+// TestMessage_ChatPath_NotFound verifies that /message with session_id for an
+// untracked session returns 404.
+func TestMessage_ChatPath_NotFound(t *testing.T) {
+	h, _, _ := setupChatMessageHandler(t, false)
+
+	payload := MessagePayload{
+		SessionID: "sess-unknown",
+		Content:   "hello",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/message", payload)
+	h.hmacAuth(h.handleMessage)(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+	assert.Equal(t, CodeNotFound, resp.Code)
+}
+
+// TestMessage_ChatPath_Validation verifies that /message with both session_id
+// and card_id returns 400.
+func TestMessage_ChatPath_Validation(t *testing.T) {
+	h, _, _ := setupChatMessageHandler(t, false)
+
+	payload := MessagePayload{
+		SessionID: "sess-chat-001",
+		CardID:    "PROJ-001",
+		Content:   "hello",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/message", payload)
+	h.hmacAuth(h.handleMessage)(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+	assert.Equal(t, CodeInvalidField, resp.Code)
+}
+
+// TestMessage_ChatPath_NoStdin verifies that /message with a tracked session
+// that has no stdin attached returns 409.
+func TestMessage_ChatPath_NoStdin(t *testing.T) {
+	h, b, _ := setupChatMessageHandler(t, false)
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	payload := MessagePayload{
+		SessionID: "sess-chat-001",
+		Content:   "hello",
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/message", payload)
+	h.hmacAuth(h.handleMessage)(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+	assert.Equal(t, CodeConflict, resp.Code)
+
+	// No phantom echo.
+	select {
+	case entry := <-ch:
+		t.Fatalf("expected no broadcast on 409, got entry: %+v", entry)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestLogs_SessionIDFilter verifies that a ?session_id= subscription only
+// receives entries with a matching SessionID (and not project-keyed entries).
+func TestLogs_SessionIDFilter(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs?session_id=sess-filter", []byte{}, ts)
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs?session_id=sess-filter", nil)
+	require.NoError(t, err)
+	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
+	req.Header.Set(cmhmac.TimestampHeader, ts)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// Consume the initial connected comment.
+	for scanner.Scan() {
+		if scanner.Text() == ": connected" {
+			break
+		}
+	}
+
+	// Publish one entry for a different session and one for the target session.
+	b.Publish(logbroadcast.LogEntry{SessionID: "sess-other", Type: "text", Content: "should not arrive"})
+	b.Publish(logbroadcast.LogEntry{SessionID: "sess-filter", Type: "text", Content: "should arrive"})
+
+	lineCh := make(chan string, 16)
+
+	go func() {
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				lineCh <- line
+
+				return
+			}
+		}
+	}()
+
+	select {
+	case dataLine := <-lineCh:
+		var got logbroadcast.LogEntry
+		require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(dataLine, "data: ")), &got))
+		assert.Equal(t, "sess-filter", got.SessionID, "expected only the target session entry")
+		assert.Equal(t, "should arrive", got.Content)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for session-filtered SSE event")
+	}
+}
+
+// TestLogs_SessionIDAndProjectMutuallyExclusive verifies that providing both
+// ?session_id= and ?project= returns 400.
+func TestLogs_SessionIDAndProjectMutuallyExclusive(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs?project=p&session_id=s", []byte{}, ts)
+
+	req := httptest.NewRequestWithContext(context.Background(), "GET", "/logs?project=p&session_id=s", nil)
+	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
+	req.Header.Set(cmhmac.TimestampHeader, ts)
+
+	w := newFlushRecorder()
+	h.hmacAuth(h.handleLogs)(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.OK)
+	assert.Equal(t, CodeInvalidField, resp.Code)
 }

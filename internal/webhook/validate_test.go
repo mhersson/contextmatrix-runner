@@ -361,6 +361,140 @@ func TestValidatePayload_EndSession(t *testing.T) {
 	require.Error(t, ValidatePayload(&EndSessionPayload{CardID: "C-1", Project: "-bad"}))
 }
 
+func TestValidatePayload_ChatStart(t *testing.T) {
+	// Happy paths.
+	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1"}))
+	require.NoError(t, ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Project:   "proj",
+		RepoURL:   "https://github.com/org/repo.git",
+	}))
+
+	cases := []struct {
+		name      string
+		mutate    func(*ChatStartPayload)
+		wantField string
+	}{
+		{"empty session_id", func(p *ChatStartPayload) { p.SessionID = "" }, "session_id"},
+		{"leading dash session_id", func(p *ChatStartPayload) { p.SessionID = "-evil" }, "session_id"},
+		{"control bytes session_id", func(p *ChatStartPayload) { p.SessionID = "sess\nfoo" }, "session_id"},
+		{"overlong session_id", func(p *ChatStartPayload) { p.SessionID = strings.Repeat("a", 65) }, "session_id"},
+		{"bad project", func(p *ChatStartPayload) { p.Project = "a b" }, "project"},
+		{"leading dash project", func(p *ChatStartPayload) { p.Project = "-evil" }, "project"},
+		{"non-url repo_url", func(p *ChatStartPayload) { p.RepoURL = "not a url" }, "repo_url"},
+		{"http scheme repo_url", func(p *ChatStartPayload) { p.RepoURL = "http://example.com/r" }, "repo_url"},
+		{"control byte repo_url", func(p *ChatStartPayload) { p.RepoURL = "https://github.com\n/x" }, "repo_url"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &ChatStartPayload{
+				SessionID: "sess-1",
+				Project:   "proj",
+				RepoURL:   "https://github.com/org/repo.git",
+			}
+			tc.mutate(p)
+
+			err := ValidatePayload(p)
+			require.Error(t, err)
+
+			var ve *ValidationError
+
+			require.ErrorAs(t, err, &ve)
+			assert.Equal(t, tc.wantField, ve.Field)
+		})
+	}
+}
+
+func TestValidatePayload_ChatStart_Model(t *testing.T) {
+	// Happy paths.
+	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1", Model: ""}))
+	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1", Model: "claude-sonnet-4-6"}))
+	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1", Model: "claude-opus-4-7"}))
+	require.NoError(t, ValidatePayload(&ChatStartPayload{SessionID: "sess-1", Model: "claude-haiku-4-5-20251001"}))
+
+	rejects := []string{
+		"gpt-4",
+		"sonnet-4-6",                        // missing claude- prefix
+		"claude-",                           // empty suffix
+		"claude-EVIL$",                      // invalid char
+		"claude-" + strings.Repeat("a", 65), // too long
+	}
+
+	for _, m := range rejects {
+		t.Run("reject:"+m, func(t *testing.T) {
+			err := ValidatePayload(&ChatStartPayload{SessionID: "sess-1", Model: m})
+			require.Error(t, err)
+
+			var ve *ValidationError
+
+			require.ErrorAs(t, err, &ve)
+			assert.Equal(t, "model", ve.Field)
+		})
+	}
+}
+
+func TestValidatePayload_ChatStart_Resume(t *testing.T) {
+	// Happy: small resume.
+	require.NoError(t, ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Resume: &ChatResumeContext{
+			Turns: []ChatResumeTurn{
+				{Seq: 1, Role: "user", Content: "hi"},
+				{Seq: 2, Role: "assistant_text", Content: "hello"},
+				{Seq: 3, Role: "tool_call", Content: "Bash: ls"},
+				{Seq: 4, Role: "tool_result_summary", Content: "→ ok"},
+			},
+		},
+	}))
+
+	// Too many turns.
+	manyTurns := make([]ChatResumeTurn, chatResumeMaxTurns+1)
+	for i := range manyTurns {
+		manyTurns[i] = ChatResumeTurn{Seq: int64(i + 1), Role: "user", Content: "x"}
+	}
+
+	err := ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Resume:    &ChatResumeContext{Turns: manyTurns},
+	})
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "resume.turns", ve.Field)
+
+	// Bad role.
+	err = ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Resume: &ChatResumeContext{Turns: []ChatResumeTurn{
+			{Seq: 1, Role: "stderr", Content: "noise"},
+		}},
+	})
+	require.Error(t, err)
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "resume.turns[0].role", ve.Field)
+
+	// Oversized content.
+	err = ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Resume: &ChatResumeContext{Turns: []ChatResumeTurn{
+			{Seq: 1, Role: "user", Content: strings.Repeat("x", chatResumeMaxContentBytes+1)},
+		}},
+	})
+	require.Error(t, err)
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "resume.turns[0].content", ve.Field)
+}
+
+func TestValidatePayload_ChatEnd(t *testing.T) {
+	require.NoError(t, ValidatePayload(&ChatEndPayload{SessionID: "sess-1"}))
+	require.Error(t, ValidatePayload(&ChatEndPayload{SessionID: ""}))
+	require.Error(t, ValidatePayload(&ChatEndPayload{SessionID: "-evil"}))
+	require.Error(t, ValidatePayload(&ChatEndPayload{SessionID: "sess\x00null"}))
+}
+
 func TestValidatePayload_ByValue(t *testing.T) {
 	// Pass-by-value should work as well as pass-by-pointer.
 	require.NoError(t, ValidatePayload(KillPayload{CardID: "C-1", Project: "p"}))
@@ -370,6 +504,8 @@ func TestValidatePayload_ByValue(t *testing.T) {
 	require.NoError(t, ValidatePayload(
 		MessagePayload{CardID: "C-1", Project: "p", Content: "hi"},
 	))
+	require.NoError(t, ValidatePayload(ChatStartPayload{SessionID: "sess-1"}))
+	require.NoError(t, ValidatePayload(ChatEndPayload{SessionID: "sess-1"}))
 }
 
 func TestValidatePayload_UnknownTypeNoop(t *testing.T) {
@@ -448,6 +584,34 @@ func (r *strictRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int,
 	r.t.Fatalf("manager.ForceRemoveByLabels must not be called on invalid payload")
 
 	return 0, nil
+}
+
+func (r *strictRunner) StartChat(_ context.Context, _ container.StartChatOpts) (string, error) {
+	r.t.Fatalf("manager.StartChat must not be called on invalid payload")
+
+	return "", nil
+}
+
+func (r *strictRunner) Stop(_ context.Context, _ string) error {
+	r.t.Fatalf("manager.Stop must not be called on invalid payload")
+
+	return nil
+}
+
+func (r *strictRunner) WorkerImage() string { return "" }
+
+func (r *strictRunner) BuildChatAuthEnv(_ context.Context) map[string]string { return nil }
+
+func (r *strictRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
+
+func (r *strictRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (r *strictRunner) WaitAndCleanupChat(_, _, _ string) {
+	r.t.Fatalf("manager.WaitAndCleanupChat must not be called on invalid payload")
+}
+
+func (r *strictRunner) DeleteChatCleanup(_ string) {
+	r.t.Fatalf("manager.DeleteChatCleanup must not be called on invalid payload")
 }
 
 // -----------------------------------------------------------------------------

@@ -73,6 +73,7 @@ type ContainerInfo struct {
 	ContainerID string
 	CardID      string
 	Project     string
+	SessionID   string // chat-mode containers; mutually exclusive with CardID
 	Image       string
 	StartedAt   time.Time
 	Cancel      context.CancelFunc
@@ -92,6 +93,7 @@ type ContainerSnapshot struct {
 	ContainerID string
 	CardID      string
 	Project     string
+	SessionID   string
 	Image       string
 	StartedAt   time.Time
 }
@@ -103,6 +105,7 @@ func snapshotLocked(ci *ContainerInfo) ContainerSnapshot {
 		ContainerID: ci.ContainerID,
 		CardID:      ci.CardID,
 		Project:     ci.Project,
+		SessionID:   ci.SessionID,
 		Image:       ci.Image,
 		StartedAt:   ci.StartedAt,
 	}
@@ -319,6 +322,42 @@ func (t *Tracker) CloseStdin(project, cardID string) error {
 	return nil
 }
 
+// closeStdinAsync closes the stdin writer attached to info under a bounded
+// watchdog so a wedged hijacked TCP connection cannot stall the caller.
+// Must be called after the info has been deleted from the tracker map (so
+// tracker.mu is no longer held). label is used only in the warning log.
+//
+// Lock ordering holds: tracker.mu was released before this function is
+// called; stdin.mu is acquired inside the goroutine with no other lock held.
+func closeStdinAsync(info *ContainerInfo, label string) {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		info.stdin.mu.Lock()
+		if info.stdin.stdin != nil {
+			_ = info.stdin.stdin.Close()
+			info.stdin.stdin = nil
+		}
+
+		onClose := info.stdin.onClose
+		info.stdin.onClose = nil
+		info.stdin.mu.Unlock()
+
+		if onClose != nil {
+			onClose()
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(stdinCloseTimeout):
+		slog.Warn("stdin close timed out in tracker.Remove; backgrounding",
+			"key", label, "timeout", stdinCloseTimeout)
+	}
+}
+
 // Remove deletes a container from the tracker and closes any attached stdin.
 // tracker.mu is released before the stdin work so a slow Close on a
 // hijacked connection does not stall readers; by the time we touch stdin.mu
@@ -326,50 +365,192 @@ func (t *Tracker) CloseStdin(project, cardID string) error {
 // with an in-flight WriteStdin/CloseStdin that captured the info pointer
 // before Remove deleted the map entry — stdin.mu serialises those paths.
 func (t *Tracker) Remove(project, cardID string) {
+	k := key(project, cardID)
+
 	t.mu.Lock()
 
-	info, ok := t.containers[key(project, cardID)]
+	info, ok := t.containers[k]
 	if ok {
-		delete(t.containers, key(project, cardID))
+		delete(t.containers, k)
 	}
 	t.mu.Unlock()
 
-	if ok && info.stdin != nil {
-		// Close stdin and invoke onClose under a bounded watchdog. Both
-		// operations act on a hijacked TCP connection and can block if the
-		// socket is wedged. Running them in a goroutine and selecting on a
-		// timeout keeps Remove from starving the subsequent removeSecretsFile
-		// and removeContainer defers in waitAndCleanup (H21 ordering).
-		//
-		// Lock ordering holds: tracker.mu was released above; stdin.mu is
-		// acquired inside the goroutine with no other lock held.
-		done := make(chan struct{})
-
-		go func() {
-			defer close(done)
-
-			info.stdin.mu.Lock()
-			if info.stdin.stdin != nil {
-				_ = info.stdin.stdin.Close()
-				info.stdin.stdin = nil
-			}
-
-			onClose := info.stdin.onClose
-			info.stdin.onClose = nil
-			info.stdin.mu.Unlock()
-
-			if onClose != nil {
-				onClose()
-			}
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(stdinCloseTimeout):
-			slog.Warn("stdin close timed out in tracker.Remove; backgrounding",
-				"project", project, "card_id", cardID, "timeout", stdinCloseTimeout)
-		}
+	if !ok {
+		return
 	}
+
+	if info.Cancel != nil {
+		info.Cancel()
+	}
+
+	if info.stdin != nil {
+		closeStdinAsync(info, k)
+	}
+}
+
+// chatKey returns the map key for a chat-mode container.
+func chatKey(sessionID string) string {
+	return "__chat__/" + sessionID
+}
+
+// AddChat registers a chat-mode container keyed by sessionID. Returns
+// ErrAlreadyTracked if an entry for the session already exists.
+func (t *Tracker) AddChat(info *ContainerInfo) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	k := chatKey(info.SessionID)
+	if _, exists := t.containers[k]; exists {
+		return fmt.Errorf("%s: %w", k, ErrAlreadyTracked)
+	}
+
+	t.containers[k] = info
+
+	return nil
+}
+
+// HasChat reports whether a chat-mode container is currently tracked for
+// sessionID.
+func (t *Tracker) HasChat(sessionID string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	_, ok := t.containers[chatKey(sessionID)]
+
+	return ok
+}
+
+// SnapshotChat returns a read-only view of the tracked chat container for
+// sessionID. The second return value is false if no container is tracked.
+func (t *Tracker) SnapshotChat(sessionID string) (ContainerSnapshot, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	info, ok := t.containers[chatKey(sessionID)]
+	if !ok {
+		return ContainerSnapshot{}, false
+	}
+
+	return snapshotLocked(info), true
+}
+
+// RemoveChat deletes a chat-mode container from the tracker and closes any
+// attached stdin.
+func (t *Tracker) RemoveChat(sessionID string) {
+	k := chatKey(sessionID)
+
+	t.mu.Lock()
+
+	info, ok := t.containers[k]
+	if ok {
+		delete(t.containers, k)
+	}
+	t.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	if info.Cancel != nil {
+		info.Cancel()
+	}
+
+	if info.stdin != nil {
+		closeStdinAsync(info, k)
+	}
+}
+
+// WriteStdinChat writes b to the attached stdin of the chat-mode container
+// identified by sessionID. Returns ErrNotTracked, ErrNoStdinAttached, or
+// ErrStdinClosed as appropriate (matching the semantics of WriteStdin).
+func (t *Tracker) WriteStdinChat(sessionID string, b []byte) error {
+	t.mu.RLock()
+	info, ok := t.containers[chatKey(sessionID)]
+	t.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("%s: %w", chatKey(sessionID), ErrNotTracked)
+	}
+
+	if info.stdin == nil {
+		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
+	}
+
+	info.stdin.mu.Lock()
+	defer info.stdin.mu.Unlock()
+
+	if info.stdin.stdin == nil {
+		return fmt.Errorf("stdin closed for %s: %w", chatKey(sessionID), ErrStdinClosed)
+	}
+
+	_, err := info.stdin.stdin.Write(b)
+
+	return err
+}
+
+// CloseStdinChat closes the attached stdin writer for the chat-mode container
+// identified by sessionID without removing the tracker entry.
+// Returns ErrNotTracked if the key is unknown and ErrNoStdinAttached if no
+// stdin has been set or it has already been closed.
+func (t *Tracker) CloseStdinChat(sessionID string) error {
+	t.mu.RLock()
+	info, ok := t.containers[chatKey(sessionID)]
+	t.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("%s: %w", chatKey(sessionID), ErrNotTracked)
+	}
+
+	if info.stdin == nil {
+		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
+	}
+
+	info.stdin.mu.Lock()
+	defer info.stdin.mu.Unlock()
+
+	if info.stdin.stdin == nil {
+		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
+	}
+
+	err := info.stdin.stdin.Close()
+	info.stdin.stdin = nil
+
+	if err != nil {
+		return fmt.Errorf("close stdin for %s: %w", chatKey(sessionID), err)
+	}
+
+	return nil
+}
+
+// SetStdinChat attaches a writable stdin handle to a tracked chat-mode
+// container. Mirrors SetStdin semantics: if the entry has already been
+// removed, w is closed synchronously and onClose is invoked so the
+// underlying connection is not leaked.
+func (t *Tracker) SetStdinChat(sessionID string, w io.WriteCloser, onClose func()) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	info, ok := t.containers[chatKey(sessionID)]
+	if !ok {
+		if w != nil {
+			_ = w.Close()
+		}
+
+		if onClose != nil {
+			onClose()
+		}
+
+		return
+	}
+
+	if info.stdin == nil {
+		info.stdin = &stdinState{}
+	}
+
+	info.stdin.mu.Lock()
+	info.stdin.stdin = w
+	info.stdin.onClose = onClose
+	info.stdin.mu.Unlock()
 }
 
 // Count returns the number of tracked containers.
@@ -414,6 +595,28 @@ func (t *Tracker) AddIfUnderLimit(info *ContainerInfo, limit int) error {
 	k := key(info.Project, info.CardID)
 	if _, exists := t.containers[k]; exists {
 		return fmt.Errorf("%s/%s: %w", info.Project, info.CardID, ErrAlreadyTracked)
+	}
+
+	t.containers[k] = info
+
+	return nil
+}
+
+// AddChatIfUnderLimit is the chat-mode counterpart of AddIfUnderLimit: it
+// reserves a chat container slot keyed by sessionID under the same shared
+// concurrency cap (chat and card-mode share the runner's total capacity).
+// Returns ErrLimitReached or ErrAlreadyTracked, both wrapped for errors.Is.
+func (t *Tracker) AddChatIfUnderLimit(info *ContainerInfo, limit int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if len(t.containers) >= limit {
+		return fmt.Errorf("%w (%d)", ErrLimitReached, limit)
+	}
+
+	k := chatKey(info.SessionID)
+	if _, exists := t.containers[k]; exists {
+		return fmt.Errorf("%s: %w", k, ErrAlreadyTracked)
 	}
 
 	t.containers[k] = info

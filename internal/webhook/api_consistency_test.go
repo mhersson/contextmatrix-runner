@@ -548,3 +548,21 @@ func (n *noopRunner) ListManaged(_ context.Context) ([]container.ManagedContaine
 func (n *noopRunner) ForceRemoveByLabels(_ context.Context, _, _ string) (int, error) {
 	return 0, nil
 }
+
+func (n *noopRunner) StartChat(_ context.Context, _ container.StartChatOpts) (string, error) {
+	return "", nil
+}
+
+func (n *noopRunner) Stop(_ context.Context, _ string) error { return nil }
+
+func (n *noopRunner) WorkerImage() string { return "" }
+
+func (n *noopRunner) BuildChatAuthEnv(_ context.Context) map[string]string { return nil }
+
+func (n *noopRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
+
+func (n *noopRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (n *noopRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (n *noopRunner) DeleteChatCleanup(_ string) {}

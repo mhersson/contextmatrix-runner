@@ -160,7 +160,7 @@ func TestPrepareSecrets(t *testing.T) {
 			m := testSecretsManager(t, cfg, tc.mkdirAll, tc.createFile)
 
 			payload := RunConfig{Mode: ModeTask, CardID: "TEST-001", Project: "proj"}
-			delivery, err := m.prepareSecrets(payload, testSecrets)
+			delivery, err := m.prepareSecrets(sanitizeContainerName(payload.Project, payload.CardID), testSecrets)
 
 			if tc.wantErr {
 				require.Error(t, err)
@@ -276,7 +276,7 @@ func TestPrepareSecrets_WarnLogged(t *testing.T) {
 	}
 
 	payload := RunConfig{Mode: ModeTask, CardID: "WARN-001", Project: "proj"}
-	delivery, err := m.prepareSecrets(payload, testSecrets)
+	delivery, err := m.prepareSecrets(sanitizeContainerName(payload.Project, payload.CardID), testSecrets)
 
 	require.NoError(t, err)
 	assert.Equal(t, secretModeEnvVar, delivery.Mode)

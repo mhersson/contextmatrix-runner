@@ -39,12 +39,47 @@ type ContainerRunner interface {
 	Kill(project, cardID string) error
 	ListManaged(ctx context.Context) ([]container.ManagedContainer, error)
 	ForceRemoveByLabels(ctx context.Context, project, cardID string) (int, error)
+
+	// Chat-mode methods (added for global-chat milestone).
+	StartChat(ctx context.Context, opts container.StartChatOpts) (string, error)
+	AttachChatStdin(ctx context.Context, sessionID, containerID string) error
+	StreamChatLogs(ctx context.Context, sessionID, containerID, project string)
+	WaitAndCleanupChat(sessionID, containerID, project string)
+	DeleteChatCleanup(containerID string)
+	Stop(ctx context.Context, containerID string) error
+	WorkerImage() string
+	BuildChatAuthEnv(ctx context.Context) map[string]string
+}
+
+// TrackerService is the interface to the task/chat tracker used by the webhook handler.
+// Using an interface enables handler tests to inject wrappers without needing
+// to modify the real tracker implementation.
+type TrackerService interface {
+	Add(info *tracker.ContainerInfo) error
+	AddIfUnderLimit(info *tracker.ContainerInfo, limit int) error
+	AddChat(info *tracker.ContainerInfo) error
+	AddChatIfUnderLimit(info *tracker.ContainerInfo, limit int) error
+	Has(project, cardID string) bool
+	HasChat(sessionID string) bool
+	Count() int
+	Remove(project, cardID string)
+	RemoveChat(sessionID string)
+	Snapshot(project, cardID string) (tracker.ContainerSnapshot, bool)
+	SnapshotChat(sessionID string) (tracker.ContainerSnapshot, bool)
+	AllSnapshots() []tracker.ContainerSnapshot
+	ListSnapshotsByProject(project string) []tracker.ContainerSnapshot
+	WriteStdin(project, cardID string, b []byte) error
+	WriteStdinChat(sessionID string, b []byte) error
+	CloseStdin(project, cardID string) error
+	CloseStdinChat(sessionID string) error
+	SetStdin(project, cardID string, w io.WriteCloser, onClose func())
+	SetStdinChat(sessionID string, w io.WriteCloser, onClose func())
 }
 
 // Handler processes incoming webhooks from ContextMatrix.
 type Handler struct {
 	manager       ContainerRunner
-	tracker       *tracker.Tracker
+	tracker       TrackerService
 	broadcaster   *logbroadcast.Broadcaster
 	cmClient      *callback.Client // contextmatrix callback client for promote API call
 	apiKey        string
@@ -88,7 +123,7 @@ type Handler struct {
 // atomic flags.
 func NewHandler(
 	manager ContainerRunner,
-	tracker *tracker.Tracker,
+	tracker TrackerService,
 	broadcaster *logbroadcast.Broadcaster,
 	cmClient *callback.Client,
 	apiKey string,
@@ -170,6 +205,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.Handle("POST /promote", wrap(h.handlePromote, true))
 	mux.Handle("POST /end-session", wrap(h.handleEndSession, true))
 	mux.Handle("POST /refresh-knowledge", wrap(h.handleRefreshKnowledge, true))
+	mux.Handle("POST /chat/start", wrap(h.handleChatStart, true))
+	mux.Handle("POST /chat/end", wrap(h.handleChatEnd, true))
 	mux.Handle("GET /logs", wrap(h.handleLogs, true))
 	mux.Handle("GET /containers", wrap(h.handleListContainers, true))
 	mux.Handle("GET /health", wrap(h.handleHealth, false))
@@ -367,6 +404,7 @@ func (h *Handler) handleListContainers(w http.ResponseWriter, r *http.Request) {
 			ContainerID:   c.ContainerID,
 			ContainerName: c.ContainerName,
 			CardID:        c.CardID,
+			SessionID:     c.SessionID,
 			Project:       c.Project,
 			State:         c.State,
 			StartedAt:     c.StartedAt.UTC().Format(time.RFC3339),
@@ -492,6 +530,84 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
+
+		return
+	}
+
+	// Chat path: session_id is set — route to the chat tracker.
+	// Dedup is keyed on (session_id, message_id) and shares the underlying
+	// MessageDedupCache via a sentinel project name, so a retried POST
+	// after a network blip replays the original ack instead of
+	// double-writing the user turn into stdin.
+	if payload.IsChat() {
+		if h.messageDedup != nil && payload.MessageID != "" {
+			if ack, ok := h.messageDedup.GetChat(payload.SessionID, payload.MessageID); ok {
+				writeRawAck(w, ack)
+
+				return
+			}
+		}
+
+		if !h.tracker.HasChat(payload.SessionID) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "no chat container tracked")
+
+			return
+		}
+
+		b, err := streammsg.BuildUserMessage(payload.Content)
+		if err != nil {
+			h.logWarn("message: BuildUserMessage failed", "error", err.Error())
+			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
+
+			return
+		}
+
+		if err := h.tracker.WriteStdinChat(payload.SessionID, b); err != nil {
+			switch {
+			case errors.Is(err, tracker.ErrNotTracked):
+				writeError(w, http.StatusNotFound, CodeNotFound, "no chat container tracked")
+			case errors.Is(err, tracker.ErrStdinClosed):
+				writeError(w, http.StatusGone, CodeStdinClosed, "session ended")
+			case errors.Is(err, tracker.ErrNoStdinAttached):
+				writeError(w, http.StatusConflict, CodeConflict, "container is not interactive")
+			default:
+				h.logWarn("message: chat stdin write failed", "session_id", payload.SessionID, "error", err.Error())
+				writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
+			}
+
+			return
+		}
+
+		if h.broadcaster != nil {
+			h.broadcaster.Publish(logbroadcast.LogEntry{
+				Timestamp: time.Now(),
+				SessionID: payload.SessionID,
+				Type:      "user",
+				Content:   payload.Content,
+			})
+		}
+
+		h.logInfo("message: chat stdin written",
+			"session_id", payload.SessionID, "message_id", payload.MessageID, "content_len", len(payload.Content))
+
+		// Marshal the success ack once so retries see byte-identical bytes
+		// from the dedup cache. A marshal error here is an internal bug,
+		// not a client problem — fall back to writeJSON.
+		ackBytes, err := json.Marshal(SuccessResponse{OK: true, MessageID: payload.MessageID})
+		if err != nil {
+			writeJSON(w, http.StatusAccepted, SuccessResponse{OK: true, MessageID: payload.MessageID})
+
+			return
+		}
+
+		if h.messageDedup != nil && payload.MessageID != "" {
+			h.messageDedup.PutChat(payload.SessionID, payload.MessageID, CachedAck{
+				Status: http.StatusAccepted,
+				Body:   ackBytes,
+			})
+		}
+
+		writeRawAck(w, CachedAck{Status: http.StatusAccepted, Body: ackBytes})
 
 		return
 	}
@@ -868,6 +984,13 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	project := r.URL.Query().Get("project")
+	sessionID := r.URL.Query().Get("session_id")
+
+	if project != "" && sessionID != "" {
+		writeError(w, http.StatusBadRequest, CodeInvalidField, "project and session_id are mutually exclusive")
+
+		return
+	}
 
 	// Clear the write deadline — the server has a 30s WriteTimeout that would
 	// otherwise terminate the long-lived SSE connection. This depends on every
@@ -887,7 +1010,17 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	// Subscribe before writing ": connected" so receiving that line is a
 	// client-observable guarantee that the subscription is live.
-	ch, unsubscribe := h.broadcaster.Subscribe(project)
+	var (
+		ch          <-chan logbroadcast.LogEntry
+		unsubscribe func()
+	)
+
+	if sessionID != "" {
+		ch, unsubscribe = h.broadcaster.SubscribeWithSessionID(sessionID)
+	} else {
+		ch, unsubscribe = h.broadcaster.Subscribe(project)
+	}
+
 	defer unsubscribe()
 
 	// Flush headers and send initial keepalive to trigger client onopen.
@@ -909,6 +1042,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.Info("SSE log client connected",
 			"project_filter", project,
+			"session_id_filter", sessionID,
 			"remote_addr", r.RemoteAddr,
 		)
 	}
@@ -919,6 +1053,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 			if h.logger != nil {
 				h.logger.Info("SSE log client disconnected",
 					"project_filter", project,
+					"session_id_filter", sessionID,
 					"remote_addr", r.RemoteAddr,
 				)
 			}
@@ -1018,7 +1153,8 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		if !cmhmac.VerifySignatureWithTimestamp(h.apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, skew) {
-			h.logWarn("webhook authentication failed", "remote_addr", r.RemoteAddr)
+			h.logWarn("webhook authentication failed",
+				"remote_addr", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
 			writeUnauthorized(w)
 
 			return

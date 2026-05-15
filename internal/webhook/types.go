@@ -24,14 +24,18 @@ type StopAllPayload struct {
 	Project string `json:"project,omitempty"`
 }
 
-// MessagePayload is received from ContextMatrix to deliver a user chat message
-// to a running interactive container's stdin.
+// MessagePayload is the body for POST /message. Exactly one of (card_id +
+// project) for card-bound HITL or session_id for chat must be set.
 type MessagePayload struct {
-	CardID    string `json:"card_id"`
-	Project   string `json:"project"`
+	CardID    string `json:"card_id,omitempty"`
+	Project   string `json:"project,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 	Content   string `json:"content"`
 	MessageID string `json:"message_id,omitempty"`
 }
+
+// IsChat reports whether the payload targets a chat session.
+func (p MessagePayload) IsChat() bool { return p.SessionID != "" }
 
 // PromotePayload is received from ContextMatrix to switch a running interactive
 // session to fully autonomous mode.
@@ -104,6 +108,7 @@ type ContainerListItem struct {
 	ContainerID   string `json:"container_id"`
 	ContainerName string `json:"container_name,omitempty"`
 	CardID        string `json:"card_id"`
+	SessionID     string `json:"session_id,omitempty"`
 	Project       string `json:"project"`
 	State         string `json:"state"`
 	StartedAt     string `json:"started_at"`
@@ -128,6 +133,49 @@ type StopAllResponse struct {
 	Stopped int              `json:"stopped"`
 	Failed  int              `json:"failed"`
 	Results []CardKillResult `json:"results"`
+}
+
+// ChatStartPayload is received from ContextMatrix to start a chat-mode container.
+type ChatStartPayload struct {
+	SessionID string `json:"session_id"`
+	Project   string `json:"project,omitempty"`
+	RepoURL   string `json:"repo_url,omitempty"`
+	// MCPAPIKey is forwarded to the container as CM_MCP_API_KEY so the
+	// in-container claude can authenticate to CM's MCP endpoint. May be
+	// empty when CM's MCP listener has no auth (loopback dev mode); the
+	// container then merges an MCP entry with no Authorization header.
+	MCPAPIKey string `json:"mcp_api_key,omitempty"`
+	// Model is the Claude model the chat container should run. When empty
+	// the entrypoint falls back to the historical default
+	// (claude-sonnet-4-6). Validated against an allowlist regex; the real
+	// allowlist (label, max context tokens) lives on the CM side.
+	Model string `json:"model,omitempty"`
+	// Resume, when non-nil, is the rehydration payload describing the prior
+	// transcript. The runner writes it to /run/cm-chat/resume.jsonl inside
+	// the container and sets CM_CHAT_RESUME=1 so the entrypoint switches
+	// into the rehydration prompt branch.
+	Resume *ChatResumeContext `json:"resume,omitempty"`
+}
+
+// ChatResumeContext mirrors chat.ResumeContext on the CM side. Wire shape
+// only — the runner doesn't import CM types.
+type ChatResumeContext struct {
+	Turns   []ChatResumeTurn `json:"turns"`
+	Clipped bool             `json:"clipped"`
+	OrigSeq int64            `json:"original_seq"`
+}
+
+// ChatResumeTurn is one filtered transcript entry in the rehydration payload.
+type ChatResumeTurn struct {
+	Seq     int64  `json:"seq"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// ChatEndPayload is received from ContextMatrix to close the stdin of a running
+// chat container so claude receives EOF and exits.
+type ChatEndPayload struct {
+	SessionID string `json:"session_id"`
 }
 
 // Response is the legacy polymorphic webhook response body.

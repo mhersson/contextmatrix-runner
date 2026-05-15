@@ -10,12 +10,13 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// stubMaintenanceTarget records every CleanupOrphans / PruneImages call so
-// the loop tests can assert the tick cadence without standing up a real
-// Docker mock.
+// stubMaintenanceTarget records every CleanupOrphans / PruneImages /
+// SweepStaleChatResumeDirs call so the loop tests can assert the tick cadence
+// without standing up a real Docker mock.
 type stubMaintenanceTarget struct {
 	cleanupCalls atomic.Int32
 	pruneCalls   atomic.Int32
+	sweepCalls   atomic.Int32
 	cleanupErr   error
 	pruneErr     error
 }
@@ -30,6 +31,10 @@ func (s *stubMaintenanceTarget) PruneImages(_ context.Context) error {
 	s.pruneCalls.Add(1)
 
 	return s.pruneErr
+}
+
+func (s *stubMaintenanceTarget) SweepStaleChatResumeDirs(_ time.Duration) {
+	s.sweepCalls.Add(1)
 }
 
 // stubMaintenanceHealth is the drain-flag view used by the loop. Using a
@@ -65,14 +70,16 @@ func TestMaintenanceLoop_CallsCleanupAndPrune(t *testing.T) {
 
 	// Wait for a handful of ticks.
 	assert.Eventually(t, func() bool {
-		return target.cleanupCalls.Load() >= 3 && target.pruneCalls.Load() >= 3
+		return target.cleanupCalls.Load() >= 3 && target.pruneCalls.Load() >= 3 && target.sweepCalls.Load() >= 3
 	}, 2*time.Second, 10*time.Millisecond,
-		"maintenance loop must call both CleanupOrphans and PruneImages on each tick")
+		"maintenance loop must call CleanupOrphans, PruneImages, and SweepStaleChatResumeDirs on each tick")
 
-	// Cleanup + prune must be called the same number of times — the loop
-	// never skips one half after a failure from the other.
+	// All three operations must be called the same number of times — the loop
+	// never skips one after a failure from another.
 	assert.Equal(t, target.cleanupCalls.Load(), target.pruneCalls.Load(),
 		"a Cleanup failure must not skip the subsequent Prune")
+	assert.Equal(t, target.pruneCalls.Load(), target.sweepCalls.Load(),
+		"a Prune failure must not skip the subsequent Sweep")
 
 	cancel()
 
@@ -117,6 +124,7 @@ func TestMaintenanceLoop_ExitsOnDrain(t *testing.T) {
 	// subsequent ticks land after drain.
 	cleanupAtExit := target.cleanupCalls.Load()
 	pruneAtExit := target.pruneCalls.Load()
+	sweepAtExit := target.sweepCalls.Load()
 
 	time.Sleep(80 * time.Millisecond)
 
@@ -124,6 +132,8 @@ func TestMaintenanceLoop_ExitsOnDrain(t *testing.T) {
 		"no cleanup ticks must fire after drain exit")
 	assert.Equal(t, pruneAtExit, target.pruneCalls.Load(),
 		"no prune ticks must fire after drain exit")
+	assert.Equal(t, sweepAtExit, target.sweepCalls.Load(),
+		"no sweep ticks must fire after drain exit")
 }
 
 // TestMaintenanceLoop_NonPositiveIntervalIsNoop checks the defensive branch:
@@ -148,4 +158,5 @@ func TestMaintenanceLoop_NonPositiveIntervalIsNoop(t *testing.T) {
 	}
 
 	assert.Equal(t, int32(0), target.cleanupCalls.Load(), "no ticks must fire when disabled")
+	assert.Equal(t, int32(0), target.sweepCalls.Load(), "no sweep ticks must fire when disabled")
 }

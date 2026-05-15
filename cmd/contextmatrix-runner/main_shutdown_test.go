@@ -25,15 +25,22 @@ import (
 // and (optionally) makes ForceKillContainer block to exercise the
 // force-cleanup per-container timeout.
 type stubManager struct {
-	killed    atomic.Int32
-	waitDone  chan struct{} // closed by the test to let Wait return
-	killErr   error
-	forceFn   func(ctx context.Context, containerID string) error
-	forceCall atomic.Int32
+	killed     atomic.Int32
+	killedChat atomic.Int32
+	waitDone   chan struct{} // closed by the test to let Wait return
+	killErr    error
+	forceFn    func(ctx context.Context, containerID string) error
+	forceCall  atomic.Int32
 }
 
 func (m *stubManager) Kill(_, _ string) error {
 	m.killed.Add(1)
+
+	return m.killErr
+}
+
+func (m *stubManager) KillChat(_ context.Context, _ string) error {
+	m.killedChat.Add(1)
 
 	return m.killErr
 }
@@ -268,4 +275,44 @@ func TestShutdown_WedgedContainer(t *testing.T) {
 
 	// Let mgr.Wait finally return so no goroutine is left behind.
 	close(mgr.waitDone)
+}
+
+// TestShutdownDrain_ChatBranch verifies that shutdown step 4 dispatches to
+// KillChat (not Kill) when the tracked entry has a non-empty SessionID. This
+// exercises the info.SessionID != "" branch that the existing
+// TestShutdown_WedgedContainer test (which only registers a card-mode entry)
+// never reaches.
+func TestShutdownDrain_ChatBranch(t *testing.T) {
+	trk := tracker.New()
+
+	// Register one card-mode and one chat-mode container so both branches
+	// in the shutdown loop are exercised in a single run.
+	require.NoError(t, trk.Add(&tracker.ContainerInfo{
+		CardID:      "PROJ-001",
+		Project:     "test-project",
+		ContainerID: "ctr-card",
+	}))
+
+	require.NoError(t, trk.AddChat(&tracker.ContainerInfo{
+		SessionID:   "sess-abc123",
+		ContainerID: "ctr-chat",
+	}))
+
+	mgr := &stubManager{
+		waitDone: make(chan struct{}),
+	}
+
+	// Unblock Wait immediately so shutdown completes without any timeout.
+	close(mgr.waitDone)
+
+	shutdown(shutdownDeps{
+		logger:  testLogger(),
+		tracker: trk,
+		manager: mgr,
+		// srv, health, callback, monitorCancel, replayCancel intentionally nil:
+		// this test focuses purely on the kill-dispatch branch.
+	})
+
+	assert.Equal(t, int32(1), mgr.killed.Load(), "Kill should be called once for the card-mode entry")
+	assert.Equal(t, int32(1), mgr.killedChat.Load(), "KillChat should be called once for the chat-mode entry")
 }

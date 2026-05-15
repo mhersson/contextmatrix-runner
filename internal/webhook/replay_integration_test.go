@@ -204,6 +204,53 @@ func TestHandleMessage_DedupTTLExpires(t *testing.T) {
 	assert.Greater(t, len(fw.buf), firstLen, "after TTL, second request must re-invoke stdin write")
 }
 
+// TestMessage_ChatDedupReplay verifies that a retried POST to /message
+// in chat mode with the same (session_id, message_id) returns the
+// byte-identical cached ack without re-invoking stdin.
+func TestMessage_ChatDedupReplay(t *testing.T) {
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	h.SetMessageDedupCache(NewMessageDedupCache(10*time.Minute, 100))
+
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+		SessionID: "sess-1",
+	}))
+
+	fw := &fakeWriteCloser{}
+	tr.SetStdinChat("sess-1", fw, nil)
+
+	payload := MessagePayload{
+		SessionID: "sess-1",
+		MessageID: "msg-42",
+		Content:   "hello",
+	}
+
+	// First request: write succeeds.
+	w1 := httptest.NewRecorder()
+	h.hmacAuth(h.handleMessage)(w1, signedRequest(t, "/message", payload))
+	require.Equal(t, http.StatusAccepted, w1.Code)
+
+	firstWriteLen := len(fw.buf)
+	require.NotZero(t, firstWriteLen, "first chat message must hit stdin once")
+
+	// Second request with the same message_id: should replay the ack
+	// without touching stdin again. Sleep past 1s so the HMAC timestamp
+	// differs, bypassing the signature replay cache, leaving message_id
+	// dedup as the only thing that can short-circuit the call.
+	// NOTE: depends on signedRequest stamping HMAC timestamps in seconds;
+	// if that ever moves to millisecond precision this sleep needs revisiting.
+	time.Sleep(1100 * time.Millisecond)
+
+	w2 := httptest.NewRecorder()
+	h.hmacAuth(h.handleMessage)(w2, signedRequest(t, "/message", payload))
+	require.Equal(t, http.StatusAccepted, w2.Code)
+	assert.Equal(t, w1.Body.String(), w2.Body.String(),
+		"replay must produce byte-identical ack")
+	assert.Len(t, fw.buf, firstWriteLen,
+		"replay must NOT re-invoke chat stdin")
+}
+
 // TestHandleMessage_DedupDisabledNoOp verifies that when the dedup
 // cache is nil, repeat calls still write stdin every time (baseline —
 // this is the pre-047 behaviour).

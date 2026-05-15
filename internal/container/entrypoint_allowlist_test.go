@@ -218,8 +218,10 @@ func TestEntrypointKBDispatchRunsClaude(t *testing.T) {
 
 	src := string(content)
 
-	// The block opens with the if-test on CM_MODE.
-	idx := strings.Index(src, `if [ "${CM_MODE:-}" = "knowledge-refresh" ]; then`)
+	// The block opens with the elif-test on CM_MODE in the dispatch section.
+	// (The validation block also contains an if-test on CM_MODE, so we search
+	// for the elif form used in the four-way dispatch.)
+	idx := strings.Index(src, `elif [ "${CM_MODE:-}" = "knowledge-refresh" ]; then`)
 	require.NotEqual(t, -1, idx, "knowledge-refresh dispatch branch not found")
 
 	// And ends at the next elif (HITL branch) or fi.
