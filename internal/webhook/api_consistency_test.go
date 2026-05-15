@@ -562,3 +562,7 @@ func (n *noopRunner) BuildChatAuthEnv(_ context.Context) map[string]string { ret
 func (n *noopRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 
 func (n *noopRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (n *noopRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (n *noopRunner) DeleteChatCleanup(_ string) {}

@@ -365,6 +365,10 @@ func (f *reconcileFakeRunner) AttachChatStdin(_ context.Context, _, _ string) er
 
 func (f *reconcileFakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
 
+func (f *reconcileFakeRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (f *reconcileFakeRunner) DeleteChatCleanup(_ string) {}
+
 // TestHandleListContainers_ReturnsDockerAuthoritativeList confirms that the
 // endpoint surfaces every ManagedContainer returned by the manager, including
 // the tracked/untracked split. The tracker state is reflected on each entry so
@@ -576,6 +580,10 @@ func (f *fakeRunner) BuildChatAuthEnv(_ context.Context) map[string]string { ret
 func (f *fakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 
 func (f *fakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (f *fakeRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (f *fakeRunner) DeleteChatCleanup(_ string) {}
 
 // TestHandleTrigger_InteractivePropagated verifies that the Interactive field from the
 // JSON trigger body is correctly propagated into the RunConfig passed to the manager.
@@ -1795,6 +1803,10 @@ func (s *stopAllFakeRunner) BuildChatAuthEnv(_ context.Context) map[string]strin
 func (s *stopAllFakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 
 func (s *stopAllFakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
+
+func (s *stopAllFakeRunner) WaitAndCleanupChat(_, _, _ string) {}
+
+func (s *stopAllFakeRunner) DeleteChatCleanup(_ string) {}
 
 func (s *stopAllFakeRunner) killedIDs() []string {
 	s.mu.Lock()

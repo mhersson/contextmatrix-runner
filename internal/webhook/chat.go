@@ -124,6 +124,10 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 				"container_id", containerID, "error", stopErr.Error())
 		}
 
+		// Discard the cleanup state stashed by StartChat; WaitAndCleanupChat
+		// has not been called yet so nothing else will pop it.
+		h.manager.DeleteChatCleanup(containerID)
+
 		switch {
 		case errors.Is(addErr, tracker.ErrLimitReached):
 			h.logWarn("chat/start: runner saturated at reservation",
@@ -136,10 +140,23 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Start the implicit-exit cleanup goroutine now that the tracker holds
+	// the entry. If the container dies in the next microsecond (bad image,
+	// exec failure) RemoveChat will find and clear the entry we just
+	// registered — closing the race window that existed when StartChat
+	// spawned this goroutine internally.
+	h.manager.WaitAndCleanupChat(p.SessionID, containerID, p.Project)
+
 	// Attach stdin so subsequent /message turns can stream into claude. If
 	// the attach fails we tear the whole thing down and surface a 502; a
 	// running container without stdin is dead weight (every /message call
 	// would 409 with "container is not interactive").
+	//
+	// WaitAndCleanupChat is already running by this point, so we rely on
+	// Stop to make ContainerWait return; the goroutine then pops the
+	// cleanup state and unlinks the secrets file + resume dir. No explicit
+	// DeleteChatCleanup is needed here (deleting it would race the
+	// goroutine and silently drop the secret-file cleanup).
 	if err := h.manager.AttachChatStdin(r.Context(), p.SessionID, containerID); err != nil {
 		h.tracker.RemoveChat(p.SessionID)
 		streamCancel()

@@ -258,6 +258,23 @@ type Manager struct {
 	// createFile is os.OpenFile(path, O_CREATE|O_WRONLY|O_EXCL|O_TRUNC, 0o600)
 	// by default; swappable in tests to inject file-creation errors.
 	createFile func(path string) (*os.File, error)
+
+	// chatCleanup stashes the resources that WaitAndCleanupChat must
+	// release after the container exits. Populated by StartChat (keyed
+	// by container ID) and consumed by WaitAndCleanupChat.
+	// Ownership of the wait goroutine sits with the webhook handler so
+	// the tracker entry is registered before an instant container exit
+	// can race RemoveChat against AddChat.
+	chatCleanupMu sync.Mutex
+	chatCleanup   map[string]chatCleanupState
+}
+
+// chatCleanupState captures the resources that the deferred
+// WaitAndCleanupChat goroutine must release once the container exits.
+// Populated by StartChat; consumed and deleted by WaitAndCleanupChat.
+type chatCleanupState struct {
+	delivery       secretDelivery
+	resumeDelivery chatResumeDelivery
 }
 
 // WithMetrics attaches a metrics bundle to the manager. A nil bundle disables
@@ -292,6 +309,7 @@ func NewManager(
 		createFile: func(path string) (*os.File, error) {
 			return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
 		},
+		chatCleanup: map[string]chatCleanupState{},
 	}
 }
 
@@ -1898,7 +1916,7 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 
 // SweepStaleChatResumeDirs removes cmr-chat-resume-* host directories that are
 // older than maxAge. These directories are created by prepareChatResume and
-// cleaned up by waitAndCleanupChat; any that survive are crash-leak artefacts.
+// cleaned up by WaitAndCleanupChat; any that survive are crash-leak artefacts.
 // Candidates are searched under SecretsDir (primary) and os.TempDir() (dev
 // fallback). Per-entry removal errors are logged and silently swallowed — this
 // is a best-effort janitor.
@@ -2309,12 +2327,43 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 		"session_id", opts.SessionID, "container_id", resp.ID, "name", name,
 		"resume_active", resumeDelivery.DirPath != "")
 
-	m.waitAndCleanupChat(opts.SessionID, resp.ID, opts.Project, delivery, resumeDelivery)
+	// Lifecycle of the wait-and-cleanup goroutine is owned by the
+	// webhook handler. It registers the tracker entry first (so an
+	// instant container exit cannot race the entry's creation), then
+	// calls WaitAndCleanupChat once registration succeeds. Stash the
+	// delivery handles here so the goroutine can release them on exit
+	// without needing the secret/resume types in its signature.
+	m.chatCleanupMu.Lock()
+	m.chatCleanup[resp.ID] = chatCleanupState{
+		delivery:       delivery,
+		resumeDelivery: resumeDelivery,
+	}
+	m.chatCleanupMu.Unlock()
 
 	return resp.ID, nil
 }
 
-// waitAndCleanupChat launches a wg-tracked goroutine that waits for the chat
+// DeleteChatCleanup pops the cleanup state stashed by StartChat for the given
+// container ID and runs the host-side file cleanup (secrets file + chat
+// resume dir). Called by webhook rollback paths that abort BEFORE invoking
+// WaitAndCleanupChat — in those paths the wait goroutine is not running,
+// so no one else will perform the cleanup. Safe to call on an unknown ID:
+// returns without touching the filesystem.
+func (m *Manager) DeleteChatCleanup(containerID string) {
+	m.chatCleanupMu.Lock()
+	state, ok := m.chatCleanup[containerID]
+	delete(m.chatCleanup, containerID)
+	m.chatCleanupMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	m.removeSecretsFile(state.delivery, m.logger)
+	m.removeChatResume(state.resumeDelivery, m.logger)
+}
+
+// WaitAndCleanupChat launches a wg-tracked goroutine that waits for the chat
 // container to exit (any reason — claude crash, OOM, external kill, or a
 // /chat/end-triggered Stop) and then unconditionally removes the tracker
 // entry and force-removes the container.
@@ -2331,11 +2380,22 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 // kicked off /chat/start. The associated log-stream goroutine (from
 // StreamChatLogs) exits on its own when ContainerLogs EOFs on container
 // removal, so no explicit cancel is required here.
-func (m *Manager) waitAndCleanupChat(sessionID, containerID, project string, delivery secretDelivery, resumeDelivery chatResumeDelivery) {
+//
+// The webhook handler owns the lifecycle: StartChat returns the container
+// ID after stashing the delivery handles in m.chatCleanup, and the handler
+// invokes WaitAndCleanupChat only after registering the tracker entry. The
+// secret / resume cleanup handles are popped from the chatCleanup map so
+// callers don't need to thread them through the signature.
+func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 	m.wg.Add(1)
 
 	go func() {
 		defer m.wg.Done()
+
+		m.chatCleanupMu.Lock()
+		state, hasState := m.chatCleanup[containerID]
+		delete(m.chatCleanup, containerID)
+		m.chatCleanupMu.Unlock()
 
 		log := m.logger.With("session_id", sessionID, "container_id", containerID, "project", project)
 
@@ -2359,8 +2419,10 @@ func (m *Manager) waitAndCleanupChat(sessionID, containerID, project string, del
 		m.removeContainer(rmCtx, containerID, log)
 
 		// Unlink the per-container secrets file (no-op in env-fallback mode).
-		m.removeSecretsFile(delivery, log)
-		m.removeChatResume(resumeDelivery, log)
+		if hasState {
+			m.removeSecretsFile(state.delivery, log)
+			m.removeChatResume(state.resumeDelivery, log)
+		}
 	}()
 }
 

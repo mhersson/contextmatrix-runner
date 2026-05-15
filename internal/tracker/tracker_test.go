@@ -3,6 +3,7 @@ package tracker
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"runtime"
 	"strconv"
@@ -1009,4 +1010,44 @@ func TestWriteStdinChat_StdinClosed(t *testing.T) {
 
 	err := tr.WriteStdinChat("01SESS", []byte("hello"))
 	require.ErrorIs(t, err, ErrStdinClosed)
+}
+
+func TestRemove_InvokesCancel(t *testing.T) {
+	tr := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // belt-and-braces in case Remove regresses
+
+	require.NoError(t, tr.Add(&ContainerInfo{
+		Project: "alpha",
+		CardID:  "ALPHA-1",
+		Cancel:  cancel,
+	}))
+
+	tr.Remove("alpha", "ALPHA-1")
+
+	select {
+	case <-ctx.Done():
+		// Expected: Remove invoked Cancel.
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("Remove did not invoke stored Cancel")
+	}
+}
+
+func TestRemoveChat_InvokesCancel(t *testing.T) {
+	tr := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	require.NoError(t, tr.AddChat(&ContainerInfo{
+		SessionID: "sess-1",
+		Cancel:    cancel,
+	}))
+
+	tr.RemoveChat("sess-1")
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("RemoveChat did not invoke stored Cancel")
+	}
 }

@@ -606,6 +606,14 @@ func (r *strictRunner) AttachChatStdin(_ context.Context, _, _ string) error { r
 
 func (r *strictRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
 
+func (r *strictRunner) WaitAndCleanupChat(_, _, _ string) {
+	r.t.Fatalf("manager.WaitAndCleanupChat must not be called on invalid payload")
+}
+
+func (r *strictRunner) DeleteChatCleanup(_ string) {
+	r.t.Fatalf("manager.DeleteChatCleanup must not be called on invalid payload")
+}
+
 // -----------------------------------------------------------------------------
 // ValidateRefreshKnowledge
 // -----------------------------------------------------------------------------

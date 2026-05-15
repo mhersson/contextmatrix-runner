@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,10 +29,19 @@ type chatFakeRunner struct {
 	// workerImage is returned by WorkerImage.
 	workerImage string
 
+	// tracker is consulted by the fake's WaitAndCleanupChat to drop the entry
+	// when exitContainer fires. Optional; only tests that exercise the
+	// lifecycle-ownership transfer need to set it.
+	tracker TrackerService
+
 	// Captured state for test assertions.
-	mu            sync.Mutex
-	LastStartOpts container.StartChatOpts
-	PrimingWrites [][]byte
+	mu                   sync.Mutex
+	LastStartOpts        container.StartChatOpts
+	PrimingWrites        [][]byte
+	WaitCleanupSessions  []string
+	DeleteCleanupCalled  []string
+	waitExitChans        map[string]chan struct{}
+	waitGoroutinesActive sync.WaitGroup
 }
 
 func (f *chatFakeRunner) Run(_ context.Context, _ container.RunConfig) {}
@@ -80,6 +90,67 @@ func (f *chatFakeRunner) AttachChatStdin(ctx context.Context, sessionID, contain
 
 func (f *chatFakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
 
+// WaitAndCleanupChat models the production hook: spawn a goroutine that waits
+// for an external "container exited" signal and then removes the tracker
+// entry. Tests trigger the exit via exitContainer.
+func (f *chatFakeRunner) WaitAndCleanupChat(sessionID, containerID, _ string) {
+	f.mu.Lock()
+	f.WaitCleanupSessions = append(f.WaitCleanupSessions, sessionID)
+
+	if f.waitExitChans == nil {
+		f.waitExitChans = map[string]chan struct{}{}
+	}
+
+	ch, ok := f.waitExitChans[containerID]
+	if !ok {
+		ch = make(chan struct{})
+		f.waitExitChans[containerID] = ch
+	}
+
+	f.mu.Unlock()
+
+	f.waitGoroutinesActive.Add(1)
+
+	go func() {
+		defer f.waitGoroutinesActive.Done()
+
+		<-ch
+
+		if f.tracker != nil {
+			f.tracker.RemoveChat(sessionID)
+		}
+	}()
+}
+
+// DeleteChatCleanup records that the rollback path discarded the stashed
+// cleanup state for containerID.
+func (f *chatFakeRunner) DeleteChatCleanup(containerID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.DeleteCleanupCalled = append(f.DeleteCleanupCalled, containerID)
+}
+
+// exitContainer signals the wait goroutine that the container has exited so
+// the fake's WaitAndCleanupChat can drop the tracker entry.
+func (f *chatFakeRunner) exitContainer(containerID string) {
+	f.mu.Lock()
+
+	if f.waitExitChans == nil {
+		f.waitExitChans = map[string]chan struct{}{}
+	}
+
+	ch, ok := f.waitExitChans[containerID]
+	if !ok {
+		ch = make(chan struct{})
+		f.waitExitChans[containerID] = ch
+	}
+
+	f.mu.Unlock()
+
+	close(ch)
+}
+
 // TestChatStart_Success verifies that a valid /chat/start request returns 202
 // and records the container in the tracker.
 func TestChatStart_Success(t *testing.T) {
@@ -103,6 +174,46 @@ func TestChatStart_Success(t *testing.T) {
 
 	// Tracker must have the chat entry.
 	assert.True(t, tr.HasChat("sess-001"))
+}
+
+// TestChatStart_TrackerRegisteredBeforeWaitGoroutine verifies that the wait-and-
+// cleanup goroutine is owned by the webhook handler and only spawned AFTER the
+// tracker entry has been registered. If the goroutine fired earlier (inside
+// StartChat, as it used to) a microsecond-scale container exit could call
+// RemoveChat before AddChat, leaving an orphan entry behind.
+func TestChatStart_TrackerRegisteredBeforeWaitGoroutine(t *testing.T) {
+	tr := tracker.New()
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		tracker:     tr,
+		startChatFn: func(_ context.Context, _ container.StartChatOpts) (string, error) {
+			return "container-xyz", nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "sess-1",
+		Project:   "alpha",
+		Model:     "claude-sonnet-4-5",
+	})
+	h.hmacAuth(h.handleChatStart)(w, req)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	require.True(t, tr.HasChat("sess-1"),
+		"tracker entry must exist immediately after a successful /chat/start")
+
+	fake.mu.Lock()
+	require.Contains(t, fake.WaitCleanupSessions, "sess-1",
+		"webhook handler must launch WaitAndCleanupChat after registering the tracker entry")
+	fake.mu.Unlock()
+
+	fake.exitContainer("container-xyz")
+
+	require.Eventually(t, func() bool {
+		return !tr.HasChat("sess-1")
+	}, time.Second, 10*time.Millisecond, "tracker entry must be cleared after container exit")
 }
 
 // TestChatStart_Conflict_WhenAlreadyTracked verifies that a duplicate

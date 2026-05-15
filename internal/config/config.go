@@ -440,6 +440,14 @@ func (c *Config) Validate() error {
 		switch k {
 		case "CM_GIT_TOKEN", "CM_MCP_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY":
 			return fmt.Errorf("worker_extra_env key %q collides with a secrets-file var; remove it", k)
+		case "GIT_SSL_NO_VERIFY", "GIT_TERMINAL_PROMPT",
+			"LD_PRELOAD", "LD_LIBRARY_PATH",
+			"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+			"NODE_OPTIONS",
+			"PATH",
+			"GOPROXY", "GOSUMDB", "GOFLAGS",
+			"PYTHONPATH":
+			return fmt.Errorf("worker_extra_env key %q is unsafe (would let YAML override worker behaviour); remove it", k)
 		}
 	}
 

@@ -375,7 +375,15 @@ func (t *Tracker) Remove(project, cardID string) {
 	}
 	t.mu.Unlock()
 
-	if ok && info.stdin != nil {
+	if !ok {
+		return
+	}
+
+	if info.Cancel != nil {
+		info.Cancel()
+	}
+
+	if info.stdin != nil {
 		closeStdinAsync(info, k)
 	}
 }
@@ -439,7 +447,15 @@ func (t *Tracker) RemoveChat(sessionID string) {
 	}
 	t.mu.Unlock()
 
-	if ok && info.stdin != nil {
+	if !ok {
+		return
+	}
+
+	if info.Cancel != nil {
+		info.Cancel()
+	}
+
+	if info.stdin != nil {
 		closeStdinAsync(info, k)
 	}
 }

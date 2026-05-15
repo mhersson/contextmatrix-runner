@@ -2636,13 +2636,17 @@ func TestIdleWatchdog_Disabled(t *testing.T) {
 
 	tr := tracker.New()
 
-	var cancelled atomic.Bool
+	// Count Cancel invocations. waitAndCleanup invokes tracker.Remove on
+	// normal teardown, which now calls the stored Cancel exactly once (H4
+	// fix). If the watchdog ALSO fires it would call Kill -> tracker.Cancel
+	// -> info.Cancel, bumping the counter past one.
+	var cancelCount atomic.Int32
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  payload.CardID,
 		Project: payload.Project,
-		Cancel:  func() { cancelled.Store(true) },
+		Cancel:  func() { cancelCount.Add(1) },
 	}))
 
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
@@ -2653,7 +2657,8 @@ func TestIdleWatchdog_Disabled(t *testing.T) {
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
 
-	assert.False(t, cancelled.Load(), "watchdog must not fire when IdleOutputTimeout is 0")
+	assert.LessOrEqual(t, cancelCount.Load(), int32(1),
+		"watchdog must not fire when IdleOutputTimeout is 0 (only tracker.Remove may invoke Cancel)")
 }
 
 // TestPruneImages_CallsDockerWithCorrectFilters verifies PruneImages forwards
@@ -4439,11 +4444,94 @@ func TestCleanupOrphans_SkipsTrackedChat(t *testing.T) {
 		"only the untracked chat container must be removed; tracked live-chat must survive")
 }
 
-// TestManager_StartChat_WaitCleanupRemovesTrackerOnExit verifies that StartChat
-// launches a wg-tracked goroutine which waits for the container to exit and
-// then removes the tracker entry plus force-removes the container. This covers
-// the implicit-exit paths (claude crash, OOM, external kill) where /chat/end
-// is NOT called by the user but the container exits anyway.
+// TestManager_DeleteChatCleanup_UnlinksHostFiles guards the leak in the
+// AddChatIfUnderLimit rollback path: after StartChat populates the host-side
+// secrets file and resume directory, the webhook handler calls
+// DeleteChatCleanup as part of its rollback. The wait goroutine is NOT yet
+// running, so DeleteChatCleanup itself must run the file cleanup. Prior to
+// the H5 follow-up fix, DeleteChatCleanup only popped the map entry and the
+// secrets file + resume dir leaked on every limit-reached / track-failed
+// rollback.
+func TestManager_DeleteChatCleanup_UnlinksHostFiles(t *testing.T) {
+	var capturedHostCfg *container.HostConfig
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, hostCfg *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedHostCfg = hostCfg
+
+		return container.CreateResponse{ID: "chat-ctr-rollback"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	// Production profile + writable temp SecretsDir → file-mode secrets +
+	// disk-resident resume dir. Both target directories live under the
+	// per-test tempdir so leaks are visible.
+	cfg := testConfig()
+	cfg.DeploymentProfile = config.ProfileProduction
+	cfg.SecretsDir = t.TempDir()
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	containerID, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "S-rollback",
+		Project:   "alpha",
+		RepoURL:   "https://example.com/alpha.git",
+		MCPAPIKey: "mcp-secret-key",
+		AuthEnv: map[string]string{
+			"CM_GIT_TOKEN": "gh-token-secret",
+		},
+		Resume: &ChatResume{
+			Turns: []ChatResumeTurn{
+				{Seq: 1, Role: "user", Content: "hi"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "chat-ctr-rollback", containerID)
+	require.NotNil(t, capturedHostCfg)
+
+	// Recover the host-side paths from the captured mount config.
+	var secretsPath, resumeDir string
+
+	for _, m := range capturedHostCfg.Mounts {
+		switch m.Target {
+		case secretsMountTarget:
+			secretsPath = m.Source
+		case chatResumeMountTarget:
+			resumeDir = m.Source
+		}
+	}
+
+	require.NotEmpty(t, secretsPath, "secrets file mount must be present")
+	require.NotEmpty(t, resumeDir, "resume dir mount must be present")
+	require.FileExists(t, secretsPath, "secrets file must exist after StartChat")
+	require.DirExists(t, resumeDir, "resume dir must exist after StartChat")
+
+	// Simulate the webhook handler's AddChatIfUnderLimit rollback: no
+	// tracker entry was registered, no WaitAndCleanupChat was launched,
+	// and the handler invokes DeleteChatCleanup. DeleteChatCleanup must
+	// do the file cleanup itself because no wait goroutine will.
+	mgr.DeleteChatCleanup(containerID)
+
+	assert.NoFileExists(t, secretsPath,
+		"DeleteChatCleanup must unlink the host-side secrets file")
+	assert.NoDirExists(t, resumeDir,
+		"DeleteChatCleanup must remove the host-side resume directory")
+}
+
+// TestManager_StartChat_WaitCleanupRemovesTrackerOnExit verifies that the
+// wait-and-cleanup path waits for the container to exit and then removes the
+// tracker entry plus force-removes the container. This covers the implicit-
+// exit paths (claude crash, OOM, external kill) where /chat/end is NOT called
+// by the user but the container exits anyway.
+//
+// The wait goroutine is launched by the webhook handler after the tracker
+// entry is registered (so an instant container exit cannot race AddChat); the
+// test simulates that ordering explicitly by calling WaitAndCleanupChat after
+// tr.AddChat.
 func TestManager_StartChat_WaitCleanupRemovesTrackerOnExit(t *testing.T) {
 	waitCh := make(chan container.WaitResponse, 1)
 	errCh := make(chan error, 1)
@@ -4481,8 +4569,8 @@ func TestManager_StartChat_WaitCleanupRemovesTrackerOnExit(t *testing.T) {
 	assert.Equal(t, "chat-ctr-wait", containerID)
 
 	// Simulate the webhook handler registering the tracker entry after
-	// StartChat returns. Without this, the cleanup goroutine has nothing
-	// to remove.
+	// StartChat returns and then launching the wait goroutine. Without
+	// this ordering, the cleanup goroutine has nothing to remove.
 	_, streamCancel := context.WithCancel(context.Background())
 	t.Cleanup(streamCancel)
 	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
@@ -4493,11 +4581,12 @@ func TestManager_StartChat_WaitCleanupRemovesTrackerOnExit(t *testing.T) {
 		Cancel:      streamCancel,
 	}))
 
+	mgr.WaitAndCleanupChat("S-wait", containerID, "alpha")
+
 	require.True(t, tr.HasChat("S-wait"), "tracker entry should exist before container exit")
 
-	// Fire the container exit. The cleanup goroutine launched inside
-	// StartChat must observe this, remove the tracker entry, and
-	// force-remove the container.
+	// Fire the container exit. The wait goroutine must observe this,
+	// remove the tracker entry, and force-remove the container.
 	waitCh <- container.WaitResponse{StatusCode: 0}
 
 	mgr.Wait()

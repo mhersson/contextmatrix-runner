@@ -44,6 +44,8 @@ type ContainerRunner interface {
 	StartChat(ctx context.Context, opts container.StartChatOpts) (string, error)
 	AttachChatStdin(ctx context.Context, sessionID, containerID string) error
 	StreamChatLogs(ctx context.Context, sessionID, containerID, project string)
+	WaitAndCleanupChat(sessionID, containerID, project string)
+	DeleteChatCleanup(containerID string)
 	Stop(ctx context.Context, containerID string) error
 	WorkerImage() string
 	BuildChatAuthEnv(ctx context.Context) map[string]string
@@ -533,9 +535,19 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Chat path: session_id is set — route to the chat tracker.
-	// Dedup cache is keyed on (project, card_id, message_id) which does not fit
-	// the chat model; dedup for chat sessions is deferred to a future iteration.
+	// Dedup is keyed on (session_id, message_id) and shares the underlying
+	// MessageDedupCache via a sentinel project name, so a retried POST
+	// after a network blip replays the original ack instead of
+	// double-writing the user turn into stdin.
 	if payload.IsChat() {
+		if h.messageDedup != nil && payload.MessageID != "" {
+			if ack, ok := h.messageDedup.GetChat(payload.SessionID, payload.MessageID); ok {
+				writeRawAck(w, ack)
+
+				return
+			}
+		}
+
 		if !h.tracker.HasChat(payload.SessionID) {
 			writeError(w, http.StatusNotFound, CodeNotFound, "no chat container tracked")
 
@@ -578,7 +590,24 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		h.logInfo("message: chat stdin written",
 			"session_id", payload.SessionID, "message_id", payload.MessageID, "content_len", len(payload.Content))
 
-		writeJSON(w, http.StatusAccepted, SuccessResponse{OK: true, MessageID: payload.MessageID})
+		// Marshal the success ack once so retries see byte-identical bytes
+		// from the dedup cache. A marshal error here is an internal bug,
+		// not a client problem — fall back to writeJSON.
+		ackBytes, err := json.Marshal(SuccessResponse{OK: true, MessageID: payload.MessageID})
+		if err != nil {
+			writeJSON(w, http.StatusAccepted, SuccessResponse{OK: true, MessageID: payload.MessageID})
+
+			return
+		}
+
+		if h.messageDedup != nil && payload.MessageID != "" {
+			h.messageDedup.PutChat(payload.SessionID, payload.MessageID, CachedAck{
+				Status: http.StatusAccepted,
+				Body:   ackBytes,
+			})
+		}
+
+		writeRawAck(w, CachedAck{Status: http.StatusAccepted, Body: ackBytes})
 
 		return
 	}

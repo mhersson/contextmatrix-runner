@@ -70,23 +70,48 @@ func NewMessageDedupCache(ttl time.Duration, capacity int, opts ...MessageDedupC
 	return c
 }
 
-// messageDedupKey builds the composite lookup key for a message.
-// Uses \x00 as a delimiter to avoid collisions across fields that
-// could legitimately contain dashes, slashes, or other punctuation.
+// chatDedupSentinel is a chat-namespace marker for MessageDedupCache keys.
+// Contains a NUL byte so it cannot collide with any validated project name
+// (project names go through validateIdent which rejects NUL).
+const chatDedupSentinel = "\x00chat"
+
+// messageDedupKey builds the composite lookup key for a card-mode
+// message. Uses \x00 as a delimiter to avoid collisions across fields
+// that could legitimately contain dashes, slashes, or other punctuation.
 func messageDedupKey(project, cardID, messageID string) string {
 	return project + "\x00" + cardID + "\x00" + messageID
 }
 
-// Get returns the stored ack for the key if present and not expired.
-// The second return value is false on miss or on a stale entry (which
-// is evicted eagerly).
+// chatDedupKey builds a chat-mode dedup key. Shares the underlying cache
+// with card-mode entries by namespacing on a NUL-prefixed sentinel that
+// validated project names cannot produce.
+func chatDedupKey(sessionID, messageID string) string {
+	return chatDedupSentinel + "\x00" + sessionID + "\x00" + messageID
+}
+
+// Get returns the stored ack for the (project, cardID, messageID) tuple
+// if present and not expired. The second return value is false on miss
+// or on a stale entry (which is evicted eagerly).
 func (c *MessageDedupCache) Get(project, cardID, messageID string) (CachedAck, bool) {
 	if messageID == "" {
 		return CachedAck{}, false
 	}
 
-	key := messageDedupKey(project, cardID, messageID)
+	return c.getByKey(messageDedupKey(project, cardID, messageID))
+}
 
+// GetChat returns the stored ack for a chat-mode (sessionID, messageID)
+// pair. An empty messageID returns a miss.
+func (c *MessageDedupCache) GetChat(sessionID, messageID string) (CachedAck, bool) {
+	if messageID == "" {
+		return CachedAck{}, false
+	}
+
+	return c.getByKey(chatDedupKey(sessionID, messageID))
+}
+
+// getByKey is the shared lookup core used by Get and GetChat.
+func (c *MessageDedupCache) getByKey(key string) (CachedAck, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -121,8 +146,21 @@ func (c *MessageDedupCache) Put(project, cardID, messageID string, ack CachedAck
 		return
 	}
 
-	key := messageDedupKey(project, cardID, messageID)
+	c.putByKey(messageDedupKey(project, cardID, messageID), ack)
+}
 
+// PutChat stores the ack for a chat-mode (sessionID, messageID) pair.
+// An empty messageID is a no-op.
+func (c *MessageDedupCache) PutChat(sessionID, messageID string, ack CachedAck) {
+	if messageID == "" {
+		return
+	}
+
+	c.putByKey(chatDedupKey(sessionID, messageID), ack)
+}
+
+// putByKey is the shared insertion core used by Put and PutChat.
+func (c *MessageDedupCache) putByKey(key string, ack CachedAck) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
