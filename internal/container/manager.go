@@ -36,6 +36,7 @@ import (
 	githubauth "github.com/mhersson/contextmatrix-githubauth"
 
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
+	"github.com/mhersson/contextmatrix-runner/internal/chatproto"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/logparser"
@@ -927,7 +928,7 @@ func (m *Manager) prepareChatResume(containerName, sessionID, project string, re
 	}
 
 	meta := chatResumeMeta{
-		PromptVersion: 1,
+		PromptVersion: chatproto.PromptVersion,
 		Clipped:       resume.Clipped,
 		TurnCount:     len(resume.Turns),
 		OrigSeqMax:    resume.OrigSeq,
@@ -1895,6 +1896,49 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// SweepStaleChatResumeDirs removes cmr-chat-resume-* host directories that are
+// older than maxAge. These directories are created by prepareChatResume and
+// cleaned up by waitAndCleanupChat; any that survive are crash-leak artefacts.
+// Candidates are searched under SecretsDir (primary) and os.TempDir() (dev
+// fallback). Per-entry removal errors are logged and silently swallowed — this
+// is a best-effort janitor.
+func (m *Manager) SweepStaleChatResumeDirs(maxAge time.Duration) {
+	secretsDir := m.cfg.SecretsDir
+	if secretsDir == "" {
+		secretsDir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
+	}
+
+	parents := []string{secretsDir, filepath.Join(os.TempDir(), "cm-runner-chat-resume")}
+
+	for _, parent := range parents {
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			// Directory may not exist; that's fine.
+			continue
+		}
+
+		for _, e := range entries {
+			if !strings.HasPrefix(e.Name(), "cmr-chat-resume-") {
+				continue
+			}
+
+			info, err := e.Info()
+			if err != nil || time.Since(info.ModTime()) <= maxAge {
+				continue
+			}
+
+			target := filepath.Join(parent, e.Name())
+			if err := os.RemoveAll(target); err != nil {
+				m.logger.Warn("sweep: failed to remove stale chat resume dir",
+					"path", target, "age", time.Since(info.ModTime()).Round(time.Second), "error", err)
+			} else {
+				m.logger.Info("sweep: removed stale chat resume dir",
+					"path", target, "age", time.Since(info.ModTime()).Round(time.Second))
+			}
+		}
+	}
+}
+
 func (m *Manager) pullImage(ctx context.Context, img string) error {
 	policy := m.cfg.ImagePullPolicy
 	if policy == "" {
@@ -2131,7 +2175,7 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 	}
 
 	if opts.RepoURL != "" {
-		env = append(env, "CM_CHAT_REPO_URL="+opts.RepoURL)
+		env = append(env, "CM_CHAT_REPO_URL="+normalizeRepoURL(opts.RepoURL))
 	}
 
 	if opts.MCPURL != "" {
@@ -2159,7 +2203,11 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 	}
 
 	// Sanitise a container name from session ID (may contain arbitrary chars).
+	// Truncate at 63 chars — Docker's enforced container name limit.
 	name := "cmr-chat-" + containerNameRe.ReplaceAllString(strings.ToLower(opts.SessionID), "-")
+	if len(name) > 63 {
+		name = name[:63]
+	}
 
 	delivery, err := m.prepareSecrets(name, secrets)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/mhersson/contextmatrix-runner/internal/container"
@@ -42,8 +43,13 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hostOnly := ""
+	if u, err := url.Parse(p.RepoURL); err == nil {
+		hostOnly = u.Host
+	}
+
 	h.logInfo("chat/start: received",
-		"session_id", p.SessionID, "project", p.Project, "repo_url", p.RepoURL)
+		"session_id", p.SessionID, "project", p.Project, "repo_host", hostOnly)
 
 	if h.tracker.HasChat(p.SessionID) {
 		writeError(w, http.StatusConflict, CodeConflict, "session already has a container")

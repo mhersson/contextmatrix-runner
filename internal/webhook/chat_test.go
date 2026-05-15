@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -445,6 +446,93 @@ func TestChatStart_NoPrimingWhenResumeNil(t *testing.T) {
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 	require.Empty(t, tr.PrimingWrites, "no priming writes when Resume is nil")
+}
+
+// TestChatStart_LargeBodyReturnsClearError verifies that a resume payload
+// exceeding chatResumeMaxTurns is rejected with 400 (CodeInvalidField) and
+// that the rejection happens inside validateChatResume rather than as a 401
+// from the HMAC middleware truncating an oversized body.
+//
+// The two sub-cases bracket the new 600-turn cap. The at-cap case uses 1 KiB
+// per turn so that 600 × ~1100-byte JSON-encoded turn stays well under
+// hmacAuth's 1 MiB read window (chatResumeMaxContentBytes=4 KiB per turn
+// would produce ~2.4 MiB at 600 turns, exceeding the HMAC window).
+// transcript.Build's 40k-token budget means production payloads are far
+// smaller than this worst-case test — the turn-count cap is the binding
+// constraint, not bytes.
+//
+//   - exactly chatResumeMaxTurns turns at 1024 bytes each → body ≈ 660 KiB,
+//     fits within hmacAuth's 1 MiB window → 202 Accepted.
+//   - chatResumeMaxTurns+1 turns → validation rejects before HMAC can
+//     truncate → 400 with CodeInvalidField.
+func TestChatStart_LargeBodyReturnsClearError(t *testing.T) {
+	t.Parallel()
+
+	// atCapContentSize is chosen so that chatResumeMaxTurns turns of this size
+	// produce a JSON body under hmacAuth's 1 MiB read window while still being
+	// large enough to constitute a realistic stress payload. 1 KiB per turn ×
+	// 600 turns ≈ 614 KiB of content; with JSON framing the total is ~660 KiB.
+	const atCapContentSize = 1024
+
+	tr := &chatTrackerWrapper{Tracker: tracker.New()}
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sessionID, _ string) error {
+			tr.SetStdinChat(sessionID, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	// --- sub-case 1: exactly at the cap → should succeed. ---
+	turns := make([]ChatResumeTurn, chatResumeMaxTurns)
+	for i := range turns {
+		turns[i] = ChatResumeTurn{
+			Seq:     int64(i + 1),
+			Role:    "user",
+			Content: strings.Repeat("x", atCapContentSize),
+		}
+	}
+
+	body, err := json.Marshal(ChatStartPayload{
+		SessionID: "01SESS-AT-CAP",
+		Project:   "p",
+		Resume:    &ChatResumeContext{Turns: turns},
+	})
+	require.NoError(t, err)
+	require.Less(t, len(body), 1<<20, "at-cap body must stay within hmacAuth's 1 MiB window")
+
+	w := httptest.NewRecorder()
+	h.hmacAuth(h.handleChatStart)(w, signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS-AT-CAP",
+		Project:   "p",
+		Resume:    &ChatResumeContext{Turns: turns},
+	}))
+	require.Equal(t, http.StatusAccepted, w.Code, "at-cap payload must be accepted")
+
+	// --- sub-case 2: one turn over the cap → clear 400, not 401. ---
+	over := make([]ChatResumeTurn, chatResumeMaxTurns+1)
+	for i := range over {
+		over[i] = ChatResumeTurn{
+			Seq:     int64(i + 1),
+			Role:    "user",
+			Content: strings.Repeat("x", atCapContentSize),
+		}
+	}
+
+	w2 := httptest.NewRecorder()
+	h.hmacAuth(h.handleChatStart)(w2, signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: "01SESS-OVER",
+		Project:   "p",
+		Resume:    &ChatResumeContext{Turns: over},
+	}))
+	require.Equal(t, http.StatusBadRequest, w2.Code,
+		"over-cap payload must return 400, not 401 from HMAC truncation")
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w2.Body).Decode(&resp))
+	assert.Equal(t, CodeInvalidField, resp.Code)
 }
 
 // TestChatStart_WriteStdinFailureDoesNotTearDown verifies that if writing

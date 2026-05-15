@@ -370,7 +370,20 @@ var chatModelPattern = regexp.MustCompile(`^claude-[a-z0-9.-]{1,64}$`)
 var chatResumeRolePattern = regexp.MustCompile(`^(user|assistant_text|tool_call|tool_result_summary)$`)
 
 const (
-	chatResumeMaxTurns        = 500
+	// chatResumeMaxTurns caps the resume payload at 600 turns, matching CM's
+	// maxMessagesForBuild constant — the maximum number of turns buildResume
+	// can ever produce before transcript.Build filters down to fit the
+	// 40k-token budget. transcript.Build's token budget bounds total content
+	// well below hmacAuth's 1 MiB read window in practice (40k tokens ×
+	// ~4 chars/token ≈ 160 KB of text, plus JSON overhead), so a legitimately
+	// oversized turn-count is rejected with 400 (invalid_field) rather than
+	// 401 (signature mismatch on truncated body).
+	chatResumeMaxTurns = 600
+
+	// chatResumeMaxContentBytes is the per-turn content cap. 4 KiB is
+	// generous for a single conversation turn. In production, transcript.Build's
+	// 40k-token budget makes the per-turn average far smaller; this cap is a
+	// defense-in-depth ceiling, not the binding factor for payload size.
 	chatResumeMaxContentBytes = 4 * 1024
 )
 

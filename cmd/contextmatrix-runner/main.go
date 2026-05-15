@@ -457,6 +457,7 @@ func shutdown(d shutdownDeps) {
 type maintenanceTarget interface {
 	CleanupOrphans(ctx context.Context) error
 	PruneImages(ctx context.Context) error
+	SweepStaleChatResumeDirs(maxAge time.Duration)
 }
 
 // maintenanceHealth narrows *webhook.HealthState down to what the loop
@@ -483,6 +484,7 @@ func (a healthDrainAdapter) DrainingLoad() bool {
 var (
 	maintenanceCleanupTimeout = 30 * time.Second
 	maintenancePruneTimeout   = 60 * time.Second
+	maintenanceSweepResumeAge = time.Hour
 )
 
 // runMaintenanceLoop ticks every interval and runs CleanupOrphans + PruneImages.
@@ -523,9 +525,9 @@ func runMaintenanceLoopWithHealth(ctx context.Context, mgr maintenanceTarget, in
 	}
 }
 
-// runMaintenanceTick executes one pass of CleanupOrphans + PruneImages. Each
-// Docker call gets a fresh bounded child of ctx so a wedged daemon cannot
-// stall the loop past the next tick.
+// runMaintenanceTick executes one pass of CleanupOrphans + PruneImages +
+// SweepStaleChatResumeDirs. Each Docker call gets a fresh bounded child of ctx
+// so a wedged daemon cannot stall the loop past the next tick.
 func runMaintenanceTick(ctx context.Context, mgr maintenanceTarget, logger *slog.Logger) {
 	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, maintenanceCleanupTimeout)
 
@@ -542,6 +544,8 @@ func runMaintenanceTick(ctx context.Context, mgr maintenanceTarget, logger *slog
 	}
 
 	pruneCancel()
+
+	mgr.SweepStaleChatResumeDirs(maintenanceSweepResumeAge)
 }
 
 // buildProbes returns the preflight Probes wired to the real
