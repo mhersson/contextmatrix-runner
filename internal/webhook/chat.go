@@ -176,20 +176,8 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 	// If CM shipped a chat-mode primer, write it to stdin BEFORE any
 	// rehydration priming so the agent learns the MCP tool surface and
 	// CM concepts before being asked to re-establish workspace state.
-	// Failures are fail-open (matching the rehydration block below) —
-	// a broken primer write must not break /chat/start.
 	if p.Primer != "" {
-		envelope, buildErr := streammsg.BuildUserMessage(p.Primer)
-		if buildErr != nil {
-			h.logWarn("chat/start: build primer failed",
-				"session_id", p.SessionID, "error", buildErr.Error())
-		} else if writeErr := h.tracker.WriteStdinChat(p.SessionID, envelope); writeErr != nil {
-			h.logWarn("chat/start: write primer failed",
-				"session_id", p.SessionID, "error", writeErr.Error())
-		} else {
-			h.logInfo("chat/start: primer written",
-				"session_id", p.SessionID, "bytes", len(envelope))
-		}
+		h.writeChatPrimingEnvelope(p.SessionID, "primer", p.Primer)
 	}
 
 	// If CM signalled a rehydration phase, prime the agent via stdin with the
@@ -201,19 +189,10 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 	// through /message); only the agent's response — tool_calls and the
 	// eventual chat_rehydration_complete call — is recorded.
 	if p.Resume != nil {
-		text := buildChatRehydrationPriming(p.SessionID)
-
-		envelope, buildErr := streammsg.BuildUserMessage(text)
-		if buildErr != nil {
-			h.logWarn("chat/start: build rehydration priming failed",
-				"session_id", p.SessionID, "error", buildErr.Error())
-		} else if writeErr := h.tracker.WriteStdinChat(p.SessionID, envelope); writeErr != nil {
-			h.logWarn("chat/start: write rehydration priming failed",
-				"session_id", p.SessionID, "error", writeErr.Error())
-		} else {
-			h.logInfo("chat/start: rehydration priming written",
-				"session_id", p.SessionID, "bytes", len(envelope))
-		}
+		h.writeChatPrimingEnvelope(
+			p.SessionID, "rehydration priming",
+			buildChatRehydrationPriming(p.SessionID),
+		)
 	}
 
 	h.manager.StreamChatLogs(streamCtx, p.SessionID, containerID, p.Project)
@@ -299,4 +278,33 @@ func (h *Handler) handleChatEnd(w http.ResponseWriter, r *http.Request) {
 		"session_id", p.SessionID, "container_id", snap.ContainerID)
 
 	writeSuccess(w, http.StatusOK, "")
+}
+
+// writeChatPrimingEnvelope builds a stream-json user envelope from text and
+// writes it to the chat container's stdin. Used by handleChatStart for both
+// the chat-mode primer and the rehydration priming. Build / write failures
+// are fail-open — a WARN is logged and the function returns without raising;
+// the /chat/start request must still return 202 to avoid leaving an
+// orphaned container the operator can't end through normal channels.
+//
+// kind is a human-readable label used only in log messages
+// (e.g. "primer", "rehydration priming") — never persisted to the transcript.
+func (h *Handler) writeChatPrimingEnvelope(sessionID, kind, text string) {
+	envelope, buildErr := streammsg.BuildUserMessage(text)
+	if buildErr != nil {
+		h.logWarn("chat/start: build "+kind+" failed",
+			"session_id", sessionID, "error", buildErr.Error())
+
+		return
+	}
+
+	if writeErr := h.tracker.WriteStdinChat(sessionID, envelope); writeErr != nil {
+		h.logWarn("chat/start: write "+kind+" failed",
+			"session_id", sessionID, "error", writeErr.Error())
+
+		return
+	}
+
+	h.logInfo("chat/start: "+kind+" written",
+		"session_id", sessionID, "bytes", len(envelope))
 }
