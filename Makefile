@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint lint-sh vuln verify-unit clean docker-worker
+.PHONY: build test test-race test-integration lint lint-sh vuln verify-unit clean docker-worker
 
 # Pinned worker toolchain versions (CTXRUN-044). Override on the command line
 # if a newer version has been vetted, e.g.
@@ -27,6 +27,17 @@ test:
 
 test-race:
 	CGO_ENABLED=1 go test -race ./...
+
+# test-integration runs the integration build tag against a real Docker
+# daemon. Slower (~30s) but exercises ContainerStart / ContainerWait /
+# ContainerAttach / stdcopy against the real SDK so a Docker upgrade
+# can't silently break the runner.
+test-integration:
+	@if ! docker info >/dev/null 2>&1; then \
+		echo "docker daemon not reachable; skipping integration tests"; \
+		exit 1; \
+	fi
+	CGO_ENABLED=1 go test -tags integration -race -count=1 ./internal/container/...
 
 lint:
 	golangci-lint run
