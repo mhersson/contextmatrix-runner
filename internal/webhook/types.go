@@ -155,6 +155,12 @@ type ChatStartPayload struct {
 	// the container and sets CM_CHAT_RESUME=1 so the entrypoint switches
 	// into the rehydration prompt branch.
 	Resume *ChatResumeContext `json:"resume,omitempty"`
+	// Primer is the chat-mode orientation text written to the
+	// container's stdin as a stream-json user envelope before any
+	// rehydration priming. Empty means "no primer" — the handler
+	// skips the stdin write. Sourced from CM's
+	// workflow-skills/chat-mode.md on each cold open.
+	Primer string `json:"primer,omitempty"`
 }
 
 // ChatResumeContext mirrors chat.ResumeContext on the CM side. Wire shape
