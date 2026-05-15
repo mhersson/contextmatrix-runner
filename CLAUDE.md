@@ -151,6 +151,7 @@ replay cache. Headers: `X-Signature-256: sha256=<hex>`,
 | POST   | `/message`     | HMAC | Send a user message to a running session. Card-mode payload: `{card_id, project, content, message_id}`. Chat-mode payload: `{session_id, content, message_id}` (mutually exclusive with `card_id`/`project`). `content` must be ≤8192 bytes (413 on overflow). Returns 404 if no container, 409 if not interactive, 202 `{ok:true, message_id}` on success. |
 | POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Returns 404/409 on error, 202 `{ok:true}` on success.                                                                                                                              |
 | POST   | `/end-session` | HMAC | Close the stdin of an interactive container so claude exits on EOF. Payload: `{card_id, project}`. Returns 404 if no container, 409 if not interactive (or stdin already closed), 202 `{ok:true}` on success. Safe to call more than once (second call returns 409). |
+| POST   | `/refresh-knowledge` | HMAC | Spawn a containerised knowledge-base refresh for the given repo. Synthetic tracker key `kb-refresh:<repo>`. |
 | POST   | `/chat/start`  | HMAC | Start a long-lived chat container for a global chat session. Payload: `{session_id, project?, repo_url?, mcp_api_key?, model, resume?}`. `model` is forwarded as `CM_ORCHESTRATOR_MODEL` (entrypoint passes it as `--model`). `resume` is an optional array of `{seq, role, content}` turns; when present, the runner writes `resume.jsonl` + `resume.meta.json` into a per-container host dir and bind-mounts it read-only at `/run/cm-chat/`, sets `CM_CHAT_RESUME=1`, and writes a stream-json user envelope to stdin priming the agent to read the resume file and call `chat_rehydration_complete`. File-prep failures are logged and the container starts without rehydration. Returns 202 `{ok:true, container_id}` on success, 409 if the session already has a container, 429 when the chat concurrency cap is reached. |
 | POST   | `/chat/end`    | HMAC | End a tracked chat container: closes stdin, force-stops, removes tracker entry. Payload: `{session_id}`. Returns 200 on success, 404 if no container is tracked. A second call returns 404.                                                                          |
 | GET    | `/logs`        | HMAC | SSE stream of `LogEntry` events. Query: `?project=<name>` for card-mode / project-scoped, or `?session_id=<id>` for chat-mode. The two filters are mutually exclusive. Browser EventSource cannot send headers, so consumers must proxy through a server that attaches the HMAC signature. |
@@ -201,6 +202,7 @@ When `interactive: true` is set in the `/trigger` payload:
 | `stderr`    | Container stderr line                     | yes       |
 | `system`    | Runner lifecycle event (start/stop/error) | no        |
 | `user`      | HITL chat message via /message webhook    | no        |
+| `usage`     | per-turn token usage / cost reports       | no        |
 
 `logparser.Redact` is applied to `text`, `thinking`, `stderr`, and `tool_call`
 entries. It is never called on `user` or `system` entries.

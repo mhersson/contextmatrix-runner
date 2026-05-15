@@ -92,17 +92,16 @@ type Config struct {
 	// WorkerExtraEnv is a deployment-wide map of additional env vars
 	// injected into every spawned worker container. Use sparingly:
 	// production deployments shouldn't need these (the entrypoint sets
-	// CM_* vars; secrets land in /run/cm-secrets/env). Intended for
-	// environments where the worker's git/HTTPS client needs special
-	// trust configuration — e.g. test harnesses fronting a self-signed
-	// HTTPS git fixture set GIT_SSL_NO_VERIFY=1 here.
+	// CM_* vars; secrets land in /run/cm-secrets/env). Useful for
+	// non-sensitive flags the worker reads (e.g. application-level
+	// feature toggles, CI=true).
 	//
 	// Values are passed verbatim to the container. Keys must be valid
 	// shell env-var names (`A-Za-z_` start, `A-Za-z0-9_` continuation).
-	// Validation rejects keys clashing with the secrets file vars
-	// (CM_GIT_TOKEN, CM_MCP_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
-	// ANTHROPIC_API_KEY) — those must come through the bind-mounted
-	// secrets file, not env.
+	// The four secret-injection keys (CM_GIT_TOKEN, CM_MCP_API_KEY,
+	// CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY) and a blocklist of
+	// dangerous keys (GIT_SSL_NO_VERIFY, LD_PRELOAD, *_PROXY, etc.) are
+	// rejected at config-load time — see Validate().
 	WorkerExtraEnv map[string]string `yaml:"worker_extra_env"`
 
 	// MaintenanceInterval is the tick interval for the background
