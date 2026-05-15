@@ -4276,6 +4276,251 @@ func TestManager_StartChat_OptionalFieldsOmitted(t *testing.T) {
 	}
 }
 
+// TestManager_StartChat_ClaudeSettings verifies that CM_CLAUDE_SETTINGS is
+// injected into chat containers when cfg.ClaudeSettings is non-empty (parity
+// with the card-mode startContainer path). The entrypoint reads this to write
+// $HOME/.claude/settings.json.
+func TestManager_StartChat_ClaudeSettings(t *testing.T) {
+	var capturedEnv []string
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedEnv = cfg.Env
+
+		return container.CreateResponse{ID: "chat-ctr-cs"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	cfg := testConfig()
+	cfg.ClaudeSettings = `{"theme":"dark"}`
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{SessionID: "S-cs"})
+	require.NoError(t, err)
+	assert.Contains(t, capturedEnv, `CM_CLAUDE_SETTINGS={"theme":"dark"}`)
+}
+
+// TestManager_StartChat_ClaudeSettings_AbsentWhenEmpty verifies that
+// CM_CLAUDE_SETTINGS is not set on chat containers when cfg.ClaudeSettings is
+// empty.
+func TestManager_StartChat_ClaudeSettings_AbsentWhenEmpty(t *testing.T) {
+	var capturedEnv []string
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedEnv = cfg.Env
+
+		return container.CreateResponse{ID: "chat-ctr-no-cs"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{SessionID: "S-no-cs"})
+	require.NoError(t, err)
+
+	for _, e := range capturedEnv {
+		assert.False(t, strings.HasPrefix(e, "CM_CLAUDE_SETTINGS="),
+			"CM_CLAUDE_SETTINGS must not be set when cfg.ClaudeSettings is empty")
+	}
+}
+
+// TestManager_StartChat_WorkerExtraEnv verifies that deployment-wide
+// WorkerExtraEnv values are propagated into chat containers (parity with the
+// card-mode startContainer path) in sorted order.
+func TestManager_StartChat_WorkerExtraEnv(t *testing.T) {
+	var capturedEnv []string
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedEnv = cfg.Env
+
+		return container.CreateResponse{ID: "chat-ctr-extra"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	cfg := testConfig()
+	cfg.WorkerExtraEnv = map[string]string{
+		"ZEBRA": "z",
+		"ALPHA": "a",
+		"MIKE":  "m",
+	}
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{SessionID: "S-extra"})
+	require.NoError(t, err)
+
+	picked := []string{}
+
+	for _, e := range capturedEnv {
+		switch {
+		case strings.HasPrefix(e, "ALPHA="),
+			strings.HasPrefix(e, "MIKE="),
+			strings.HasPrefix(e, "ZEBRA="):
+			picked = append(picked, e)
+		}
+	}
+
+	assert.Equal(t, []string{"ALPHA=a", "MIKE=m", "ZEBRA=z"}, picked,
+		"WorkerExtraEnv must be appended in sorted order (parity with card-mode)")
+}
+
+// TestManager_StartChat_TaskSkillsMount verifies that when cfg.TaskSkillsDir is
+// configured, chat containers get the /host-skills bind-mount and
+// pullSkillsRepo is invoked with the git token from opts.AuthEnv.
+func TestManager_StartChat_TaskSkillsMount(t *testing.T) {
+	var (
+		capturedHostCfg *container.HostConfig
+		pullCalls       []string
+		pullTokens      []string
+	)
+
+	orig := pullSkillsRepo
+
+	t.Cleanup(func() { pullSkillsRepo = orig })
+
+	pullSkillsRepo = func(_ context.Context, dir, token string) error {
+		pullCalls = append(pullCalls, dir)
+		pullTokens = append(pullTokens, token)
+
+		return nil
+	}
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, hostCfg *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedHostCfg = hostCfg
+
+		return container.CreateResponse{ID: "chat-ctr-skills"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	skillsDir := t.TempDir()
+
+	cfg := testConfig()
+	cfg.TaskSkillsDir = skillsDir
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID: "S-skills",
+		AuthEnv:   map[string]string{"CM_GIT_TOKEN": "gh-token-for-pull"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, capturedHostCfg)
+
+	require.Len(t, pullCalls, 1, "pullSkillsRepo must be invoked exactly once")
+	assert.Equal(t, skillsDir, pullCalls[0])
+	assert.Equal(t, "gh-token-for-pull", pullTokens[0],
+		"pullSkillsRepo must receive the git token from AuthEnv")
+
+	var hasSkillsMount bool
+
+	for _, m := range capturedHostCfg.Mounts {
+		if m.Target == "/host-skills" {
+			hasSkillsMount = true
+
+			assert.Equal(t, skillsDir, m.Source)
+			assert.True(t, m.ReadOnly, "/host-skills mount must be read-only")
+			assert.Equal(t, mount.TypeBind, m.Type)
+		}
+	}
+
+	assert.True(t, hasSkillsMount, "chat container HostConfig must bind-mount /host-skills when TaskSkillsDir is set")
+}
+
+// TestManager_StartChat_TaskSkillsExplicitSet verifies that when
+// StartChatOpts.TaskSkills is non-nil, CM_TASK_SKILLS_SET=1 and CM_TASK_SKILLS
+// (comma-separated) are set on the container env.
+func TestManager_StartChat_TaskSkillsExplicitSet(t *testing.T) {
+	var capturedEnv []string
+
+	orig := pullSkillsRepo
+
+	t.Cleanup(func() { pullSkillsRepo = orig })
+
+	pullSkillsRepo = func(_ context.Context, _, _ string) error { return nil }
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedEnv = cfg.Env
+
+		return container.CreateResponse{ID: "chat-ctr-skills-set"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	cfg := testConfig()
+	cfg.TaskSkillsDir = t.TempDir()
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	skills := []string{"create-plan", "review"}
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{
+		SessionID:  "S-skills-set",
+		TaskSkills: &skills,
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, capturedEnv, "CM_TASK_SKILLS_SET=1")
+	assert.Contains(t, capturedEnv, "CM_TASK_SKILLS=create-plan,review")
+}
+
+// TestManager_StartChat_TaskSkillsAbsentWhenNil verifies that with
+// TaskSkills==nil the env vars are NOT set, so the entrypoint copies the full
+// skills set (parity with the card-mode "no constraint" branch).
+func TestManager_StartChat_TaskSkillsAbsentWhenNil(t *testing.T) {
+	var capturedEnv []string
+
+	orig := pullSkillsRepo
+
+	t.Cleanup(func() { pullSkillsRepo = orig })
+
+	pullSkillsRepo = func(_ context.Context, _, _ string) error { return nil }
+
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		capturedEnv = cfg.Env
+
+		return container.CreateResponse{ID: "chat-ctr-skills-nil"}, nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	cfg := testConfig()
+	cfg.TaskSkillsDir = t.TempDir()
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	_, err := mgr.StartChat(context.Background(), StartChatOpts{SessionID: "S-skills-nil"})
+	require.NoError(t, err)
+
+	for _, e := range capturedEnv {
+		assert.False(t, strings.HasPrefix(e, "CM_TASK_SKILLS_SET="),
+			"CM_TASK_SKILLS_SET must be absent when TaskSkills is nil")
+		assert.False(t, strings.HasPrefix(e, "CM_TASK_SKILLS="),
+			"CM_TASK_SKILLS must be absent when TaskSkills is nil")
+	}
+}
+
 // TestManager_StreamChatLogs_PublishesAssistantText verifies that
 // StreamChatLogs reads the chat container's stdout, parses claude
 // stream-json, and republishes assistant text events to the broadcaster

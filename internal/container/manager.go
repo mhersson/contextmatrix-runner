@@ -551,15 +551,6 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		env = append(env, "CM_ORCHESTRATOR_MODEL="+payload.Model)
 	}
 
-	if m.cfg.ClaudeSettings != "" {
-		env = append(env, "CM_CLAUDE_SETTINGS="+m.cfg.ClaudeSettings)
-	}
-
-	if m.cfg.TaskSkillsDir != "" && payload.TaskSkills != nil {
-		env = append(env, "CM_TASK_SKILLS_SET=1")
-		env = append(env, "CM_TASK_SKILLS="+strings.Join(*payload.TaskSkills, ","))
-	}
-
 	if payload.Mode == ModeKnowledgeRefresh {
 		env = append(env,
 			"CM_MODE=knowledge-refresh",
@@ -569,23 +560,15 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		)
 	}
 
-	// Worker-extra env vars (deployment-wide, see Config.WorkerExtraEnv).
-	// Sorted for deterministic ordering — useful in tests and reproducible
-	// `docker inspect` output. Validation in config.Validate ensures keys
-	// are well-formed and don't shadow secrets-file vars.
-	if len(m.cfg.WorkerExtraEnv) > 0 {
-		extraKeys := slices.Sorted(maps.Keys(m.cfg.WorkerExtraEnv))
-
-		for _, k := range extraKeys {
-			env = append(env, k+"="+m.cfg.WorkerExtraEnv[k])
-		}
-	}
+	env = m.appendCommonEnv(env, payload.TaskSkills)
 
 	// Apply highest-priority Claude auth method only.
 	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
 	// The auth-dir bind is shared with chat-mode via claudeAuthMount(); the
-	// env-based modes go through the secrets file (card-mode only — chat
-	// uses BuildChatAuthEnv to put them straight into HostConfig.Env).
+	// env-based modes (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) go through
+	// the secrets file in both modes — card adds them inline below; chat
+	// pre-builds them into opts.AuthEnv via BuildChatAuthEnv before StartChat
+	// runs.
 	var mounts []mount.Mount
 
 	if authMount, ok := m.claudeAuthMount(); ok {
@@ -599,20 +582,8 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		}
 	}
 
-	if m.cfg.TaskSkillsDir != "" {
-		if err := pullSkillsRepo(ctx, m.cfg.TaskSkillsDir, gitToken); err != nil {
-			slog.Warn("task skills pull failed; using existing local clone",
-				"task_skills_dir", m.cfg.TaskSkillsDir,
-				"error", err,
-			)
-		}
-
-		mounts = append(mounts, mount.Mount{
-			Type:     mount.TypeBind,
-			Source:   m.cfg.TaskSkillsDir,
-			Target:   "/host-skills",
-			ReadOnly: true,
-		})
+	if skillsMount, ok := m.taskSkillsMount(ctx, gitToken); ok {
+		mounts = append(mounts, skillsMount)
 	}
 
 	// Collect secret values (deterministic order, sorted by key) for the
@@ -634,18 +605,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	}
 
 	// Wire the delivery into the container configuration.
-	switch delivery.Mode {
-	case secretModeFile:
-		mounts = append(mounts, mount.Mount{
-			Type:     mount.TypeBind,
-			Source:   delivery.FilePath,
-			Target:   secretsMountTarget,
-			ReadOnly: true,
-		})
-	case secretModeEnvVar:
-		// Secrets land directly in env; no bind-mount added.
-		env = append(env, delivery.EnvVars...)
-	}
+	env, mounts = applySecretsDelivery(env, mounts, delivery)
 
 	name := sanitizeContainerName(payload.Project, payload.CardID)
 
@@ -816,6 +776,27 @@ func secretsToEnvVars(secrets map[string]string) []string {
 	}
 
 	return vars
+}
+
+// applySecretsDelivery wires the runner's secret-delivery decision into the
+// container spec. In file mode it appends the tmpfs bind-mount for
+// /run/cm-secrets/env; in env-var fallback mode it appends the secrets to
+// the env slice. Both card-mode and chat-mode call this so the two delivery
+// modes stay symmetric.
+func applySecretsDelivery(env []string, mounts []mount.Mount, delivery secretDelivery) ([]string, []mount.Mount) {
+	switch delivery.Mode {
+	case secretModeFile:
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   delivery.FilePath,
+			Target:   secretsMountTarget,
+			ReadOnly: true,
+		})
+	case secretModeEnvVar:
+		env = append(env, delivery.EnvVars...)
+	}
+
+	return env, mounts
 }
 
 // shellSingleQuoteEscape returns s with every `'` replaced by `'\”` so the
@@ -2140,6 +2121,12 @@ type StartChatOpts struct {
 	// CM_CHAT_RESUME=1. The entrypoint switches to the rehydration prompt
 	// branch when this flag is present.
 	Resume *ChatResume
+	// TaskSkills mirrors RunConfig.TaskSkills for chat-mode workers. nil =
+	// no constraint (entrypoint copies the full set from /host-skills);
+	// non-nil (even empty) = explicit selection via CM_TASK_SKILLS_SET +
+	// CM_TASK_SKILLS. The /host-skills bind-mount is added whenever
+	// cfg.TaskSkillsDir is set, regardless of this field.
+	TaskSkills *[]string
 }
 
 // ChatResume mirrors the wire shape of the rehydration payload. Defined
@@ -2203,6 +2190,8 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 	if opts.Model != "" {
 		env = append(env, "CM_ORCHESTRATOR_MODEL="+opts.Model)
 	}
+
+	env = m.appendCommonEnv(env, opts.TaskSkills)
 
 	// Build the chat-mode secrets map. AuthEnv is treated as opaque-but-
 	// sensitive: the runner only ever populates it via BuildChatAuthEnv which
@@ -2273,18 +2262,11 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 		mounts = append(mounts, authMount)
 	}
 
-	switch delivery.Mode {
-	case secretModeFile:
-		mounts = append(mounts, mount.Mount{
-			Type:     mount.TypeBind,
-			Source:   delivery.FilePath,
-			Target:   secretsMountTarget,
-			ReadOnly: true,
-		})
-	case secretModeEnvVar:
-		env = append(env, delivery.EnvVars...)
-		containerCfg.Env = env
+	if skillsMount, ok := m.taskSkillsMount(ctx, opts.AuthEnv["CM_GIT_TOKEN"]); ok {
+		mounts = append(mounts, skillsMount)
 	}
+
+	env, mounts = applySecretsDelivery(env, mounts, delivery)
 
 	if resumeDelivery.DirPath != "" {
 		mounts = append(mounts, mount.Mount{
@@ -2568,6 +2550,57 @@ func (m *Manager) claudeAuthMount() (mount.Mount, bool) {
 		Type:     mount.TypeBind,
 		Source:   m.cfg.ClaudeAuthDir,
 		Target:   "/claude-auth",
+		ReadOnly: true,
+	}, true
+}
+
+// appendCommonEnv appends deployment-wide env vars consumed by every spawned
+// worker — CM_CLAUDE_SETTINGS, CM_TASK_SKILLS_SET/CM_TASK_SKILLS, and the
+// WorkerExtraEnv map (sorted by key). Both card-mode startContainer and
+// chat-mode StartChat call this so a new deployment-wide knob added here
+// automatically lands in every worker, regardless of mode.
+func (m *Manager) appendCommonEnv(env []string, taskSkills *[]string) []string {
+	if m.cfg.ClaudeSettings != "" {
+		env = append(env, "CM_CLAUDE_SETTINGS="+m.cfg.ClaudeSettings)
+	}
+
+	if m.cfg.TaskSkillsDir != "" && taskSkills != nil {
+		env = append(env, "CM_TASK_SKILLS_SET=1")
+		env = append(env, "CM_TASK_SKILLS="+strings.Join(*taskSkills, ","))
+	}
+
+	if len(m.cfg.WorkerExtraEnv) > 0 {
+		extraKeys := slices.Sorted(maps.Keys(m.cfg.WorkerExtraEnv))
+		for _, k := range extraKeys {
+			env = append(env, k+"="+m.cfg.WorkerExtraEnv[k])
+		}
+	}
+
+	return env
+}
+
+// taskSkillsMount returns the read-only /host-skills bind-mount when
+// m.cfg.TaskSkillsDir is configured, plus true; otherwise the zero Mount and
+// false. Best-effort `git pull` of the local clone runs first using gitToken;
+// pull failure is logged and the mount is still returned so the container
+// starts with the existing on-disk state. Mirrors the claudeAuthMount call
+// pattern so card-mode and chat-mode stay symmetric.
+func (m *Manager) taskSkillsMount(ctx context.Context, gitToken string) (mount.Mount, bool) {
+	if m.cfg.TaskSkillsDir == "" {
+		return mount.Mount{}, false
+	}
+
+	if err := pullSkillsRepo(ctx, m.cfg.TaskSkillsDir, gitToken); err != nil {
+		m.logger.Warn("task skills pull failed; using existing local clone",
+			"task_skills_dir", m.cfg.TaskSkillsDir,
+			"error", err,
+		)
+	}
+
+	return mount.Mount{
+		Type:     mount.TypeBind,
+		Source:   m.cfg.TaskSkillsDir,
+		Target:   "/host-skills",
 		ReadOnly: true,
 	}, true
 }
