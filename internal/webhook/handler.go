@@ -23,12 +23,12 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
-// CTXRUN-060 note: threading the raw body through context.Value is an
-// accepted anti-pattern (context-as-data rather than request-scoped
-// cancellation/deadline). A future refactor should pass the body to each
-// handler via an explicit argument or a bodyHandler wrapper type. Deferring
-// here because it touches every handler signature (six handlers) and the
-// polish-sweep scope is supposed to stay low-risk.
+// Threading the raw body through context.Value is an accepted anti-pattern
+// (context-as-data rather than request-scoped cancellation/deadline). A
+// future refactor should pass the body to each handler via an explicit
+// argument or a bodyHandler wrapper type. Deferring here because it touches
+// every handler signature (six handlers) and the polish-sweep scope is
+// supposed to stay low-risk.
 type bodyKey struct{}
 
 // ContainerRunner is the subset of container.Manager used by the webhook handler.
@@ -217,12 +217,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
-	// CTXRUN-040: short-circuit during graceful shutdown. The readiness
-	// probe flipped to 503 in step 1 of the shutdown sequence, but a
-	// /trigger that raced signal delivery and the load-balancer pull
-	// could still land here before we stop accepting new HTTP traffic.
-	// Refuse it explicitly so we don't start a container we're about to
-	// kill.
+	// Short-circuit during graceful shutdown. The readiness probe flipped
+	// to 503 in step 1 of the shutdown sequence, but a /trigger that raced
+	// signal delivery and the load-balancer pull could still land here
+	// before we stop accepting new HTTP traffic. Refuse it explicitly so
+	// we don't start a container we're about to kill.
 	if h.isDraining() {
 		writeError(w, http.StatusServiceUnavailable, CodeDraining, "runner is draining")
 
@@ -501,8 +500,8 @@ const maxMessageContent = 8192
 // handleMessage accepts a user chat message and writes it to the target
 // container's stdin as a Claude Code stream-json user turn.
 func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
-	// CTXRUN-040: refuse new work during shutdown so a stdin write doesn't
-	// race the /end-session close that shutdown will trigger anyway.
+	// Refuse new work during shutdown so a stdin write doesn't race the
+	// /end-session close that shutdown will trigger anyway.
 	if h.isDraining() {
 		writeError(w, http.StatusServiceUnavailable, CodeDraining, "runner is draining")
 
@@ -716,7 +715,7 @@ const autonomousContent = "Autonomous mode has been enabled (card flag flipped).
 // re-triggering the webhook and breaking an infinite promote loop. If the flag
 // is not confirmed, it returns an error and does NOT write to stdin (fail closed).
 func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
-	// CTXRUN-040: refuse new work during shutdown.
+	// Refuse new work during shutdown.
 	if h.isDraining() {
 		writeError(w, http.StatusServiceUnavailable, CodeDraining, "runner is draining")
 
@@ -912,9 +911,9 @@ func (h *Handler) handleRefreshKnowledge(w http.ResponseWriter, r *http.Request)
 // claude receives EOF and exits. The tracker entry is left in place; the
 // normal waitAndCleanup flow removes it when the container exits.
 func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
-	// CTXRUN-040: refuse new work during shutdown. The shutdown sequence
-	// kills every tracked container anyway, so a stray /end-session
-	// landing mid-drain would race the container teardown.
+	// Refuse new work during shutdown. The shutdown sequence kills every
+	// tracked container anyway, so a stray /end-session landing mid-drain
+	// would race the container teardown.
 	if h.isDraining() {
 		writeError(w, http.StatusServiceUnavailable, CodeDraining, "runner is draining")
 
@@ -1185,11 +1184,11 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	// CTXRUN-059 (L13): json.NewEncoder allocates an encoder per call; for
-	// the short webhook responses we serialize here, json.Marshal + a
-	// single Write is both cheaper and trims the trailing newline that
-	// Encoder adds. If Marshal fails we fall back to a fixed error body so
-	// the client still gets a well-formed JSON response.
+	// json.NewEncoder allocates an encoder per call; for the short webhook
+	// responses we serialize here, json.Marshal + a single Write is both
+	// cheaper and trims the trailing newline that Encoder adds. If Marshal
+	// fails we fall back to a fixed error body so the client still gets a
+	// well-formed JSON response.
 	w.Header().Set("Content-Type", "application/json")
 
 	body, err := json.Marshal(v)

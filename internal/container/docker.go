@@ -55,9 +55,9 @@ type DockerClient interface {
 	ContainerList(ctx context.Context, options container.ListOptions) ([]DockerContainer, error)
 	ContainerAttach(ctx context.Context, containerID string, options container.AttachOptions) (*HijackedResponse, error)
 	// ImagesPrune asks dockerd to delete dangling/unused images matching the
-	// given filter args. Used by the periodic maintenance loop (CTXRUN-058)
-	// to keep local image cache bounded — without this, the host image store
-	// grows unbounded across worker-image upgrades.
+	// given filter args. Used by the periodic maintenance loop to keep local
+	// image cache bounded — without this, the host image store grows
+	// unbounded across worker-image upgrades.
 	ImagesPrune(ctx context.Context, pruneFilter filters.Args) (image.PruneReport, error)
 	Close() error
 }

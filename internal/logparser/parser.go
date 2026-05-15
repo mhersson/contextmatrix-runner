@@ -20,7 +20,7 @@ import (
 // can be very long, so we allow up to 1MiB — but the scanner allocates only
 // initScannerBuf up front and grows geometrically on demand so the typical
 // short-line case doesn't pin the worst-case buffer for the container's
-// lifetime. See CTXRUN-059 (H26).
+// lifetime.
 const maxScannerBuf = 1 << 20 // 1 MiB
 
 // initScannerBuf is the initial capacity handed to bufio.Scanner.Buffer.
@@ -416,7 +416,7 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 
 	scanner := bufio.NewScanner(r)
 	// Start at initScannerBuf; bufio.Scanner grows as needed up to maxScannerBuf.
-	// See CTXRUN-059 (H26) for the memory-footprint rationale.
+	// See maxScannerBuf for the memory-footprint rationale.
 	scanner.Buffer(make([]byte, 0, initScannerBuf), maxScannerBuf)
 
 	for scanner.Scan() {

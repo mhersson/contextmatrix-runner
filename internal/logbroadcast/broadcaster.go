@@ -63,7 +63,7 @@ type TokenUsage struct {
 // channel; Publish takes the read lock, checks !closed, and sends. Because
 // the critical section around the actual send is tiny (one non-blocking
 // channel op) the per-subscriber mutex does not reintroduce the starvation
-// the broadcaster-wide lock caused. See CTXRUN-059 (H25).
+// the broadcaster-wide lock caused.
 type subscriber struct {
 	ch        chan LogEntry
 	project   string // empty means "all projects" (when sessionID is also empty)
@@ -263,7 +263,7 @@ func (b *Broadcaster) SubscribeWithSessionID(sessionID string) (<-chan LogEntry,
 // subscriber's full channel buffer (observed by the default-drop branch of
 // the select) cannot starve Subscribe / Unsubscribe callers under sustained
 // log throughput. This mirrors the standard "copy-under-lock, work-outside"
-// pattern. See CTXRUN-059 (H25). The drop-on-full-channel semantics are
+// pattern. The drop-on-full-channel semantics are
 // preserved exactly: the select's default branch still increments the
 // dropCount and observer.
 //

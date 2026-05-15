@@ -14,13 +14,13 @@ import (
 )
 
 // testDigestImage is a placeholder digest-pinned reference that satisfies
-// Validate()'s CTXRUN-044 digest-pinning check. Tests that do not exercise
-// the pinning rule itself reuse this constant so the unrelated Validate
-// paths stay readable.
+// Validate()'s digest-pinning check. Tests that do not exercise the pinning
+// rule itself reuse this constant so the unrelated Validate paths stay
+// readable.
 const testDigestImage = "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 // TestLogFormat_JSON_EmitsValidJSON verifies that configuring log_format: json
-// produces parseable JSON log lines. (Belongs to CTXRUN-053.)
+// produces parseable JSON log lines.
 func TestLogFormat_JSON_EmitsValidJSON(t *testing.T) {
 	var buf bytes.Buffer
 
@@ -152,7 +152,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 3, cfg.MaxConcurrent)
 	assert.Equal(t, "2h", cfg.ContainerTimeout)
 	assert.Equal(t, "info", cfg.LogLevel)
-	// CTXRUN-048: default auth mode for VerifyAutonomous is HMAC.
+	// Default auth mode for VerifyAutonomous is HMAC.
 	assert.True(t, cfg.UseHMACForVerifyAutonomous,
 		"use_hmac_for_verify_autonomous must default to true")
 }
@@ -855,8 +855,8 @@ func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
 }
 
 func TestValidate_ReplayCacheDefaultsWhenUnset(t *testing.T) {
-	// A Config literal that leaves the new CTXRUN-047 tunables at zero
-	// must validate and receive the documented defaults.
+	// A Config literal that leaves the webhook replay-protection tunables
+	// at zero must validate and receive the documented defaults.
 	cfg := baseValidConfigNoGitHub(t)
 	cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 
@@ -959,9 +959,9 @@ github:
 	assert.Equal(t, "ghp_fromenv", cfg.GitHub.PAT.Token)
 }
 
-// TestValidate_BaseImageDigestPin covers the CTXRUN-044 requirement that
-// base_image be an @sha256:... reference. Mutable tags and malformed digests
-// must fail validation so a rebuilt upstream image can never silently ship.
+// TestValidate_BaseImageDigestPin covers the requirement that base_image be
+// an @sha256:... reference. Mutable tags and malformed digests must fail
+// validation so a rebuilt upstream image can never silently ship.
 func TestValidate_BaseImageDigestPin(t *testing.T) {
 	validDigest := "contextmatrix/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 

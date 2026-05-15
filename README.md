@@ -269,7 +269,7 @@ contextmatrix_url: "http://localhost:8080"
 api_key: "your-shared-secret-here-at-least-32-chars"
 
 # Default Docker image for worker containers. MUST be @sha256:... pinned
-# (enforced by Validate; mutable tags are rejected). See CTXRUN-044.
+# (enforced by Validate; mutable tags are rejected).
 # Env: CMR_BASE_IMAGE
 base_image: "contextmatrix/worker@sha256:<digest>"
 
@@ -552,7 +552,7 @@ non-zero exit), `completed` (clean exit).
 
 | Field          | Type   | Required | Description                                                                                                                                                                                                                                                                       |
 | -------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `card_id`      | string | yes      | Card identifier (e.g. `CTXRUN-019`)                                                                                                                                                                                                                                               |
+| `card_id`      | string | yes      | Card identifier (e.g. `PROJECT-019`)                                                                                                                                                                                                                                              |
 | `project`      | string | yes      | Project name                                                                                                                                                                                                                                                                      |
 | `repo_url`     | string | yes      | Repository URL. HTTPS (`https://github.com/org/repo`) is the supported form; `ssh://` URLs are accepted and rewritten to HTTPS.                                                                                                                                                   |
 | `mcp_api_key`  | string | no       | Bearer token for MCP authentication                                                                                                                                                                                                                                               |

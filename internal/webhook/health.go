@@ -10,10 +10,10 @@ import (
 //   - PreflightPassed is flipped by the startup preflight (and its retry
 //     loop) once all dependency probes succeed. It starts false and must
 //     reach true before the runner reports ready.
-//   - Draining is flipped by the shutdown sequence (CTXRUN-040) so the
-//     process can continue serving in-flight requests while signalling to
-//     the load balancer that no new traffic should be routed. This card
-//     only exposes the field; flipping it is CTXRUN-040's job.
+//   - Draining is flipped by the shutdown sequence so the process can
+//     continue serving in-flight requests while signalling to the load
+//     balancer that no new traffic should be routed. This type only
+//     exposes the field; flipping it is the shutdown hook's job.
 //
 // Both flags are atomic.Bool so readers (the /readyz handler) do not need
 // to coordinate with writers (preflight retry loop, shutdown hook).

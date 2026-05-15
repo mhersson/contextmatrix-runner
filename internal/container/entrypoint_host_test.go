@@ -18,7 +18,7 @@ import (
 // We use parameter expansion + a `case` allowlist rather than sed because
 // sed is line-oriented: a newline in the input would yield a multi-line
 // value that is catastrophic when interpolated into a .netrc/credential
-// helper. See CTXRUN-043.
+// helper.
 const hostExtractionSnippet = `
 GIT_HOST=""
 case "${CM_REPO_URL:-}" in
@@ -90,10 +90,10 @@ func TestEntrypointGitHostExtraction(t *testing.T) {
 			wantHost:  "github.com",
 		},
 		{
-			// CTXRUN-043: a newline in the host would inject a second
-			// `machine` clause into .netrc / a second line into the
-			// credential helper. The case-based extractor must reject
-			// any such value and fall back to github.com.
+			// A newline in the host would inject a second `machine`
+			// clause into .netrc / a second line into the credential
+			// helper. The case-based extractor must reject any such
+			// value and fall back to github.com.
 			name:      "newline in host rejects and falls back",
 			cmRepoURL: "https://evil\nhost/org/repo.git",
 			wantHost:  "github.com",
@@ -265,7 +265,7 @@ func TestEntrypointBranchValidatorInSource(t *testing.T) {
 
 	// The old grep-based validator must be gone.
 	assert.NotContains(t, src, `grep -qE '^-|[[:space:]]'`,
-		"entrypoint.sh must not use the legacy grep-based branch validator (CTXRUN-043)")
+		"entrypoint.sh must not use the legacy grep-based branch validator")
 }
 
 // TestEntrypointSecretsFileSourcing verifies the entrypoint reads the tmpfs
@@ -299,11 +299,11 @@ func TestEntrypointUsesDynamicGitHost(t *testing.T) {
 	assert.NotContains(t, src, "machine github.com",
 		"entrypoint.sh must not hardcode 'machine github.com'; it should use $GIT_HOST")
 
-	// Must NOT use the legacy sed-based host extraction (CTXRUN-043:
-	// sed is line-oriented, so a newline in CM_REPO_URL could yield a
-	// multi-line value. Parameter expansion + case allowlist is required).
+	// Must NOT use the legacy sed-based host extraction (sed is line-oriented,
+	// so a newline in CM_REPO_URL could yield a multi-line value; parameter
+	// expansion + case allowlist is required).
 	assert.NotContains(t, src, "sed -n 's#^https://",
-		"entrypoint.sh must not use sed for host extraction (CTXRUN-043)")
+		"entrypoint.sh must not use sed for host extraction")
 
 	// Must derive GIT_HOST via parameter expansion.
 	assert.Contains(t, src, `_rest="${CM_REPO_URL#https://}"`,
@@ -326,11 +326,11 @@ func TestEntrypointUsesDynamicGitHost(t *testing.T) {
 // dependencies required.
 //
 // The previous TestEntrypointInteractiveBranching that executed entrypoint.sh
-// via bash+mocks was removed as part of CTXRUN-057: it was gated behind
-// CM_ENTRYPOINT_HOST_TEST=1, required write access to /home/user/workspace on
-// the host, and duplicated the same assertions that this source-inspection
-// test already covers. Keeping the dead-gated runner path made the file harder
-// to reason about; this source-level check is sufficient.
+// via bash+mocks was removed: it was gated behind CM_ENTRYPOINT_HOST_TEST=1,
+// required write access to /home/user/workspace on the host, and duplicated
+// the same assertions that this source-inspection test already covers.
+// Keeping the dead-gated runner path made the file harder to reason about;
+// this source-level check is sufficient.
 func TestEntrypointInteractiveContent(t *testing.T) {
 	path := entrypointPath(t)
 	content, err := os.ReadFile(path)

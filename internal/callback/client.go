@@ -59,7 +59,7 @@ type KnowledgeStatusRequest struct {
 // The one transitional exception is VerifyAutonomous when
 // useHMACForVerifyAutonomous is false: the runner falls back to Bearer
 // until the ContextMatrix server accepts HMAC on that GET endpoint
-// (see CTXRUN-048). The fallback is deprecated and logs a WARN at startup.
+// The fallback is deprecated and logs a WARN at startup.
 type Client struct {
 	httpClient                 *http.Client
 	contextMatrixURL           string
@@ -90,7 +90,7 @@ func NewClient(cmURL, apiKey string, logger *slog.Logger) *Client {
 // SetUseHMACForVerifyAutonomous toggles whether VerifyAutonomous signs its
 // GET request with HMAC (true, the default and secure mode) or falls back
 // to sending `Authorization: Bearer <apiKey>` (false, the deprecated
-// cross-repo transition mode). See CTXRUN-048.
+// cross-repo transition mode).
 func (c *Client) SetUseHMACForVerifyAutonomous(useHMAC bool) {
 	c.useHMACForVerifyAutonomous = useHMAC
 }
@@ -157,10 +157,10 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointLabel(status)).Inc()
 		}
 
-		// CTXRUN-059 (M19): explicit Timer + defer Stop so ctx cancellation
-		// does not leak the timer (time.After drops its reference only when
-		// it fires). backoff is per-attempt, so declaring the timer inside
-		// the loop body is correct — each attempt gets a fresh timer.
+		// Explicit Timer + defer Stop so ctx cancellation does not leak the
+		// timer (time.After drops its reference only when it fires). backoff
+		// is per-attempt, so declaring the timer inside the loop body is
+		// correct — each attempt gets a fresh timer.
 		backoff := time.Duration(1<<uint(attempt)) * time.Second
 		timer := time.NewTimer(backoff)
 
@@ -397,8 +397,8 @@ type cardResponse struct {
 // non-2xx response so callers can remain fail-closed without issuing any
 // state-changing request back to CM (which would trigger an infinite loop).
 //
-// The request is HMAC-signed by default (CTXRUN-048). The signature covers
-// the timestamp concatenated with an empty body, identical to every other
+// The request is HMAC-signed by default. The signature covers the
+// timestamp concatenated with an empty body, identical to every other
 // runner<->CM webhook so the CM handler uses one verification path.
 // During the cross-repo transition, SetUseHMACForVerifyAutonomous(false)
 // switches back to `Authorization: Bearer <apiKey>` so the runner keeps

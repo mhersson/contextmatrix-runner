@@ -2,7 +2,7 @@
 #
 # Worker image for contextmatrix-runner.
 #
-# Pinning policy (CTXRUN-044):
+# Pinning policy:
 #   - The base image is pinned by SHA256 digest (not the mutable
 #     `:bookworm-slim` tag). Update the digest intentionally when rolling
 #     Debian point releases.

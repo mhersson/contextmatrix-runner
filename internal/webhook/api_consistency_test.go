@@ -139,10 +139,10 @@ type failingReader struct{ err error }
 
 func (f *failingReader) Read([]byte) (int, error) { return 0, f.err }
 
-// TestEndpointStatusCodeMatrix is the table-driven check required by
-// CTXRUN-056: every (endpoint, input, expected status, expected code) row is
-// covered in one place so a future handler tweak that accidentally flips a
-// status is caught immediately.
+// TestEndpointStatusCodeMatrix is the table-driven check that every
+// (endpoint, input, expected status, expected code) row is covered in one
+// place, so a future handler tweak that accidentally flips a status is
+// caught immediately.
 func TestEndpointStatusCodeMatrix(t *testing.T) {
 	type setup func(t *testing.T) (*Handler, []byte, string)
 

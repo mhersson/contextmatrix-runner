@@ -209,7 +209,7 @@ func TestVerifyAutonomous_NotFound(t *testing.T) {
 // TestVerifyAutonomous_HMACSigned confirms the default auth mode: the
 // request carries HMAC headers (X-Signature-256 + X-Webhook-Timestamp)
 // and NO `Authorization: Bearer`. This is the fix for H10
-// (apiKey-triple-purpose Bearer leakage) under CTXRUN-048.
+// (apiKey-triple-purpose Bearer leakage).
 func TestVerifyAutonomous_HMACSigned(t *testing.T) {
 	apiKey := "test-secret-key-that-is-long-enough"
 
@@ -425,7 +425,7 @@ func TestPing_InvalidURL(t *testing.T) {
 // returns promptly and does not leak the per-attempt Timer. Under the old
 // time.After-based loop the Timer kept a reference into the runtime heap
 // until it fired (up to 4s later on the last attempt) so a burst of
-// cancelled callbacks would pile up unreachable Timers. CTXRUN-059 (M19).
+// cancelled callbacks would pile up unreachable Timers.
 //
 // The test kicks off a ReportStatus against a server that always 500s,
 // then cancels the ctx just as the first backoff starts. We assert two

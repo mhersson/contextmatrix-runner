@@ -710,7 +710,7 @@ func TestAddIfUnderLimit_Concurrent(t *testing.T) {
 
 // TestErrSentinels verifies every exported tracker sentinel is wired through
 // fmt.Errorf("... %w", ...) and reachable via errors.Is from the caller's
-// perspective (CTXRUN-056 C8 / M21). Handlers branch on these sentinels to
+// perspective. Handlers branch on these sentinels to
 // pick the right HTTP status code; if a future refactor drops the %w wrap the
 // handler would silently fall through to the generic internal-error path, so
 // this test is the contract that keeps that wiring honest.

@@ -448,7 +448,7 @@ func TestConcurrentSafety(t *testing.T) {
 // full for the whole test would hold the lock's readers high enough that
 // an incoming Subscribe (which acquires a write lock) would stall until
 // publishing quieted. This test asserts Subscribe returns promptly even
-// while a slow subscriber is backed up. CTXRUN-059 (H25).
+// while a slow subscriber is backed up.
 func TestPublish_ReleasesLockBeforeSend(t *testing.T) {
 	b := logbroadcast.NewBroadcaster(nil, nil)
 

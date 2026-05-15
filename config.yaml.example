@@ -61,7 +61,7 @@ api_key: ""
 # Default Docker image for worker containers. Can be overridden per-project
 # via runner_image in the trigger payload.
 #
-# base_image MUST be @sha256:... pinned (enforced by Validate). See CTXRUN-044.
+# base_image MUST be @sha256:... pinned (enforced by Validate).
 # Mutable tags like `:latest` are rejected so a rebuilt upstream image can
 # never silently ship into production. Replace the digest below with the
 # output of `docker inspect --format='{{index .RepoDigests 0}}' <image>`.
@@ -174,7 +174,7 @@ github:
     # Env: CMR_GITHUB_PAT_TOKEN
     token: ""
 
-# ----- Webhook replay protection (CTXRUN-047) -----
+# ----- Webhook replay protection -----
 
 # Max number of recently-seen HMAC signatures to keep in memory. A larger
 # value increases coverage against replay attacks at the cost of RAM; the
@@ -196,7 +196,7 @@ message_dedup_cache_size: 1000
 # message_id collision is vanishingly unlikely.
 message_dedup_ttl_seconds: 600
 
-# ----- Runtime watchdogs (CTXRUN-058) -----
+# ----- Runtime watchdogs -----
 
 # Kill a container that has produced no output for this long. Go duration
 # format. Zero or a negative value disables the watchdog. Prevents a hung
@@ -226,11 +226,11 @@ idle_watchdog_interval: "30s"
 # older than 24h. Must be positive. No env var override.
 maintenance_interval: "10m"
 
-# ----- Callback auth (CTXRUN-048) -----
+# ----- Callback auth -----
 
 # Use HMAC-signed GET for VerifyAutonomous callbacks to ContextMatrix.
 # Set to false ONLY during the cross-repo transition if the CM server
-# does not yet accept HMAC on that endpoint. See CTXRUN-048.
+# does not yet accept HMAC on that endpoint.
 use_hmac_for_verify_autonomous: true
 
 # ----- Logging -----

@@ -11,8 +11,8 @@ import (
 
 // TestEntrypointAllowlist verifies that docker/entrypoint.sh uses
 // --allowed-tools with an explicit allowlist instead of
-// --dangerously-skip-permissions (CTXRUN-045). The assertions are performed
-// against the file contents so the test runs without a shell or Docker.
+// --dangerously-skip-permissions. The assertions are performed against the
+// file contents so the test runs without a shell or Docker.
 func TestEntrypointAllowlist(t *testing.T) {
 	path := entrypointPath(t)
 	content, err := os.ReadFile(path)
@@ -79,10 +79,6 @@ func TestEntrypointAllowlist(t *testing.T) {
 	// it is declared in the extras block.
 	assert.Contains(t, src, `"Task"`,
 		"ALLOWED_TOOLS_AUTO_EXTRAS must include Task for autonomous sub-agent spawning")
-
-	// 7. The rationale comment from the CTXRUN-045 spec must be present.
-	assert.Contains(t, src, "CTXRUN-045",
-		"entrypoint.sh must reference CTXRUN-045 in the allowlist rationale comment")
 }
 
 // TestEntrypointKBAllowlistContainsRequiredTools verifies that the

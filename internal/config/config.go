@@ -71,13 +71,13 @@ type Config struct {
 	// disables the feature.
 	TaskSkillsDir string `yaml:"task_skills_dir"`
 
-	// Webhook replay-protection tunables. See CTXRUN-047.
+	// Webhook replay-protection tunables.
 	WebhookReplayCacheSize   int `yaml:"webhook_replay_cache_size"`
 	WebhookReplaySkewSeconds int `yaml:"webhook_replay_skew_seconds"`
 	MessageDedupCacheSize    int `yaml:"message_dedup_cache_size"`
 	MessageDedupTTLSeconds   int `yaml:"message_dedup_ttl_seconds"`
 
-	// Idle-output watchdog (CTXRUN-058, H15). If a container's logparser
+	// Idle-output watchdog. If a container's logparser
 	// has not published any event in this many seconds, the watchdog kills
 	// the container with an "idle timeout" reason. Zero or negative
 	// disables the watchdog.
@@ -105,15 +105,15 @@ type Config struct {
 	WorkerExtraEnv map[string]string `yaml:"worker_extra_env"`
 
 	// MaintenanceInterval is the tick interval for the background
-	// reconcile-and-prune loop (CTXRUN-058, M12). Each tick runs
-	// CleanupOrphans and PruneImages. Must be positive.
+	// reconcile-and-prune loop. Each tick runs CleanupOrphans and
+	// PruneImages. Must be positive.
 	MaintenanceInterval time.Duration `yaml:"maintenance_interval"`
 
 	// UseHMACForVerifyAutonomous toggles whether the VerifyAutonomous
 	// callback to CM is HMAC-signed (true, default) or falls back to
 	// `Authorization: Bearer <api_key>` (false, deprecated transition
-	// mode). See CTXRUN-048. Set false ONLY while the ContextMatrix
-	// server is being upgraded to accept HMAC on that GET endpoint.
+	// mode). Set false ONLY while the ContextMatrix server is being
+	// upgraded to accept HMAC on that GET endpoint.
 	UseHMACForVerifyAutonomous bool `yaml:"use_hmac_for_verify_autonomous"`
 
 	// DeploymentProfile selects the operational mode: "production" (default,
@@ -308,10 +308,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("base_image is required")
 	}
 
-	// Digest-pin base_image and every allowed_images entry (CTXRUN-044).
-	// A mutable tag like `:latest` would let a rebuilt upstream image
-	// silently ship into production; require `@sha256:...` so operators
-	// roll base images intentionally.
+	// Digest-pin base_image and every allowed_images entry. A mutable tag
+	// like `:latest` would let a rebuilt upstream image silently ship into
+	// production; require `@sha256:...` so operators roll base images
+	// intentionally.
 	//
 	// In dev mode we collect unpinned references instead of failing hard, so
 	// local development setups can use mutable tags. The caller (main.go) logs
@@ -411,7 +411,7 @@ func (c *Config) Validate() error {
 
 	c.containerTimeoutDuration = d
 
-	// Idle-output watchdog (CTXRUN-058). Negative values are an error.
+	// Idle-output watchdog. Negative values are an error.
 	// Zero is legal and disables the watchdog.
 	if c.IdleOutputTimeout < 0 {
 		return fmt.Errorf("idle_output_timeout must be zero or positive")
@@ -450,7 +450,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Maintenance loop interval (CTXRUN-058). Default silently when zero so
+	// Maintenance loop interval. Default silently when zero so
 	// hand-crafted configs don't have to opt in; negatives are an error.
 	if c.MaintenanceInterval == 0 {
 		c.MaintenanceInterval = 10 * time.Minute

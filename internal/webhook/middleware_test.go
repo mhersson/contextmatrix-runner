@@ -96,7 +96,7 @@ func TestMetricsMiddleware_ObservesEndpointAndStatus(t *testing.T) {
 }
 
 // TestMetricsMiddleware_RateLimitedCode verifies that 429s produce the
-// rate_limited code bucket (CTXRUN-056 shape).
+// rate_limited code bucket.
 func TestMetricsMiddleware_RateLimitedCode(t *testing.T) {
 	mx := metrics.New()
 

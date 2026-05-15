@@ -1,7 +1,6 @@
 #!/bin/bash
-# Explicit allowlist (CTXRUN-045) replaces the old unconditional
-# permission-bypass flag. To add a tool, justify in PR + update this list +
-# add a test.
+# Explicit allowlist replaces the old unconditional permission-bypass flag.
+# To add a tool, justify in PR + update this list + add a test.
 set -euo pipefail
 
 # ----- Secrets file (preferred: off-env, tmpfs bind-mount) -----
@@ -28,7 +27,7 @@ else
     fi
 fi
 
-# ----- Tool allowlist (CTXRUN-045) -----
+# ----- Tool allowlist -----
 # Passed to `claude --allowed-tools` so the worker can only call pre-approved
 # tools. Built from a shared base plus per-mode additions:
 #
@@ -443,8 +442,8 @@ fi
 # CM_GIT_TOKEN → already copied into the credential helper file.
 # CM_MCP_API_KEY → already written into ~/.claude.json.
 # Both of these would otherwise leak into every Bash/Tool subprocess claude
-# spawns (defence-in-depth — the --allowed-tools allowlist from CTXRUN-045
-# restricts which tools claude will invoke, but env hygiene still matters).
+# spawns (defence-in-depth — the --allowed-tools allowlist restricts which
+# tools claude will invoke, but env hygiene still matters).
 # CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY are intentionally preserved:
 # the Claude CLI reads them at startup, and removing them here breaks auth in
 # the env-fallback path.

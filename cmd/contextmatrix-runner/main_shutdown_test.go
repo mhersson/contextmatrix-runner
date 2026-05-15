@@ -71,10 +71,10 @@ func (c *stubCallback) ReportStatus(_ context.Context, _, _, _, _ string) error 
 	return nil
 }
 
-// TestShutdown_WedgedContainer exercises the full CTXRUN-040 shutdown
-// sequence end-to-end with a wedged manager. A tracked container is
-// registered, mgr.Wait never returns on its own, and ForceKillContainer
-// blocks well past forceCleanupTimeout. The assertions are:
+// TestShutdown_WedgedContainer exercises the full graceful-shutdown sequence
+// end-to-end with a wedged manager. A tracked container is registered,
+// mgr.Wait never returns on its own, and ForceKillContainer blocks well past
+// forceCleanupTimeout. The assertions are:
 //
 //   - /trigger returns 503 as soon as the drain flag flips.
 //   - /readyz returns 503.

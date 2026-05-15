@@ -95,7 +95,7 @@ func (sr *statusRecorder) Unwrap() http.ResponseWriter {
 // withMetrics wraps every webhook handler and records request count + duration
 // on the provided metrics bundle. The endpoint label is the URL path with a
 // leading slash stripped; status is the HTTP status code; code is a coarse
-// success/error bucket derived from the status (the CTXRUN-056 ErrorResponse
+// success/error bucket derived from the status (the ErrorResponse
 // code-string mapping can be plugged in later without changing the shape).
 func withMetrics(m *metrics.Metrics, next http.Handler) http.Handler {
 	if m == nil {

@@ -1,6 +1,6 @@
 .PHONY: build test test-race test-integration lint lint-sh vuln verify-unit clean docker-worker
 
-# Pinned worker toolchain versions (CTXRUN-044). Override on the command line
+# Pinned worker toolchain versions. Override on the command line
 # if a newer version has been vetted, e.g.
 #   make docker-worker GO_VERSION=1.26.3
 # These values are passed into the Dockerfile as --build-args so the build is
@@ -55,7 +55,7 @@ vuln:
 	govulncheck ./...
 
 # verify-unit grep-asserts that the generated systemd unit contains the
-# CTXRUN-052 hardening directives, and runs `systemd-analyze --user
+# expected hardening directives, and runs `systemd-analyze --user
 # verify` if available. No Go build required.
 verify-unit:
 	./svc.sh verify

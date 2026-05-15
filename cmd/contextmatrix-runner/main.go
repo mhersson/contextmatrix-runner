@@ -30,9 +30,9 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/webhook"
 )
 
-// Shutdown timeouts (CTXRUN-040). Declared as package vars so
-// main_shutdown_test.go can shrink them to keep the test under 45 s while
-// production retains generous margins.
+// Shutdown timeouts. Declared as package vars so main_shutdown_test.go can
+// shrink them to keep the test under 45 s while production retains generous
+// margins.
 var (
 	// httpShutdownTimeout bounds srv.Shutdown: how long the HTTP listener
 	// is given to finish draining in-flight requests after we stop
@@ -143,8 +143,8 @@ func main() {
 	cb.SetUseHMACForVerifyAutonomous(cfg.UseHMACForVerifyAutonomous)
 
 	if !cfg.UseHMACForVerifyAutonomous {
-		// CTXRUN-048 cross-repo transition knob. Log loudly at startup so
-		// operators can't silently run the deprecated Bearer mode forever.
+		// Cross-repo transition knob. Log loudly at startup so operators
+		// can't silently run the deprecated Bearer mode forever.
 		logger.Warn(
 			"Bearer fallback for VerifyAutonomous is deprecated; " +
 				"ContextMatrix server must accept HMAC by the next release — " +
@@ -160,10 +160,9 @@ func main() {
 
 	// HealthState is the shared view of whether preflight has passed and
 	// whether a graceful shutdown has started. /readyz reads both flags;
-	// the preflight retry loop flips PreflightPassed; CTXRUN-040 will
-	// flip Draining during shutdown. It lives in main.go (not as a
-	// package-level global) so the whole wiring graph stays trivially
-	// swappable.
+	// the preflight retry loop flips PreflightPassed; the shutdown sequence
+	// flips Draining. It lives in main.go (not as a package-level global)
+	// so the whole wiring graph stays trivially swappable.
 	health := webhook.NewHealthState()
 
 	// monitorCtx drives the two background loops (preflight retry and
@@ -195,7 +194,7 @@ func main() {
 	// Background maintenance loop: periodically sweeps orphaned worker
 	// containers and prunes dangling images. Closes the M12 gap where
 	// CleanupOrphans only ran once at startup and the image cache grew
-	// unbounded across worker-image upgrades. See CTXRUN-058.
+	// unbounded across worker-image upgrades.
 	go runMaintenanceLoop(monitorCtx, mgr, cfg.MaintenanceInterval, health, logger)
 
 	// Webhook handler.
@@ -332,11 +331,10 @@ type shutdownDeps struct {
 	replayCancel  context.CancelFunc
 }
 
-// shutdown runs the CTXRUN-040 graceful-shutdown sequence. The order
-// matters: we must stop accepting new work before we wait for in-flight
-// work to finish, and both must be bounded so one wedged goroutine can't
-// stall shutdown until systemd SIGKILLs us (at which point callbacks never
-// run).
+// shutdown runs the graceful-shutdown sequence. The order matters: we must
+// stop accepting new work before we wait for in-flight work to finish, and
+// both must be bounded so one wedged goroutine can't stall shutdown until
+// systemd SIGKILLs us (at which point callbacks never run).
 //
 //  1. Flip Draining so /readyz flips to 503 immediately and the load
 //     balancer removes us from rotation before step 2 finishes. Our own
@@ -490,7 +488,6 @@ var (
 // runMaintenanceLoop ticks every interval and runs CleanupOrphans + PruneImages.
 // It exits on ctx cancel or on drain. Each tick's Docker call is bounded by a
 // fresh per-call timeout so a hung dockerd can't stall the whole loop.
-// See CTXRUN-058 (M12, M35).
 func runMaintenanceLoop(ctx context.Context, mgr maintenanceTarget, interval time.Duration, health *webhook.HealthState, logger *slog.Logger) {
 	runMaintenanceLoopWithHealth(ctx, mgr, interval, healthDrainAdapter{h: health}, logger)
 }

@@ -1,8 +1,8 @@
 # CI pipeline for contextmatrix-runner.
 #
 # Gates every push and pull_request on the full quality bar declared in the
-# Week-1 audit plan (see REVIEW.md C18, §9). Worker image is digest-pinned
-# (CTXRUN-044) so hadolint, Trivy, and shellcheck are all strict gates now.
+# Week-1 audit plan (see REVIEW.md C18, §9). Worker image is digest-pinned, so
+# hadolint, Trivy, and shellcheck are all strict gates now.
 # Worker image signing (cosign) and SBOM generation (syft) run on push-to-main.
 #
 # GitHub Actions are pinned to exact release tags. Full SHA pinning is a

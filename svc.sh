@@ -14,14 +14,14 @@
 #
 # Because this is a user unit, gating on `After=docker.service` does not
 # work: the per-user systemd manager cannot observe system units. We
-# therefore rely on the runner's own preflight + /readyz loop (CTXRUN-054)
-# to wait for dockerd on startup, and omit the `After=` line.
+# therefore rely on the runner's own preflight + /readyz loop to wait for
+# dockerd on startup, and omit the `After=` line.
 #
-# Hardening (CTXRUN-052).
-# ----------------------
+# Hardening.
+# ----------
 # The generated [Service] section applies a baseline sandbox + resource
-# limits + restart-jitter policy. The directives below were added
-# under CTXRUN-052 to address REVIEW.md findings H18, L34, L35.
+# limits + restart-jitter policy. The directives below address REVIEW.md
+# findings H18, L34, L35.
 #   NoNewPrivileges, ProtectSystem=strict, ProtectHome=read-only,
 #   PrivateTmp, PrivateDevices, ProtectKernelTunables,
 #   ProtectKernelModules, ProtectControlGroups, LockPersonality,
@@ -77,8 +77,7 @@ generate_unit() {
 Description=ContextMatrix Runner
 # NOTE: After=docker.service is intentionally omitted. This is a user
 # unit; the per-user systemd manager cannot gate on system units. The
-# runner's preflight + /readyz loop (CTXRUN-054) waits for dockerd at
-# startup instead.
+# runner's preflight + /readyz loop waits for dockerd at startup instead.
 
 [Service]
 Type=simple
@@ -87,7 +86,7 @@ ExecStart=${BINARY} --config ${CONFIG}
 KillMode=mixed
 TimeoutStopSec=60
 
-# --- Sandboxing (CTXRUN-052) ---
+# --- Sandboxing ---
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
@@ -109,12 +108,12 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 
-# --- Resource limits (CTXRUN-052) ---
+# --- Resource limits ---
 MemoryMax=2G
 TasksMax=1024
 LimitNOFILE=65536
 
-# --- Restart policy with jitter (CTXRUN-052 / REVIEW L34) ---
+# --- Restart policy with jitter (REVIEW L34) ---
 # on-failure + exponential backoff via RestartSteps/RestartMaxDelaySec
 # avoids a restart storm when dockerd is flapping.
 Restart=on-failure

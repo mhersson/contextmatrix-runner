@@ -277,7 +277,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 
 // TestHandleKill_IdempotentWhenAlreadyStopped verifies that /kill on a card
 // with no tracked container and no matching labeled Docker container returns
-// 200 OK (CTXRUN-056 / C8). The old behaviour was 404, which made retry logic
+// 200 OK. The old behaviour was 404, which made retry logic
 // in CM harder (a legitimate not-yet-started tracker miss was indistinguishable
 // from a hard failure). ForceRemoveByLabels returns 0 for this case so the
 // handler falls through to the no-op branch.
@@ -1906,7 +1906,7 @@ func TestHandleStopAll_KillFailureOnOneCard(t *testing.T) {
 	req := signedRequest(t, "/stop-all", StopAllPayload{})
 	h.hmacAuth(h.handleStopAll)(w, req)
 
-	// CTXRUN-056 / M40: 207 Multi-Status when any per-card kill fails.
+	// 207 Multi-Status when any per-card kill fails.
 	require.Equal(t, http.StatusMultiStatus, w.Code)
 
 	var resp StopAllResponse
@@ -2097,7 +2097,7 @@ func TestHandleEndSession_401_InvalidHMAC(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// --- Drain / 503 tests (CTXRUN-040) ---
+// --- Drain / 503 tests ---
 //
 // When the shutdown sequence flips health.Draining to true, every handler
 // that starts or extends long-running work must short-circuit to 503 so we

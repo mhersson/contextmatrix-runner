@@ -115,8 +115,8 @@ func TestRun_Success(t *testing.T) {
 		createdLabels map[string]string
 		statusMu      sync.Mutex
 		// reportedStatuses is mutex-protected because the running-status
-		// callback now fires on a detached goroutine (CTXRUN-059 H23) so
-		// the handler can still be writing it after mgr.Wait() returns.
+		// callback now fires on a detached goroutine so the handler can
+		// still be writing it after mgr.Wait() returns.
 		reportedStatuses []string
 	)
 
@@ -187,7 +187,7 @@ func TestRun_Success(t *testing.T) {
 	assert.Contains(t, createdEnv, "CM_REPO_URL=https://github.com/org/repo.git")
 
 	// Secrets must NOT be in HostConfig.Env — they are written to a tmpfs
-	// bind-mounted file at /run/cm-secrets/env instead (CTXRUN-043).
+	// bind-mounted file at /run/cm-secrets/env instead.
 	for _, e := range createdEnv {
 		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="), "CM_GIT_TOKEN must not be in Env")
 		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be in Env")
@@ -201,8 +201,8 @@ func TestRun_Success(t *testing.T) {
 	assert.Equal(t, "my-project", createdLabels[LabelProject])
 
 	// Should have reported "running". The running-status callback runs on a
-	// detached goroutine (CTXRUN-059 H23) so it may land after mgr.Wait()
-	// returns — poll briefly with the mutex held.
+	// detached goroutine so it may land after mgr.Wait() returns — poll
+	// briefly with the mutex held.
 	require.Eventually(t, func() bool {
 		statusMu.Lock()
 		defer statusMu.Unlock()
@@ -453,8 +453,8 @@ func TestRun_NonZeroExit(t *testing.T) {
 		_ = json.Unmarshal(body, &req)
 
 		// Mutex-protected: the running callback now fires on a detached
-		// goroutine (CTXRUN-059 H23) concurrently with the failed
-		// callback, so plain-slice append would race under -race.
+		// goroutine concurrently with the failed callback, so plain-slice
+		// append would race under -race.
 		statusMu.Lock()
 
 		reportedStatuses = append(reportedStatuses, req.RunnerStatus)
@@ -668,7 +668,7 @@ func TestCleanupOrphans_SkipsTrackedContainers(t *testing.T) {
 // TestCleanupOrphans_PartialFailure verifies that a per-container Stop failure
 // does not short-circuit cleanup of the remaining orphans and that the
 // returned error wraps the failure via errors.Join so callers can still see
-// which container failed. See CTXRUN-050 (M20).
+// which container failed.
 func TestCleanupOrphans_PartialFailure(t *testing.T) {
 	var (
 		stopIDs   []string
@@ -1503,7 +1503,7 @@ func (b *blockingWriteCloser) Close() error {
 // wedges on the hijacked conn does not stall the Run goroutine: after
 // primingWriteTimeout elapses the manager logs and continues into
 // waitAndCleanup, and the whole test exits well before any real timeout
-// could fire. CTXRUN-040 (C11).
+// could fire.
 func TestPrimingWriteStdin_WriteDeadline(t *testing.T) {
 	// Shrink the deadline for the duration of this test so we don't
 	// spend 5 s on a synthetic wedge. Snapshot + restore around the run.
@@ -1639,7 +1639,7 @@ func TestSanitizeContainerName(t *testing.T) {
 // stopped and removed, the tracker slot is freed, a "container canceled"
 // system event is emitted, AND reportFailure is invoked with a "killed by
 // operator" message so ContextMatrix can transition the card out of
-// `running`. See CTXRUN-050.
+// `running`.
 func TestWaitAndCleanup_ParentContextCanceled(t *testing.T) {
 	type statusReport struct {
 		status, message string
@@ -1722,8 +1722,8 @@ func TestWaitAndCleanup_ParentContextCanceled(t *testing.T) {
 	assert.True(t, removeCalled.Load(), "container must be removed")
 	assert.Equal(t, 0, tr.Count(), "tracker slot must be freed")
 
-	// CTXRUN-050: reportFailure must fire via a detached context so CM sees
-	// the terminal status even though the parent ctx is already cancelled.
+	// reportFailure must fire via a detached context so CM sees the
+	// terminal status even though the parent ctx is already cancelled.
 	var (
 		sawFailed           bool
 		sawKilledByOperator bool
@@ -1753,7 +1753,7 @@ drainLoop:
 // ContainerStart fails while the parent ctx has already been cancelled (e.g.
 // the Kill webhook raced the start goroutine), reportFailure still fires via
 // a detached context so CM sees the `failed` status instead of the card
-// getting stuck in `running`. See CTXRUN-050 (C12).
+// getting stuck in `running`.
 func TestStartFailure_ReportsFailureDespiteCancelledContext(t *testing.T) {
 	type statusReport struct {
 		status, message string
@@ -2148,19 +2148,19 @@ func TestRun_PanicInStartContainer_RecoveryFreesTrackerAndReports(t *testing.T) 
 	}
 }
 
-// TestStreamLogs_StderrScannerPanic asserts that CTXRUN-040's per-goroutine
-// recover inside streamLogs isolates a panic in one of the three child
-// goroutines (here: stdcopy, which calls Read on the injected panicReader).
-// Before the fix a panic in these goroutines unwound the entire runner
-// process; now the runner must continue, the panic is surfaced as a
-// `system` LogEntry so operators see it, and waitAndCleanup must still run
-// to completion so the tracker entry is removed.
+// TestStreamLogs_StderrScannerPanic asserts that the per-goroutine recover
+// inside streamLogs isolates a panic in one of the three child goroutines
+// (here: stdcopy, which calls Read on the injected panicReader). Before the
+// fix a panic in these goroutines unwound the entire runner process; now
+// the runner must continue, the panic is surfaced as a `system` LogEntry so
+// operators see it, and waitAndCleanup must still run to completion so the
+// tracker entry is removed.
 func TestStreamLogs_StderrScannerPanic(t *testing.T) {
 	mock := successfulMock()
 	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
 		// panicReader's Read panics on first call. stdcopy.StdCopy will
 		// panic trying to read from it; the recover() installed by
-		// CTXRUN-040 must catch it and emit a system event.
+		// streamLogs must catch it and emit a system event.
 		return io.NopCloser(&panicReader{}), nil
 	}
 
@@ -2216,7 +2216,7 @@ func TestStreamLogs_StderrScannerPanic(t *testing.T) {
 type panicReader struct{}
 
 func (p *panicReader) Read(_ []byte) (int, error) {
-	panic("synthetic read panic for CTXRUN-040")
+	panic("synthetic read panic for streamLogs recover test")
 }
 
 // recordingBroadcaster wraps logbroadcast.Broadcaster and captures published
@@ -2347,7 +2347,7 @@ func TestNormalizeRepoURL(t *testing.T) {
 
 // TestPullImage_EmptyPolicyReturnsError asserts that pullImage fails fast with
 // a descriptive error when ImagePullPolicy is unset, instead of silently
-// falling back to PullAlways. See CTXRUN-051.
+// falling back to PullAlways.
 func TestPullImage_EmptyPolicyReturnsError(t *testing.T) {
 	// MockDockerClient with no function fields set: any call into the
 	// docker client would fall through to a default that either succeeds
@@ -2486,7 +2486,7 @@ func TestWaitAndCleanup_MessageDuringCleanupGets404(t *testing.T) {
 	assert.Equal(t, 0, tr.Count(), "tracker must end empty")
 }
 
-// TestIdleWatchdog_KillsOnSilence verifies the CTXRUN-058 idle-output watchdog
+// TestIdleWatchdog_KillsOnSilence verifies the idle-output watchdog
 // kills the container and emits a "idle timeout" system event when no output
 // has been observed for longer than IdleOutputTimeout. Exercises the goroutine
 // directly (rather than via streamLogs + a fake stream) so the test is
@@ -2662,7 +2662,7 @@ func TestIdleWatchdog_Disabled(t *testing.T) {
 }
 
 // TestPruneImages_CallsDockerWithCorrectFilters verifies PruneImages forwards
-// the CTXRUN-058 filters (dangling=true, until=24h) to dockerd and surfaces
+// the prune filters (dangling=true, until=24h) to dockerd and surfaces
 // the prune report as a nil error.
 func TestPruneImages_CallsDockerWithCorrectFilters(t *testing.T) {
 	var capturedFilter filters.Args
@@ -2741,7 +2741,6 @@ func (s *stubResolver) LookupHost(ctx context.Context, _ string) ([]string, erro
 // DNS server cannot stall the spawn path indefinitely. The stub sleeps well
 // past the 2s cap; buildExtraHosts must return within a small envelope of the
 // cap and must return only the default host-gateway entry (no MCP mapping).
-// CTXRUN-059 (H24).
 func TestBuildExtraHosts_DNSTimeout(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
@@ -2785,8 +2784,7 @@ func TestBuildExtraHosts_DNSCache(t *testing.T) {
 // TestRun_RunningCallbackAsync asserts that startContainer + waitAndCleanup
 // do not block on a slow running-status callback. The mock callback server
 // sleeps 500ms before responding; the whole Run must still complete well
-// under 1s because the callback is fired on a detached goroutine. CTXRUN-059
-// (H23).
+// under 1s because the callback is fired on a detached goroutine.
 func TestRun_RunningCallbackAsync(t *testing.T) {
 	var runningSeen atomic.Bool
 
