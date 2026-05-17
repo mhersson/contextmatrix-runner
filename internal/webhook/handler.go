@@ -491,6 +491,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                 true,
 		"running_containers": h.tracker.Count(),
+		"max_concurrent":     h.maxConcurrent,
 	})
 }
 

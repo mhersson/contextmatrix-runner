@@ -498,6 +498,7 @@ func TestHandleHealth(t *testing.T) {
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.Equal(t, true, resp["ok"])
 	assert.InDelta(t, float64(1), resp["running_containers"], 1e-9)
+	assert.InDelta(t, float64(3), resp["max_concurrent"], 1e-9)
 }
 
 // signedGETRequest builds a signed GET request with an empty body.
