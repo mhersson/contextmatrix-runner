@@ -1566,7 +1566,6 @@ func TestValidate_WorkerExtraEnv(t *testing.T) {
 
 		secrets := []string{
 			"CM_GIT_TOKEN",
-			"CM_MCP_API_KEY",
 			"CLAUDE_CODE_OAUTH_TOKEN",
 			"ANTHROPIC_API_KEY",
 		}
@@ -1578,6 +1577,17 @@ func TestValidate_WorkerExtraEnv(t *testing.T) {
 			assert.ErrorContains(t, err, "collides with a secrets-file var",
 				"key %q should collide with secrets file", k)
 		}
+	})
+
+	t.Run("per-container env collision rejected", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := baseCfg()
+		cfg.WorkerExtraEnv = map[string]string{"CM_MCP_API_KEY": "leak"}
+
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "collides with a per-container env var",
+			"key CM_MCP_API_KEY should collide with per-container env var")
 	})
 }
 
