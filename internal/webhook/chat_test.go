@@ -78,7 +78,7 @@ func (f *chatFakeRunner) Stop(ctx context.Context, containerID string) error {
 
 func (f *chatFakeRunner) WorkerImage() string { return f.workerImage }
 
-func (f *chatFakeRunner) BuildChatAuthEnv(_ context.Context) map[string]string { return nil }
+func (f *chatFakeRunner) BuildChatAuthEnv(_ context.Context) string { return "" }
 
 func (f *chatFakeRunner) AttachChatStdin(ctx context.Context, sessionID, containerID string) error {
 	if f.attachChatStdinFn != nil {
