@@ -60,10 +60,12 @@ type Config struct {
 	GitHub                    GitHubConfig `yaml:"github"`
 	LogLevel                  string       `yaml:"log_level"`
 	LogFormat                 string       `yaml:"log_format"`
-	// SecretsDir is the host directory where per-container secrets files
-	// are written. Each file is bind-mounted read-only into its container
-	// at /run/cm-secrets/env so the values never appear in HostConfig.Env
-	// (and therefore not in `docker inspect`). Should be on tmpfs.
+	// SecretsDir is the host directory where the runner stages the shared
+	// secrets file. The runner writes $SecretsDir/shared/env (created at
+	// boot, rotated by tokenRefresher) and bind-mounts $SecretsDir/shared/
+	// read-only into every worker at /run/cm-secrets/. When empty, secrets
+	// are folded into Container.Env directly (test-only fallback).
+	// Should be on tmpfs.
 	SecretsDir string `yaml:"secrets_dir"`
 	// TaskSkillsDir is the host path to the curated task skills repo, bind-mounted
 	// read-only into worker containers at /host-skills. The entrypoint copies the
@@ -92,9 +94,10 @@ type Config struct {
 	// WorkerExtraEnv is a deployment-wide map of additional env vars
 	// injected into every spawned worker container. Use sparingly:
 	// production deployments shouldn't need these (the entrypoint sets
-	// CM_* vars; secrets land in /run/cm-secrets/env). Useful for
-	// non-sensitive flags the worker reads (e.g. application-level
-	// feature toggles, CI=true).
+	// CM_* vars; rotating secrets reach the worker via the shared dir
+	// mount at /run/cm-secrets/, sourced from the env file inside).
+	// Useful for non-sensitive flags the worker reads (e.g. application-
+	// level feature toggles, CI=true).
 	//
 	// Values are passed verbatim to the container. Keys must be valid
 	// shell env-var names (`A-Za-z_` start, `A-Za-z0-9_` continuation).
@@ -430,15 +433,18 @@ func (c *Config) Validate() error {
 	// Worker extra env: validate key shape and reject collisions with
 	// secrets-file vars. These restrictions exist so a misconfigured
 	// extra-env map can't accidentally shadow the secret-injection path
-	// (which the entrypoint sources from /run/cm-secrets/env).
+	// (the entrypoint sources the env file from the shared dir mounted
+	// at /run/cm-secrets/).
 	for k := range c.WorkerExtraEnv {
 		if !validEnvKey(k) {
 			return fmt.Errorf("worker_extra_env key %q is not a valid env var name", k)
 		}
 
 		switch k {
-		case "CM_GIT_TOKEN", "CM_MCP_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY":
+		case "CM_GIT_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY":
 			return fmt.Errorf("worker_extra_env key %q collides with a secrets-file var; remove it", k)
+		case "CM_MCP_API_KEY":
+			return fmt.Errorf("worker_extra_env key %q collides with a per-container env var; remove it", k)
 		case "GIT_SSL_NO_VERIFY", "GIT_TERMINAL_PROMPT",
 			"LD_PRELOAD", "LD_LIBRARY_PATH",
 			"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",

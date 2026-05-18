@@ -52,7 +52,9 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func testConfig() *config.Config {
+func testConfig(t *testing.T) *config.Config {
+	t.Helper()
+
 	cfg := &config.Config{
 		BaseImage:        "test-image:latest",
 		ContainerTimeout: "1h",
@@ -61,9 +63,9 @@ func testConfig() *config.Config {
 		// PullAlways preserves the behavior that previously came from the
 		// now-removed empty-string fallback in Manager.pullImage.
 		ImagePullPolicy: config.PullAlways,
-		// Use the OS temp dir instead of the production default
-		// (/var/run/cm-runner/secrets) so tests work without root.
-		SecretsDir: os.TempDir() + "/cm-runner-tests-secrets",
+		// Per-test isolation: each test gets its own temp dir so parallel
+		// tests (and cleanup) can't step on each other's secrets state.
+		SecretsDir: t.TempDir(),
 	}
 	// Parse the container timeout duration without full validation.
 	cfg.ParseContainerTimeout()
@@ -165,7 +167,7 @@ func TestRun_Success(t *testing.T) {
 	cb := callback.NewClient(origCbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -186,13 +188,13 @@ func TestRun_Success(t *testing.T) {
 	assert.Contains(t, createdEnv, "CM_MCP_URL=http://cm:8080/mcp")
 	assert.Contains(t, createdEnv, "CM_REPO_URL=https://github.com/org/repo.git")
 
-	// Secrets must NOT be in HostConfig.Env — they are written to a tmpfs
-	// bind-mounted file at /run/cm-secrets/env instead.
+	// CM_GIT_TOKEN is delivered via the shared dir mount (not env).
+	// Claude auth secrets are in the shared dir too.
+	// CM_MCP_API_KEY is per-card and must appear directly in Env.
 	for _, e := range createdEnv {
-		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="), "CM_GIT_TOKEN must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="), "CM_GIT_TOKEN must not be in Env; it rides the shared dir mount")
 		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be in Env")
 		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be in Env")
-		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="), "CM_MCP_API_KEY must not be in Env")
 	}
 
 	// Verify labels.
@@ -215,28 +217,23 @@ func TestRun_PATProvider(t *testing.T) {
 	var (
 		createdEnv     []string
 		createdMounts  []mount.Mount
-		secretsOnDisk  string
 		secretsSource  string
 		secretsRdOnly  bool
 		secretsMntType mount.Type
 	)
 
+	cfg := testConfig(t)
+
 	mock := successfulMock()
-	mock.ContainerCreateFn = func(_ context.Context, cfg *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-		createdEnv = cfg.Env
+	mock.ContainerCreateFn = func(_ context.Context, c *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		createdEnv = c.Env
 		createdMounts = hc.Mounts
 
-		// Capture the file contents now — the cleanup defer will
-		// unlink it before this test gets to make assertions.
 		for _, m := range hc.Mounts {
 			if m.Target == secretsMountTarget {
 				secretsSource = m.Source
 				secretsRdOnly = m.ReadOnly
 				secretsMntType = m.Type
-				b, err := os.ReadFile(m.Source)
-				require.NoError(t, err, "reading on-host secrets file during ContainerCreate")
-
-				secretsOnDisk = string(b)
 			}
 		}
 
@@ -253,7 +250,10 @@ func TestRun_PATProvider(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+	require.NoError(t, mgr.InitSharedSecrets())
+
+	sharedDir := filepath.Join(cfg.SecretsDir, "shared")
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -264,13 +264,13 @@ func TestRun_PATProvider(t *testing.T) {
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
 
-	// PAT token must NOT be in container env.
+	// CM_GIT_TOKEN must NOT be in container env; it rides the shared dir mount.
 	for _, e := range createdEnv {
 		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="),
-			"CM_GIT_TOKEN must not be in container env; it is delivered via /run/cm-secrets/env")
+			"CM_GIT_TOKEN must not be in container env; it rides the shared dir mount")
 	}
 
-	// The per-container secrets mount must exist, be a read-only bind.
+	// The secrets dir-mount must exist, be a read-only bind.
 	var sawSecrets bool
 
 	for _, m := range createdMounts {
@@ -282,45 +282,35 @@ func TestRun_PATProvider(t *testing.T) {
 	require.True(t, sawSecrets, "secrets mount must be present")
 	assert.Equal(t, mount.TypeBind, secretsMntType)
 	assert.True(t, secretsRdOnly, "secrets mount must be read-only")
-	assert.NotEmpty(t, secretsSource, "secrets mount must have a source path")
 
-	// The file content (captured before cleanup) must contain the PAT token.
-	assert.Contains(t, secretsOnDisk, "CM_GIT_TOKEN='ghp_test_pat'",
-		"secrets file must contain the PAT token")
+	// The mount source must be the shared directory (not a per-container file).
+	assert.Equal(t, sharedDir, secretsSource, "secrets mount source must be the shared dir")
 
-	// And it must be deleted by the cleanup path.
+	// The shared dir must NOT be removed after container exit.
 	_, err := os.Stat(secretsSource)
-	assert.True(t, os.IsNotExist(err),
-		"secrets file must be removed after the container exits; stat err=%v", err)
+	assert.False(t, os.IsNotExist(err),
+		"shared secrets dir must NOT be removed after container exits; stat err=%v", err)
 }
 
-// TestStartContainer_SecretsWrittenToTmpfsBindMount verifies the happy-path
-// wiring: a secrets file is written, bind-mounted read-only at
-// /run/cm-secrets/env, and contains the expected keys with values that are
-// safe to embed inside single-quoted shell strings.
-func TestStartContainer_SecretsWrittenToTmpfsBindMount(t *testing.T) {
+// TestStartContainer_SecretsSharedDirMountAndMCPKeyInEnv verifies the new
+// delivery model: the shared dir is bind-mounted read-only at secretsMountTarget
+// and CM_MCP_API_KEY rides directly in Container.Env (per-card, doesn't rotate).
+func TestStartContainer_SecretsSharedDirMountAndMCPKeyInEnv(t *testing.T) {
 	var (
 		createdEnv    []string
 		createdMounts []mount.Mount
-		secretsText   string
 	)
+
+	cfg := testConfig(t)
+	cfg.AnthropicAPIKey = "sk-api-key"
 
 	mock := &MockDockerClient{
 		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
 			return io.NopCloser(strings.NewReader("")), nil
 		},
-		ContainerCreateFn: func(_ context.Context, cfg *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-			createdEnv = cfg.Env
+		ContainerCreateFn: func(_ context.Context, c *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+			createdEnv = c.Env
 			createdMounts = hc.Mounts
-
-			for _, m := range hc.Mounts {
-				if m.Target == secretsMountTarget {
-					b, err := os.ReadFile(m.Source)
-					require.NoError(t, err)
-
-					secretsText = string(b)
-				}
-			}
 
 			return container.CreateResponse{ID: "secret-test-ctr"}, nil
 		},
@@ -342,9 +332,6 @@ func TestStartContainer_SecretsWrittenToTmpfsBindMount(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	cfg := testConfig()
-	cfg.AnthropicAPIKey = "sk-weird'quote"
-
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
 
 	payload := testPayload()
@@ -357,15 +344,21 @@ func TestStartContainer_SecretsWrittenToTmpfsBindMount(t *testing.T) {
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
 
-	// No secrets in Env.
+	// CM_MCP_API_KEY is per-card and must appear in Env.
+	assert.Contains(t, createdEnv, "CM_MCP_API_KEY=mcp-secret",
+		"CM_MCP_API_KEY must be in container Env for per-card delivery")
+
+	// Rotating secrets (CM_GIT_TOKEN, Claude auth) must NOT be in Env.
 	for _, e := range createdEnv {
-		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="))
-		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="))
-		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="))
-		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="))
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="),
+			"CM_GIT_TOKEN must not be in Env; it rides the shared dir mount")
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="),
+			"ANTHROPIC_API_KEY must not be in Env; it rides the shared dir mount")
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="),
+			"CLAUDE_CODE_OAUTH_TOKEN must not be in Env; it rides the shared dir mount")
 	}
 
-	// Secrets mount present and read-only.
+	// Shared dir mount present, read-only bind at secretsMountTarget.
 	var found bool
 
 	for _, m := range createdMounts {
@@ -374,29 +367,27 @@ func TestStartContainer_SecretsWrittenToTmpfsBindMount(t *testing.T) {
 
 			assert.Equal(t, mount.TypeBind, m.Type)
 			assert.True(t, m.ReadOnly)
+			assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), m.Source,
+				"mount source must be the shared dir, not a per-container file")
 		}
 	}
 
-	require.True(t, found, "secrets mount must be present")
-
-	// File content has the expected keys and the quote in the API key is
-	// escaped as \'.
-	assert.Contains(t, secretsText, "CM_GIT_TOKEN='ghs_test_token'")
-	assert.Contains(t, secretsText, "CM_MCP_API_KEY='mcp-secret'")
-	assert.Contains(t, secretsText, `ANTHROPIC_API_KEY='sk-weird'\''quote'`,
-		"single quote in secret must be escaped as '\\''")
+	require.True(t, found, "secrets mount must be present at %s", secretsMountTarget)
 }
 
-// TestSecretsFileCleanedUpOnContainerExit verifies the host-side secrets
-// file is unlinked by the waitAndCleanup path.
-func TestSecretsFileCleanedUpOnContainerExit(t *testing.T) {
-	var secretsPath string
+// TestSecretsSharedDirNotRemovedOnContainerExit verifies the shared secrets
+// directory is NOT removed when a container exits — it is owned by the
+// singleton tokenRefresher, not per-container lifecycle.
+func TestSecretsSharedDirNotRemovedOnContainerExit(t *testing.T) {
+	var secretsSource string
+
+	cfg := testConfig(t)
 
 	mock := successfulMock()
 	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, hc *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 		for _, m := range hc.Mounts {
 			if m.Target == secretsMountTarget {
-				secretsPath = m.Source
+				secretsSource = m.Source
 			}
 		}
 
@@ -419,7 +410,10 @@ func TestSecretsFileCleanedUpOnContainerExit(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+	require.NoError(t, mgr.InitSharedSecrets())
+
+	sharedDir := filepath.Join(cfg.SecretsDir, "shared")
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -430,11 +424,12 @@ func TestSecretsFileCleanedUpOnContainerExit(t *testing.T) {
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
 
-	require.NotEmpty(t, secretsPath, "expected secrets mount source path")
+	require.NotEmpty(t, secretsSource, "expected secrets mount source path")
+	assert.Equal(t, sharedDir, secretsSource, "mount source must be the shared dir")
 
-	_, err := os.Stat(secretsPath)
-	assert.True(t, os.IsNotExist(err),
-		"secrets file must be gone after waitAndCleanup; stat err=%v", err)
+	// Shared dir must still exist after container exit.
+	_, err := os.Stat(secretsSource)
+	assert.NoError(t, err, "shared secrets dir must still exist after container exits")
 }
 
 func TestRun_NonZeroExit(t *testing.T) {
@@ -477,7 +472,7 @@ func TestRun_NonZeroExit(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -524,7 +519,7 @@ func TestRun_ImagePullFailure(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -559,7 +554,7 @@ func TestRun_CustomImage(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.AllowedImages = []string{"test-image:latest", "custom/image:v2"}
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
 
@@ -579,7 +574,7 @@ func TestRun_CustomImage(t *testing.T) {
 func TestKill(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	canceled := false
 
@@ -598,7 +593,7 @@ func TestKill(t *testing.T) {
 func TestKill_NotFound(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.Kill("proj", "PROJ-999")
 	assert.ErrorContains(t, err, "no container tracked")
@@ -621,7 +616,7 @@ func TestCleanupOrphans(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.NoError(t, err)
@@ -657,7 +652,7 @@ func TestCleanupOrphans_SkipsTrackedContainers(t *testing.T) {
 		Project: "proj", CardID: "A-001", ContainerID: "live-1",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.NoError(t, err)
@@ -707,7 +702,7 @@ func TestCleanupOrphans_PartialFailure(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.Error(t, err, "CleanupOrphans must return the joined per-container failures")
@@ -747,7 +742,7 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -765,10 +760,9 @@ func TestStreamLogs_WithLogData(t *testing.T) {
 // buildAuthTestManager creates a manager with a mock that captures env and
 // mounts, runs a container, and returns the captured values. The cfg argument
 // controls auth. The returned `mountTargets` contains all Mount.Target paths
-// for tests that only care about presence/absence. `secretsContent` is the
-// body of the per-container secrets file captured at ContainerCreate time
-// (the file is deleted during cleanup before this function returns).
-func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mountTargets []string, secretsContent string) {
+// for tests that only care about presence/absence. `secretsMountSource` is the
+// source path of the secrets mount (the shared dir in file-mode delivery).
+func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mountTargets []string, secretsMountSource string) {
 	t.Helper()
 
 	mock := successfulMock()
@@ -779,10 +773,7 @@ func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mount
 			mountTargets = append(mountTargets, m.Target)
 
 			if m.Target == secretsMountTarget {
-				b, err := os.ReadFile(m.Source)
-				require.NoError(t, err, "reading secrets file at create time")
-
-				secretsContent = string(b)
+				secretsMountSource = m.Source
 			}
 		}
 
@@ -809,114 +800,108 @@ func buildAuthTestManager(t *testing.T, cfg *config.Config) (env []string, mount
 	mgr.Run(context.Background(), payload)
 	mgr.Wait()
 
-	return env, mountTargets, secretsContent
+	return env, mountTargets, secretsMountSource
 }
 
-// assertNoAuthEnv fails if any of the secret env vars appear in env.
-func assertNoAuthEnv(t *testing.T, env []string) {
+// assertNoSharedSecretEnv fails if any rotating secret env vars appear in env.
+// CM_MCP_API_KEY is intentionally excluded: it is per-card and must appear in Env.
+func assertNoSharedSecretEnv(t *testing.T, env []string) {
 	t.Helper()
 
 	for _, e := range env {
-		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be in Env")
-		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be in Env")
-		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="), "CM_GIT_TOKEN must not be in Env")
-		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="), "CM_MCP_API_KEY must not be in Env")
+		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="), "ANTHROPIC_API_KEY must not be in Env; it rides the shared dir mount")
+		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="), "CLAUDE_CODE_OAUTH_TOKEN must not be in Env; it rides the shared dir mount")
+		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="), "CM_GIT_TOKEN must not be in Env; it rides the shared dir mount")
 	}
 }
 
 // TestAuthPriority_ClaudeAuthDir verifies that when ClaudeAuthDir is set alongside
-// oauth token and API key, only the directory mount is used — no auth env vars,
-// and no Claude token in the secrets file.
+// oauth token and API key, only the directory mount is used — no auth env vars.
 func TestAuthPriority_ClaudeAuthDir(t *testing.T) {
 	// Create a temporary directory to use as ClaudeAuthDir so validation passes.
 	dir := t.TempDir()
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeAuthDir = dir
 	cfg.ClaudeOAuthToken = "oauth-tok"
 	cfg.AnthropicAPIKey = "sk-api"
 
-	env, targets, secrets := buildAuthTestManager(t, cfg)
+	env, targets, sharedSrc := buildAuthTestManager(t, cfg)
 
-	// The claude-auth mount is present; so is the secrets mount (for CM_GIT_TOKEN).
+	// The claude-auth mount is present; so is the shared secrets dir mount.
 	assert.Contains(t, targets, "/claude-auth", "claude-auth mount should be present")
 	assert.Contains(t, targets, secretsMountTarget, "secrets mount should be present")
 
-	assertNoAuthEnv(t, env)
+	// Shared dir mount source must point at SecretsDir/shared.
+	assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), sharedSrc,
+		"secrets mount source must be the shared dir")
 
-	// When ClaudeAuthDir takes priority, the Claude auth tokens must NOT
-	// appear in the secrets file either — the container reads them from
-	// the mounted $HOME/.claude directory.
-	assert.NotContains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN",
-		"CLAUDE_CODE_OAUTH_TOKEN must not be in secrets file when ClaudeAuthDir is highest priority")
-	assert.NotContains(t, secrets, "ANTHROPIC_API_KEY",
-		"ANTHROPIC_API_KEY must not be in secrets file when ClaudeAuthDir is highest priority")
+	assertNoSharedSecretEnv(t, env)
 }
 
 // TestAuthPriority_OAuthToken verifies that when ClaudeAuthDir is unset but
-// ClaudeOAuthToken and AnthropicAPIKey are both set, only the OAuth token
-// appears in the secrets file.
+// ClaudeOAuthToken and AnthropicAPIKey are both set, no auth env vars appear
+// in the container env (auth goes via the shared dir).
 func TestAuthPriority_OAuthToken(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = "oauth-tok"
 	cfg.AnthropicAPIKey = "sk-api"
 
-	env, targets, secrets := buildAuthTestManager(t, cfg)
+	env, targets, sharedSrc := buildAuthTestManager(t, cfg)
 
-	// The only mount must be the secrets tmpfs bind mount.
+	// The only mount must be the shared secrets dir bind mount.
 	assert.Equal(t, []string{secretsMountTarget}, targets,
 		"only the secrets mount should be present when using oauth token")
 
-	assertNoAuthEnv(t, env)
+	assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), sharedSrc,
+		"secrets mount source must be the shared dir")
 
-	assert.Contains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN='oauth-tok'")
-	assert.NotContains(t, secrets, "ANTHROPIC_API_KEY",
-		"ANTHROPIC_API_KEY must not appear in secrets file when OAuth token takes priority")
+	assertNoSharedSecretEnv(t, env)
 }
 
 // TestAuthPriority_APIKeyOnly verifies that when only AnthropicAPIKey is set,
-// only ANTHROPIC_API_KEY is written to the secrets file.
+// no auth env vars appear in the container env (auth goes via the shared dir).
 func TestAuthPriority_APIKeyOnly(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = ""
 	cfg.AnthropicAPIKey = "sk-only"
 
-	env, targets, secrets := buildAuthTestManager(t, cfg)
+	env, targets, sharedSrc := buildAuthTestManager(t, cfg)
 
 	assert.Equal(t, []string{secretsMountTarget}, targets,
 		"only the secrets mount should be present when using API key only")
-	assertNoAuthEnv(t, env)
 
-	assert.Contains(t, secrets, "ANTHROPIC_API_KEY='sk-only'")
-	assert.NotContains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN",
-		"CLAUDE_CODE_OAUTH_TOKEN must not appear in secrets file when only API key is configured")
+	assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), sharedSrc,
+		"secrets mount source must be the shared dir")
+
+	assertNoSharedSecretEnv(t, env)
 }
 
 // TestAuthPriority_OAuthTokenOnly verifies that when only ClaudeOAuthToken is
-// set, only CLAUDE_CODE_OAUTH_TOKEN is written to the secrets file.
+// set, no auth env vars appear in the container env (auth goes via the shared dir).
 func TestAuthPriority_OAuthTokenOnly(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = "oauth-only"
 	cfg.AnthropicAPIKey = ""
 
-	env, targets, secrets := buildAuthTestManager(t, cfg)
+	env, targets, sharedSrc := buildAuthTestManager(t, cfg)
 
 	assert.Equal(t, []string{secretsMountTarget}, targets,
 		"only the secrets mount should be present when using OAuth token only")
-	assertNoAuthEnv(t, env)
 
-	assert.Contains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN='oauth-only'")
-	assert.NotContains(t, secrets, "ANTHROPIC_API_KEY",
-		"ANTHROPIC_API_KEY must not appear in secrets file when only OAuth token is configured")
+	assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), sharedSrc,
+		"secrets mount source must be the shared dir")
+
+	assertNoSharedSecretEnv(t, env)
 }
 
 // TestClaudeSettings_EnvVarPresentWhenSet verifies that CM_CLAUDE_SETTINGS is
 // injected into the container env when cfg.ClaudeSettings is non-empty.
 func TestClaudeSettings_EnvVarPresentWhenSet(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeSettings = `{"enabledTools":["Bash","Edit"]}`
 
 	env, _, _ := buildAuthTestManager(t, cfg)
@@ -927,7 +912,7 @@ func TestClaudeSettings_EnvVarPresentWhenSet(t *testing.T) {
 // TestClaudeSettings_EnvVarAbsentWhenEmpty verifies that CM_CLAUDE_SETTINGS is
 // not injected when cfg.ClaudeSettings is empty.
 func TestClaudeSettings_EnvVarAbsentWhenEmpty(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeSettings = ""
 
 	env, _, _ := buildAuthTestManager(t, cfg)
@@ -942,7 +927,7 @@ func TestClaudeSettings_EnvVarAbsentWhenEmpty(t *testing.T) {
 func TestClaudeSettings_WithClaudeAuthDir(t *testing.T) {
 	dir := t.TempDir()
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeAuthDir = dir
 	cfg.ClaudeSettings = `{"model":"claude-sonnet-4-6"}`
 
@@ -953,35 +938,33 @@ func TestClaudeSettings_WithClaudeAuthDir(t *testing.T) {
 }
 
 // TestClaudeSettings_WithOAuthToken verifies that CM_CLAUDE_SETTINGS is
-// set alongside the OAuth token being written to the secrets file.
+// set and no rotating secrets appear in the container env.
 func TestClaudeSettings_WithOAuthToken(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = "oauth-tok"
 	cfg.AnthropicAPIKey = ""
 	cfg.ClaudeSettings = `{"theme":"dark"}`
 
-	env, _, secrets := buildAuthTestManager(t, cfg)
+	env, _, _ := buildAuthTestManager(t, cfg)
 
-	assertNoAuthEnv(t, env)
+	assertNoSharedSecretEnv(t, env)
 	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"theme":"dark"}`)
-	assert.Contains(t, secrets, "CLAUDE_CODE_OAUTH_TOKEN='oauth-tok'")
 }
 
 // TestClaudeSettings_WithAPIKey verifies that CM_CLAUDE_SETTINGS is set
-// alongside the Anthropic API key being written to the secrets file.
+// and no rotating secrets appear in the container env.
 func TestClaudeSettings_WithAPIKey(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeAuthDir = ""
 	cfg.ClaudeOAuthToken = ""
 	cfg.AnthropicAPIKey = "sk-test-key"
 	cfg.ClaudeSettings = `{"permissions":{"allow":["Bash"]}}`
 
-	env, _, secrets := buildAuthTestManager(t, cfg)
+	env, _, _ := buildAuthTestManager(t, cfg)
 
-	assertNoAuthEnv(t, env)
+	assertNoSharedSecretEnv(t, env)
 	assert.Contains(t, env, `CM_CLAUDE_SETTINGS={"permissions":{"allow":["Bash"]}}`)
-	assert.Contains(t, secrets, "ANTHROPIC_API_KEY='sk-test-key'")
 }
 
 // TestOrchestratorModel_EnvVarPresentWhenSet verifies that CM_ORCHESTRATOR_MODEL
@@ -1004,7 +987,7 @@ func TestOrchestratorModel_EnvVarPresentWhenSet(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.Model = "claude-opus-4-7"
@@ -1040,7 +1023,7 @@ func TestOrchestratorModel_EnvVarAbsentWhenEmpty(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	// Model is intentionally left empty (zero value).
@@ -1073,7 +1056,7 @@ func TestBaseBranch_EnvVarPresentWhenSet(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.BaseBranch = "main"
@@ -1108,7 +1091,7 @@ func TestInteractive_EnvVarPresentWhenTrue(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.Interactive = true
@@ -1143,7 +1126,7 @@ func TestInteractive_EnvVarAbsentWhenFalse(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	// Interactive is intentionally left false (zero value).
@@ -1176,7 +1159,7 @@ func TestBaseBranch_EnvVarAbsentWhenEmpty(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	// BaseBranch is intentionally left empty (zero value).
@@ -1219,7 +1202,7 @@ func TestInteractive_StdinConfigFlags(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.Interactive = true
@@ -1282,7 +1265,7 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 		tp := testTokenProvider(t)
 
-		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 		payload := testPayload()
 		payload.Interactive = true
@@ -1345,7 +1328,7 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 		tp := testTokenProvider(t)
 
-		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 		payload := testPayload()
 		// Interactive is false (zero value): no attach, no priming write.
@@ -1397,7 +1380,7 @@ func TestPrimingMessage_WrittenWhenInteractive(t *testing.T) {
 		cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 		tp := testTokenProvider(t)
 
-		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+		mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 		payload := testPayload()
 		payload.Interactive = true
@@ -1529,7 +1512,7 @@ func TestPrimingWriteStdin_WriteDeadline(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.Interactive = true
@@ -1601,7 +1584,7 @@ func TestInteractive_FalseNoStdinFlagsNoAttach(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	// Interactive is intentionally left false (zero value).
@@ -1694,7 +1677,7 @@ func TestWaitAndCleanup_ParentContextCanceled(t *testing.T) {
 	tp := testTokenProvider(t)
 
 	b := newRecordingBroadcaster()
-	mgr := NewManager(mock, tr, cb, tp, b.Broadcaster(), testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, b.Broadcaster(), testConfig(t), testLogger())
 
 	payload := testPayload()
 
@@ -1799,7 +1782,7 @@ func TestStartFailure_ReportsFailureDespiteCancelledContext(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 
@@ -1907,7 +1890,7 @@ func TestWaitAndCleanup_Timeout(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ContainerTimeout = "100ms"
 	cfg.ParseContainerTimeout()
 
@@ -1991,7 +1974,7 @@ func TestWaitAndCleanup_ErrChFromContainerWait(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -2041,7 +2024,7 @@ func TestKillContainer_Success(t *testing.T) {
 		return nil
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 	mgr.killContainer(context.Background(), "target-id", testLogger())
 
 	assert.Equal(t, "target-id", gotID)
@@ -2057,7 +2040,7 @@ func TestKillContainer_StopError(t *testing.T) {
 		return fmt.Errorf("docker not reachable")
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 	// Must not panic or block.
 	assert.NotPanics(t, func() {
 		mgr.killContainer(context.Background(), "id", testLogger())
@@ -2072,7 +2055,7 @@ func TestRemoveContainer_Failure(t *testing.T) {
 		return fmt.Errorf("container busy")
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 
 	assert.NotPanics(t, func() {
 		mgr.removeContainer(context.Background(), "id", testLogger())
@@ -2116,7 +2099,7 @@ func TestRun_PanicInStartContainer_RecoveryFreesTrackerAndReports(t *testing.T) 
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -2177,7 +2160,7 @@ func TestStreamLogs_StderrScannerPanic(t *testing.T) {
 	broadcaster := newRecordingBroadcaster()
 	defer broadcaster.Close()
 
-	mgr := NewManager(mock, tr, cb, tp, broadcaster.inner, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, broadcaster.inner, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -2437,7 +2420,7 @@ func TestWaitAndCleanup_MessageDuringCleanupGets404(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -2492,7 +2475,7 @@ func TestWaitAndCleanup_MessageDuringCleanupGets404(t *testing.T) {
 // directly (rather than via streamLogs + a fake stream) so the test is
 // deterministic and does not depend on docker multiplexed framing.
 func TestIdleWatchdog_KillsOnSilence(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.IdleOutputTimeout = 50 * time.Millisecond
 	// Shrink the poll tick so the watchdog reacts promptly inside the test.
 	cfg.IdleWatchdogInterval = 10 * time.Millisecond
@@ -2550,7 +2533,7 @@ func TestIdleWatchdog_KillsOnSilence(t *testing.T) {
 // TestIdleWatchdog_DoesNotKillWhileActive verifies the watchdog stays silent
 // while the container keeps publishing output faster than the idle timeout.
 func TestIdleWatchdog_DoesNotKillWhileActive(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.IdleOutputTimeout = 50 * time.Millisecond
 	// Shrink the poll tick so the watchdog reacts promptly inside the test.
 	cfg.IdleWatchdogInterval = 5 * time.Millisecond
@@ -2617,7 +2600,7 @@ func TestIdleWatchdog_DoesNotKillWhileActive(t *testing.T) {
 // watchdog from being spawned at all: streamLogs runs to completion without a
 // kill even though the stream is empty and lastOutputAt never advances.
 func TestIdleWatchdog_Disabled(t *testing.T) {
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.IdleOutputTimeout = 0 // disabled
 
 	mock := successfulMock()
@@ -2678,7 +2661,7 @@ func TestPruneImages_CallsDockerWithCorrectFilters(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.PruneImages(context.Background())
 	require.NoError(t, err)
@@ -2701,7 +2684,7 @@ func TestPruneImages_PropagatesDockerError(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.PruneImages(context.Background())
 	require.Error(t, err)
@@ -2744,7 +2727,7 @@ func (s *stubResolver) LookupHost(ctx context.Context, _ string) ([]string, erro
 func TestBuildExtraHosts_DNSTimeout(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 	mgr.resolver = &stubResolver{sleep: 5 * time.Second, addrs: []string{"10.0.0.1"}}
 
 	start := time.Now()
@@ -2764,7 +2747,7 @@ func TestBuildExtraHosts_DNSTimeout(t *testing.T) {
 func TestBuildExtraHosts_DNSCache(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	stub := &stubResolver{addrs: []string{"192.0.2.17"}}
 	mgr.resolver = stub
@@ -2813,7 +2796,7 @@ func TestRun_RunningCallbackAsync(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
@@ -2892,7 +2875,7 @@ func TestKill_InteractiveContainer_RemovesContainer(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.CardID = "PROJ-911"
@@ -2966,7 +2949,7 @@ func TestKill_InteractiveContainer_SlowStdinClose_StillRemoves(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.CardID = "PROJ-912"
@@ -3108,7 +3091,7 @@ func TestWaitAndCleanup_LogDone_HangingReader_StillRemovesContainer(t *testing.T
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := testPayload()
 	payload.CardID = "PROJ-426"
@@ -3202,7 +3185,7 @@ func TestListManaged_ReportsTrackerDivergence(t *testing.T) {
 		Project: "proj", CardID: "A-001", ContainerID: "tracked-abc",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	got, err := mgr.ListManaged(context.Background())
 	require.NoError(t, err)
@@ -3231,7 +3214,7 @@ func TestListManaged_DockerError(t *testing.T) {
 		return nil, fmt.Errorf("docker unreachable")
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 
 	_, err := mgr.ListManaged(context.Background())
 	require.Error(t, err)
@@ -3268,7 +3251,7 @@ func TestForceRemoveByLabels_RemovesEveryMatch(t *testing.T) {
 		return nil
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 
 	n, err := mgr.ForceRemoveByLabels(context.Background(), "proj", "A-001")
 	require.NoError(t, err)
@@ -3285,7 +3268,7 @@ func TestForceRemoveByLabels_NoMatchReturnsZero(t *testing.T) {
 		return nil, nil
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 
 	n, err := mgr.ForceRemoveByLabels(context.Background(), "proj", "A-001")
 	require.NoError(t, err)
@@ -3297,7 +3280,7 @@ func TestForceRemoveByLabels_NoMatchReturnsZero(t *testing.T) {
 // them all — which would happen if the label filter were silently ignored
 // by Docker when the value is empty.
 func TestForceRemoveByLabels_RequiresProjectAndCard(t *testing.T) {
-	mgr := NewManager(nil, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(nil, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 
 	_, err := mgr.ForceRemoveByLabels(context.Background(), "", "A-001")
 	require.Error(t, err)
@@ -3349,7 +3332,7 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 	}
 
 	t.Run("mount added when task_skills_dir configured", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = "/var/lib/cm/task-skills"
 
 		payload := testPayload()
@@ -3377,7 +3360,7 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 	})
 
 	t.Run("no mount when task_skills_dir empty", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = ""
 
 		payload := testPayload()
@@ -3396,7 +3379,7 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 	})
 
 	t.Run("env vars emitted for non-nil TaskSkills", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = "/x"
 
 		payload := testPayload()
@@ -3410,7 +3393,7 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 	})
 
 	t.Run("empty list still emits SET=1 with empty value", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = "/x"
 
 		payload := testPayload()
@@ -3424,7 +3407,7 @@ func TestContainerCreate_TaskSkillsMount(t *testing.T) {
 	})
 
 	t.Run("nil TaskSkills emits no env vars even with mount", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = "/x"
 
 		payload := testPayload()
@@ -3479,7 +3462,7 @@ func TestContainerCreate_WorkerExtraEnv(t *testing.T) {
 	}
 
 	t.Run("nil map adds nothing", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.WorkerExtraEnv = nil
 
 		env := captureEnv(t, cfg)
@@ -3490,7 +3473,7 @@ func TestContainerCreate_WorkerExtraEnv(t *testing.T) {
 	})
 
 	t.Run("entries appear in env list", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.WorkerExtraEnv = map[string]string{
 			"GIT_SSL_NO_VERIFY":   "1",
 			"NPM_CONFIG_REGISTRY": "https://npm.internal/",
@@ -3502,7 +3485,7 @@ func TestContainerCreate_WorkerExtraEnv(t *testing.T) {
 	})
 
 	t.Run("entries sorted for deterministic output", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.WorkerExtraEnv = map[string]string{
 			"ZEBRA": "z",
 			"ALPHA": "a",
@@ -3573,7 +3556,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 		// Create a fake .git directory so pullSkillsRepo is not short-circuited
 		// by the real implementation (tests stub it, but the dir check is in
 		// the stub for this test to exercise the wiring path).
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = dir
 
 		calls, tokens := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _, _ string) error {
@@ -3588,7 +3571,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 
 	t.Run("pull failure does not abort container creation", func(t *testing.T) {
 		dir := t.TempDir()
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = dir
 
 		// Stub returns an error; container creation must still complete.
@@ -3634,7 +3617,7 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 	})
 
 	t.Run("no pull when task_skills_dir empty", func(t *testing.T) {
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.TaskSkillsDir = ""
 
 		calls, _ := runWithPullStub(t, cfg, testPayload(), func(_ context.Context, _, _ string) error {
@@ -3748,7 +3731,7 @@ func TestRun_KnowledgeRefreshEnvInjection(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := RunConfig{
 		Mode:          ModeKnowledgeRefresh,
@@ -3842,7 +3825,7 @@ func TestRun_KnowledgeRefreshMode_OnSuccess_CallsKnowledgeStatus(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := RunConfig{
 		Mode:    ModeKnowledgeRefresh,
@@ -3911,7 +3894,7 @@ func TestRun_KnowledgeRefreshMode_OnFailure_CallsKnowledgeStatusWithFailed(t *te
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := RunConfig{
 		Mode:    ModeKnowledgeRefresh,
@@ -3966,7 +3949,7 @@ func TestRun_KnowledgeRefreshMode_DoesNotCallReportStatusRunning(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := RunConfig{
 		Mode:    ModeKnowledgeRefresh,
@@ -4042,7 +4025,7 @@ func TestRun_KnowledgeRefreshMode_DoesNotCallReportSkillEngaged(t *testing.T) {
 	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
 	tp := testTokenProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	payload := RunConfig{
 		Mode:    ModeKnowledgeRefresh,
@@ -4092,7 +4075,7 @@ func TestManager_StartChat_SetsEnvAndWorkspace(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	containerID, err := mgr.StartChat(context.Background(), StartChatOpts{
 		SessionID: "S1",
@@ -4130,11 +4113,11 @@ func TestManager_StartChat_SetsEnvAndWorkspace(t *testing.T) {
 	assert.Equal(t, "alpha", capturedCfg.Labels[LabelProject])
 }
 
-// TestManager_StartChat_SecretsViaTmpfs verifies that chat-mode secrets
-// (CM_MCP_API_KEY + AuthEnv contents like CM_GIT_TOKEN, CLAUDE_CODE_OAUTH_TOKEN)
-// are delivered via the same tmpfs bind-mount the card-mode path uses, and do
-// not appear in container.Config.Env where `docker inspect` would surface them.
-func TestManager_StartChat_SecretsViaTmpfs(t *testing.T) {
+// TestManager_StartChat_SecretDelivery verifies that chat-mode secrets are
+// delivered correctly: CM_MCP_API_KEY rides in Env (per-card), while rotating
+// secrets (CM_GIT_TOKEN, Claude auth) ride the shared dir mount and must not
+// appear in container.Config.Env.
+func TestManager_StartChat_SecretDelivery(t *testing.T) {
 	var (
 		capturedCfg     *container.Config
 		capturedHostCfg *container.HostConfig
@@ -4152,10 +4135,8 @@ func TestManager_StartChat_SecretsViaTmpfs(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	// Production profile + writable temp SecretsDir → file-mode delivery.
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.DeploymentProfile = config.ProfileProduction
-	cfg.SecretsDir = t.TempDir()
 
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
 
@@ -4164,28 +4145,27 @@ func TestManager_StartChat_SecretsViaTmpfs(t *testing.T) {
 		Project:   "alpha",
 		RepoURL:   "https://example.com/alpha.git",
 		MCPAPIKey: "mcp-secret-key",
-		AuthEnv: map[string]string{
-			"CM_GIT_TOKEN":            "gh-token-secret",
-			"CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
-		},
+		GitToken:  "gh-token-secret",
 	})
 	require.NoError(t, err)
 	require.NotNil(t, capturedCfg)
 	require.NotNil(t, capturedHostCfg)
 
-	// Secret env vars must NOT appear in container.Config.Env.
+	// CM_MCP_API_KEY is per-card and must appear in Env.
+	assert.Contains(t, capturedCfg.Env, "CM_MCP_API_KEY=mcp-secret-key",
+		"CM_MCP_API_KEY must be in container Env for per-card delivery")
+
+	// Rotating secrets must NOT appear in container.Config.Env.
 	for _, e := range capturedCfg.Env {
-		assert.False(t, strings.HasPrefix(e, "CM_MCP_API_KEY="),
-			"CM_MCP_API_KEY must not be set as a container env var")
 		assert.False(t, strings.HasPrefix(e, "CM_GIT_TOKEN="),
-			"CM_GIT_TOKEN must not be set as a container env var")
+			"CM_GIT_TOKEN must not be in Env; it rides the shared dir mount")
 		assert.False(t, strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN="),
-			"CLAUDE_CODE_OAUTH_TOKEN must not be set as a container env var")
+			"CLAUDE_CODE_OAUTH_TOKEN must not be in Env; it rides the shared dir mount")
 		assert.False(t, strings.HasPrefix(e, "ANTHROPIC_API_KEY="),
-			"ANTHROPIC_API_KEY must not be set as a container env var")
+			"ANTHROPIC_API_KEY must not be in Env; it rides the shared dir mount")
 	}
 
-	// Mounts must include the secrets tmpfs file at the canonical target.
+	// Mounts must include the shared dir at the canonical target.
 	var hasSecretsMount bool
 
 	for _, m := range capturedHostCfg.Mounts {
@@ -4194,10 +4174,12 @@ func TestManager_StartChat_SecretsViaTmpfs(t *testing.T) {
 
 			assert.True(t, m.ReadOnly, "secrets mount must be read-only")
 			assert.Equal(t, mount.TypeBind, m.Type, "secrets mount must be a bind")
+			assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), m.Source,
+				"secrets mount source must be the shared dir")
 		}
 	}
 
-	assert.True(t, hasSecretsMount, "chat container HostConfig must bind-mount the secrets file at %s", secretsMountTarget)
+	assert.True(t, hasSecretsMount, "chat container HostConfig must bind-mount the shared secrets dir at %s", secretsMountTarget)
 }
 
 // TestManager_StartChat_RequiresSessionID verifies that an empty SessionID
@@ -4209,7 +4191,7 @@ func TestManager_StartChat_RequiresSessionID(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	_, err := mgr.StartChat(context.Background(), StartChatOpts{})
 	require.Error(t, err)
@@ -4234,7 +4216,7 @@ func TestManager_StartChat_UsesBaseImage(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	cfg := testConfig() // BaseImage is "test-image:latest"
+	cfg := testConfig(t) // BaseImage is "test-image:latest"
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
 
 	_, err := mgr.StartChat(context.Background(), StartChatOpts{
@@ -4260,7 +4242,7 @@ func TestManager_StartChat_OptionalFieldsOmitted(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	_, err := mgr.StartChat(context.Background(), StartChatOpts{
 		SessionID: "S3",
@@ -4292,7 +4274,7 @@ func TestManager_StartChat_ClaudeSettings(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.ClaudeSettings = `{"theme":"dark"}`
 
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
@@ -4319,7 +4301,7 @@ func TestManager_StartChat_ClaudeSettings_AbsentWhenEmpty(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	_, err := mgr.StartChat(context.Background(), StartChatOpts{SessionID: "S-no-cs"})
 	require.NoError(t, err)
@@ -4347,7 +4329,7 @@ func TestManager_StartChat_WorkerExtraEnv(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.WorkerExtraEnv = map[string]string{
 		"ZEBRA": "z",
 		"ALPHA": "a",
@@ -4376,7 +4358,7 @@ func TestManager_StartChat_WorkerExtraEnv(t *testing.T) {
 
 // TestManager_StartChat_TaskSkillsMount verifies that when cfg.TaskSkillsDir is
 // configured, chat containers get the /host-skills bind-mount and
-// pullSkillsRepo is invoked with the git token from opts.AuthEnv.
+// pullSkillsRepo is invoked with the git token from opts.GitToken.
 func TestManager_StartChat_TaskSkillsMount(t *testing.T) {
 	var (
 		capturedHostCfg *container.HostConfig
@@ -4408,14 +4390,14 @@ func TestManager_StartChat_TaskSkillsMount(t *testing.T) {
 
 	skillsDir := t.TempDir()
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.TaskSkillsDir = skillsDir
 
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
 
 	_, err := mgr.StartChat(context.Background(), StartChatOpts{
 		SessionID: "S-skills",
-		AuthEnv:   map[string]string{"CM_GIT_TOKEN": "gh-token-for-pull"},
+		GitToken:  "gh-token-for-pull",
 	})
 	require.NoError(t, err)
 	require.NotNil(t, capturedHostCfg)
@@ -4423,7 +4405,7 @@ func TestManager_StartChat_TaskSkillsMount(t *testing.T) {
 	require.Len(t, pullCalls, 1, "pullSkillsRepo must be invoked exactly once")
 	assert.Equal(t, skillsDir, pullCalls[0])
 	assert.Equal(t, "gh-token-for-pull", pullTokens[0],
-		"pullSkillsRepo must receive the git token from AuthEnv")
+		"pullSkillsRepo must receive the git token from GitToken")
 
 	var hasSkillsMount bool
 
@@ -4463,7 +4445,7 @@ func TestManager_StartChat_TaskSkillsExplicitSet(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.TaskSkillsDir = t.TempDir()
 
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
@@ -4503,7 +4485,7 @@ func TestManager_StartChat_TaskSkillsAbsentWhenNil(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.TaskSkillsDir = t.TempDir()
 
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
@@ -4543,7 +4525,7 @@ func TestManager_StreamChatLogs_PublishesAssistantText(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, rec.Broadcaster(), testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, rec.Broadcaster(), testConfig(t), testLogger())
 
 	mgr.StreamChatLogs(context.Background(), "S-stream", "chat-ctr-1", "alpha")
 	mgr.Wait()
@@ -4622,7 +4604,7 @@ func TestListManaged_IncludesChatContainers(t *testing.T) {
 		SessionID: "S-known", Project: "proj", ContainerID: "chat-ctr-tracked",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	got, err := mgr.ListManaged(context.Background())
 	require.NoError(t, err)
@@ -4679,7 +4661,7 @@ func TestCleanupOrphans_SkipsTrackedChat(t *testing.T) {
 		SessionID: "S-live", Project: "proj", ContainerID: "live-chat",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.NoError(t, err)
@@ -4688,13 +4670,11 @@ func TestCleanupOrphans_SkipsTrackedChat(t *testing.T) {
 }
 
 // TestManager_DeleteChatCleanup_UnlinksHostFiles guards the leak in the
-// AddChatIfUnderLimit rollback path: after StartChat populates the host-side
-// secrets file and resume directory, the webhook handler calls
+// AddChatIfUnderLimit rollback path: after StartChat mounts the shared secrets
+// dir and creates the resume directory, the webhook handler calls
 // DeleteChatCleanup as part of its rollback. The wait goroutine is NOT yet
-// running, so DeleteChatCleanup itself must run the file cleanup. Prior to
-// the H5 follow-up fix, DeleteChatCleanup only popped the map entry and the
-// secrets file + resume dir leaked on every limit-reached / track-failed
-// rollback.
+// running, so DeleteChatCleanup itself must run the resume cleanup.
+// The shared secrets dir must NOT be removed — it is owned by the refresher.
 func TestManager_DeleteChatCleanup_UnlinksHostFiles(t *testing.T) {
 	var capturedHostCfg *container.HostConfig
 
@@ -4709,23 +4689,18 @@ func TestManager_DeleteChatCleanup_UnlinksHostFiles(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	// Production profile + writable temp SecretsDir → file-mode secrets +
-	// disk-resident resume dir. Both target directories live under the
-	// per-test tempdir so leaks are visible.
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.DeploymentProfile = config.ProfileProduction
-	cfg.SecretsDir = t.TempDir()
 
 	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+	require.NoError(t, mgr.InitSharedSecrets())
 
 	containerID, err := mgr.StartChat(context.Background(), StartChatOpts{
 		SessionID: "S-rollback",
 		Project:   "alpha",
 		RepoURL:   "https://example.com/alpha.git",
 		MCPAPIKey: "mcp-secret-key",
-		AuthEnv: map[string]string{
-			"CM_GIT_TOKEN": "gh-token-secret",
-		},
+		GitToken:  "gh-token-secret",
 		Resume: &ChatResume{
 			Turns: []ChatResumeTurn{
 				{Seq: 1, Role: "user", Content: "hi"},
@@ -4737,30 +4712,32 @@ func TestManager_DeleteChatCleanup_UnlinksHostFiles(t *testing.T) {
 	require.NotNil(t, capturedHostCfg)
 
 	// Recover the host-side paths from the captured mount config.
-	var secretsPath, resumeDir string
+	var secretsSource, resumeDir string
 
 	for _, m := range capturedHostCfg.Mounts {
 		switch m.Target {
 		case secretsMountTarget:
-			secretsPath = m.Source
+			secretsSource = m.Source
 		case chatResumeMountTarget:
 			resumeDir = m.Source
 		}
 	}
 
-	require.NotEmpty(t, secretsPath, "secrets file mount must be present")
+	require.NotEmpty(t, secretsSource, "secrets mount must be present")
 	require.NotEmpty(t, resumeDir, "resume dir mount must be present")
-	require.FileExists(t, secretsPath, "secrets file must exist after StartChat")
+	// The secrets source is the shared dir (not a per-container file).
+	assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), secretsSource,
+		"secrets mount source must be the shared dir")
 	require.DirExists(t, resumeDir, "resume dir must exist after StartChat")
 
-	// Simulate the webhook handler's AddChatIfUnderLimit rollback: no
-	// tracker entry was registered, no WaitAndCleanupChat was launched,
-	// and the handler invokes DeleteChatCleanup. DeleteChatCleanup must
-	// do the file cleanup itself because no wait goroutine will.
+	// Simulate the webhook handler's AddChatIfUnderLimit rollback.
 	mgr.DeleteChatCleanup(containerID)
 
-	assert.NoFileExists(t, secretsPath,
-		"DeleteChatCleanup must unlink the host-side secrets file")
+	// The shared secrets dir must NOT be removed by DeleteChatCleanup.
+	_, statErr := os.Stat(secretsSource)
+	assert.False(t, os.IsNotExist(statErr),
+		"DeleteChatCleanup must NOT remove the shared secrets dir")
+
 	assert.NoDirExists(t, resumeDir,
 		"DeleteChatCleanup must remove the host-side resume directory")
 }
@@ -4802,7 +4779,7 @@ func TestManager_StartChat_WaitCleanupRemovesTrackerOnExit(t *testing.T) {
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
 	tp := testPATProvider(t)
 
-	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
 
 	containerID, err := mgr.StartChat(context.Background(), StartChatOpts{
 		SessionID: "S-wait",
@@ -4883,7 +4860,7 @@ func TestKillChat_ClosesStdinThenStops(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	const (
 		sessionID   = "01TESTCHAT"
@@ -4919,7 +4896,7 @@ func TestKillChat_NotFound(t *testing.T) {
 	t.Parallel()
 
 	mock := successfulMock()
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
 
 	err := mgr.KillChat(context.Background(), "no-such-session")
 	require.Error(t, err)
@@ -4946,7 +4923,7 @@ func TestKillChat_NoStdinAttached(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(), testLogger())
+	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
 
 	_, streamCancel := context.WithCancel(context.Background())
 	t.Cleanup(streamCancel)
@@ -4964,52 +4941,23 @@ func TestKillChat_NoStdinAttached(t *testing.T) {
 	assert.True(t, stopped.Load(), "ContainerStop must be called even when stdin is not attached")
 }
 
-// TestBuildChatAuthEnv_AuthDirSuppressesEnv verifies that when ClaudeAuthDir is
-// configured alongside a token and API key, BuildChatAuthEnv does NOT inject
-// env-based credentials — the bind-mount is the sole auth mechanism.
-func TestBuildChatAuthEnv_AuthDirSuppressesEnv(t *testing.T) {
+// TestBuildChatAuthEnv_ReturnsGitToken verifies that BuildChatAuthEnv returns
+// a non-empty token when a token provider is wired. Claude auth (OAuth token,
+// API key) is owned by the tokenRefresher and reaches the worker via the
+// shared secrets dir — this function must not return those credentials.
+func TestBuildChatAuthEnv_ReturnsGitToken(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-
+	tp := testPATProvider(t)
 	cfg := &config.Config{
-		ClaudeAuthDir:    dir,
-		ClaudeOAuthToken: "should-not-be-used",
+		ClaudeOAuthToken: "should-not-appear",
 		AnthropicAPIKey:  "neither",
 	}
 
-	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
-	env := mgr.BuildChatAuthEnv(context.Background())
+	mgr := NewManager(nil, tracker.New(), nil, tp, nil, cfg, testLogger())
+	tok := mgr.BuildChatAuthEnv(context.Background())
 
-	_, hasOAuth := env["CLAUDE_CODE_OAUTH_TOKEN"]
-	_, hasAPI := env["ANTHROPIC_API_KEY"]
-
-	require.False(t, hasOAuth, "CLAUDE_CODE_OAUTH_TOKEN must not be set when ClaudeAuthDir is configured")
-	require.False(t, hasAPI, "ANTHROPIC_API_KEY must not be set when ClaudeAuthDir is configured")
-}
-
-// TestBuildChatAuthEnv_FallsBackToOAuthThenAPIKey verifies the fallback cascade
-// when ClaudeAuthDir is absent: oauth token takes priority over API key.
-func TestBuildChatAuthEnv_FallsBackToOAuthThenAPIKey(t *testing.T) {
-	t.Parallel()
-
-	// Only oauth token set — must land in env.
-	mgr1 := NewManager(nil, tracker.New(), nil, nil, nil, &config.Config{
-		ClaudeOAuthToken: "tok",
-	}, testLogger())
-	env1 := mgr1.BuildChatAuthEnv(context.Background())
-	require.Equal(t, "tok", env1["CLAUDE_CODE_OAUTH_TOKEN"])
-	_, hasAPI1 := env1["ANTHROPIC_API_KEY"]
-	require.False(t, hasAPI1, "ANTHROPIC_API_KEY must not appear when oauth token is set")
-
-	// Only API key set — must land in env.
-	mgr2 := NewManager(nil, tracker.New(), nil, nil, nil, &config.Config{
-		AnthropicAPIKey: "key",
-	}, testLogger())
-	env2 := mgr2.BuildChatAuthEnv(context.Background())
-	require.Equal(t, "key", env2["ANTHROPIC_API_KEY"])
-	_, hasOAuth2 := env2["CLAUDE_CODE_OAUTH_TOKEN"]
-	require.False(t, hasOAuth2, "CLAUDE_CODE_OAUTH_TOKEN must not appear when only API key is set")
+	require.NotEmpty(t, tok, "BuildChatAuthEnv must return a non-empty token when a provider is wired")
 }
 
 // TestManager_StartChat_ResumeMountReadOnly verifies that StartChat binds
@@ -5027,8 +4975,7 @@ func TestManager_StartChat_ResumeMountReadOnly(t *testing.T) {
 		return container.CreateResponse{ID: "chat-resume-ro"}, nil
 	}
 
-	cfg := testConfig()
-	cfg.SecretsDir = t.TempDir()
+	cfg := testConfig(t)
 
 	tr := tracker.New()
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
@@ -5074,8 +5021,7 @@ func TestStartChat_ModelEnvForwarded(t *testing.T) {
 		return container.CreateResponse{ID: "chat-model-test"}, nil
 	}
 
-	cfg := testConfig()
-	cfg.SecretsDir = t.TempDir()
+	cfg := testConfig(t)
 
 	tr := tracker.New()
 	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
@@ -5111,8 +5057,7 @@ func TestStartChat_ResumeEnvOnlyWhenSucceeded(t *testing.T) {
 			return container.CreateResponse{ID: "chat-resume-success"}, nil
 		}
 
-		cfg := testConfig()
-		cfg.SecretsDir = t.TempDir()
+		cfg := testConfig(t)
 
 		tr := tracker.New()
 		cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
@@ -5149,8 +5094,7 @@ func TestStartChat_ResumeEnvOnlyWhenSucceeded(t *testing.T) {
 			return container.CreateResponse{ID: "chat-resume-fail"}, nil
 		}
 
-		cfg := testConfig()
-		cfg.SecretsDir = t.TempDir()
+		cfg := testConfig(t)
 		cfg.DeploymentProfile = config.ProfileProduction
 
 		tr := tracker.New()
@@ -5164,9 +5108,9 @@ func TestStartChat_ResumeEnvOnlyWhenSucceeded(t *testing.T) {
 		// prepareChatResume failure from secrets prep.
 		mgr.mkdirAll = func(path string, perm os.FileMode) error {
 			count := mkdirCount.Add(1)
-			// Allow the first few calls (baseDir + container name dirs), but fail
-			// the per-container resume directory creation.
-			if count > 2 {
+			// buildSecretDelivery makes no mkdirAll calls in file mode;
+			// all mkdirAll calls here are for the per-container resume dir.
+			if count > 1 {
 				return fmt.Errorf("injected mkdir failure for resume dir")
 			}
 
@@ -5192,8 +5136,7 @@ func TestStartChat_ResumeEnvOnlyWhenSucceeded(t *testing.T) {
 func TestManager_PrepareChatResume_FilePerms(t *testing.T) {
 	t.Parallel()
 
-	cfg := testConfig()
-	cfg.SecretsDir = t.TempDir()
+	cfg := testConfig(t)
 
 	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
 
@@ -5222,8 +5165,7 @@ func TestManager_PrepareChatResume_FilePerms(t *testing.T) {
 func TestManager_PrepareChatResume_NonceUniqueness(t *testing.T) {
 	t.Parallel()
 
-	cfg := testConfig()
-	cfg.SecretsDir = t.TempDir()
+	cfg := testConfig(t)
 
 	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
 
@@ -5251,8 +5193,7 @@ func TestManager_PrepareChatResume_NonceUniqueness(t *testing.T) {
 func TestManager_PrepareChatResume_CleansUpOnWriteFailure(t *testing.T) {
 	t.Parallel()
 
-	cfg := testConfig()
-	cfg.SecretsDir = t.TempDir()
+	cfg := testConfig(t)
 
 	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
 
@@ -5285,7 +5226,7 @@ func TestManager_PrepareChatResume_CleansUpOnWriteFailure(t *testing.T) {
 func TestManager_PrepareChatResume_FallsBackToTmpInDevMode(t *testing.T) {
 	t.Parallel()
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	// Use a non-existent directory that will fail on mkdir
 	cfg.SecretsDir = "/nonexistent/path/that/cannot/be/created"
 	cfg.DeploymentProfile = "dev"
@@ -5318,4 +5259,58 @@ func TestManager_PrepareChatResume_FallsBackToTmpInDevMode(t *testing.T) {
 
 	_, err = os.Stat(filepath.Join(delivery.DirPath, "resume.meta.json"))
 	require.NoError(t, err, "resume.meta.json must exist in the fallback directory")
+}
+
+func TestInitSharedSecretsCreatesDirectory(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{SecretsDir: dir}
+
+	m := &Manager{
+		cfg:      cfg,
+		logger:   slog.Default(),
+		mkdirAll: os.MkdirAll,
+	}
+
+	require.NoError(t, m.InitSharedSecrets())
+
+	info, err := os.Stat(filepath.Join(dir, "shared"))
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+}
+
+func TestInitSharedSecretsNoopWhenSecretsDirEmpty(t *testing.T) {
+	m := &Manager{
+		cfg:      &config.Config{SecretsDir: ""},
+		logger:   slog.Default(),
+		mkdirAll: os.MkdirAll,
+	}
+	require.NoError(t, m.InitSharedSecrets())
+}
+
+func TestStartTokenRefresherWritesSecretsFile(t *testing.T) {
+	dir := t.TempDir()
+
+	cfg := &config.Config{
+		SecretsDir:       dir,
+		ClaudeOAuthToken: "sk-ant-oat01-abc",
+	}
+	m := &Manager{
+		cfg:      cfg,
+		logger:   slog.Default(),
+		token:    &fakeTokenGen{token: "ghs_init", expires: time.Now().Add(1 * time.Hour)},
+		mkdirAll: os.MkdirAll,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// LIFO: wg.Wait runs after cancel so the goroutine exits before the drain.
+	defer m.wg.Wait()
+	defer cancel()
+
+	require.NoError(t, m.StartTokenRefresher(ctx))
+
+	// Synchronous initial mint guarantees the file exists on return.
+	b, err := os.ReadFile(filepath.Join(dir, "shared", "env"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "ghs_init")
 }

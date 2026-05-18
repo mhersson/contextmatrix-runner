@@ -69,7 +69,7 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	authEnv := h.manager.BuildChatAuthEnv(r.Context())
+	gitToken := h.manager.BuildChatAuthEnv(r.Context())
 
 	var resume *container.ChatResume
 
@@ -92,7 +92,7 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		RepoURL:   p.RepoURL,
 		MCPURL:    h.mcpURL,
 		MCPAPIKey: p.MCPAPIKey,
-		AuthEnv:   authEnv,
+		GitToken:  gitToken,
 		Model:     p.Model,
 		Resume:    resume,
 	})
@@ -154,9 +154,9 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 	//
 	// WaitAndCleanupChat is already running by this point, so we rely on
 	// Stop to make ContainerWait return; the goroutine then pops the
-	// cleanup state and unlinks the secrets file + resume dir. No explicit
+	// cleanup state and removes the chat resume dir. No explicit
 	// DeleteChatCleanup is needed here (deleting it would race the
-	// goroutine and silently drop the secret-file cleanup).
+	// goroutine and silently drop the resume-dir cleanup).
 	if err := h.manager.AttachChatStdin(r.Context(), p.SessionID, containerID); err != nil {
 		h.tracker.RemoveChat(p.SessionID)
 		streamCancel()

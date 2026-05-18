@@ -136,8 +136,6 @@ func main() {
 	// (tokens hand off to long-lived worker containers; freshness at delivery matters).
 
 	// Core components.
-	defer func() { _ = docker.Close() }()
-
 	trk := tracker.New()
 	cb := callback.NewClient(cfg.ContextMatrixURL, cfg.APIKey, logger).WithMetrics(mx)
 	cb.SetUseHMACForVerifyAutonomous(cfg.UseHMACForVerifyAutonomous)
@@ -153,9 +151,6 @@ func main() {
 	}
 
 	broadcaster := logbroadcast.NewBroadcaster(logger, broadcasterDropAdapter{m: mx})
-
-	defer func() { _ = broadcaster.Close(context.Background()) }()
-
 	mgr := container.NewManager(docker, trk, cb, tokenProvider, broadcaster, cfg, logger).WithMetrics(mx)
 
 	// HealthState is the shared view of whether preflight has passed and
@@ -169,6 +164,18 @@ func main() {
 	// dockerd health monitor). It is cancelled on shutdown so the
 	// goroutines exit before the HTTP server finishes draining.
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+
+	if err := mgr.StartTokenRefresher(monitorCtx); err != nil {
+		logger.Error("failed to start token refresher", "error", err)
+		monitorCancel()
+		os.Exit(1)
+	}
+
+	// Deferred cleanups are registered after fatal startup checks to keep
+	// all os.Exit calls in main above any defer, satisfying the
+	// exitAfterDefer linter rule.
+	defer func() { _ = docker.Close() }()
+	defer func() { _ = broadcaster.Close(context.Background()) }()
 	defer monitorCancel()
 
 	// Run preflight. It runs synchronously for the first attempt so the

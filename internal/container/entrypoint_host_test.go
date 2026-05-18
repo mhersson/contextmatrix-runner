@@ -268,8 +268,8 @@ func TestEntrypointBranchValidatorInSource(t *testing.T) {
 		"entrypoint.sh must not use the legacy grep-based branch validator")
 }
 
-// TestEntrypointSecretsFileSourcing verifies the entrypoint reads the tmpfs
-// secrets file at /run/cm-secrets/env when present.
+// TestEntrypointSecretsFileSourcing verifies the entrypoint reads the
+// shared host-directory bind-mounted secrets file at /run/cm-secrets/env when present.
 func TestEntrypointSecretsFileSourcing(t *testing.T) {
 	path := entrypointPath(t)
 	content, err := os.ReadFile(path)
@@ -412,6 +412,43 @@ func makeFakeSkillDir(t *testing.T, parent, name string) {
 	dir := filepath.Join(parent, name)
 	require.NoError(t, os.MkdirAll(dir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# "+name), 0o600))
+}
+
+// TestEntrypointGitCredentialHelperResourcesSecrets verifies that the git
+// credential helper sources /run/cm-secrets/env on every `get` so the runner's
+// token rotation is picked up without restarting the worker.
+func TestEntrypointGitCredentialHelperResourcesSecrets(t *testing.T) {
+	path := entrypointPath(t)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err, "reading entrypoint.sh")
+
+	src := string(content)
+
+	assert.Contains(t, src, ". /run/cm-secrets/env",
+		"credential helper must source the secrets file on every get")
+	assert.NotContains(t, src, `printf '%s\n' "$CM_GIT_TOKEN" > "$_cred_file"`,
+		"static token-file write must be removed")
+}
+
+// TestEntrypointInstallsGhWrapper verifies that the entrypoint installs a
+// wrapper script at $HOME/.local/bin/gh that re-sources /run/cm-secrets/env
+// on every invocation, and that the old static export GH_TOKEN= line is gone.
+func TestEntrypointInstallsGhWrapper(t *testing.T) {
+	path := entrypointPath(t)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err, "reading entrypoint.sh")
+
+	src := string(content)
+
+	assert.Contains(t, src, `mkdir -p "$HOME/.local/bin"`,
+		`entrypoint.sh must create $HOME/.local/bin`)
+	assert.Contains(t, src, `"$HOME/.local/bin/gh"`,
+		`entrypoint.sh must install a wrapper at $HOME/.local/bin/gh`)
+	// The old block conditionally exported GH_TOKEN at entrypoint time,
+	// pinning the value for the container lifetime. The wrapper approach
+	// replaces it; the bare conditional must be gone.
+	assert.NotContains(t, src, "if [ -n \"${CM_GIT_TOKEN:-}\" ]; then\n    export GH_TOKEN",
+		`entrypoint.sh must not have the old static "if CM_GIT_TOKEN; then export GH_TOKEN" block`)
 }
 
 func TestEntrypoint_TaskSkillsCopy(t *testing.T) {

@@ -216,20 +216,21 @@ const dnsLookupTimeout = 2 * time.Second
 type secretMode int
 
 const (
-	// secretModeFile delivers secrets via a host-side tmpfs file that is
-	// bind-mounted read-only into the container at /run/cm-secrets/env.
+	// secretModeFile delivers secrets via the singleton shared dir
+	// ($SecretsDir/shared), bind-mounted read-only at /run/cm-secrets/.
+	// The entrypoint sources /run/cm-secrets/env which the tokenRefresher writes.
 	secretModeFile secretMode = iota
-	// secretModeEnvVar delivers secrets directly via HostConfig.Env. Used as a
-	// dev-mode fallback when secrets_dir is not writable.
+	// secretModeEnvVar delivers secrets directly via HostConfig.Env. Used when
+	// SecretsDir is empty (unit tests without a shared dir).
 	secretModeEnvVar
 )
 
-// secretDelivery describes the result of prepareSecrets: either a host-side
-// file path (Mode == secretModeFile) or a slice of KEY=VALUE strings ready to
-// be appended to the container env (Mode == secretModeEnvVar).
+// secretDelivery describes how secrets reach a container. In file mode,
+// FilePath is the host-side shared dir to bind-mount. In env-var mode, EnvVars
+// is the slice of KEY=VALUE strings to append to the container env.
 type secretDelivery struct {
 	Mode     secretMode
-	FilePath string   // set when Mode == secretModeFile
+	FilePath string   // set when Mode == secretModeFile: host path of shared dir
 	EnvVars  []string // set when Mode == secretModeEnvVar
 }
 
@@ -266,15 +267,7 @@ type Manager struct {
 	// the tracker entry is registered before an instant container exit
 	// can race RemoveChat against AddChat.
 	chatCleanupMu sync.Mutex
-	chatCleanup   map[string]chatCleanupState
-}
-
-// chatCleanupState captures the resources that the deferred
-// WaitAndCleanupChat goroutine must release once the container exits.
-// Populated by StartChat; consumed and deleted by WaitAndCleanupChat.
-type chatCleanupState struct {
-	delivery       secretDelivery
-	resumeDelivery chatResumeDelivery
+	chatCleanup   map[string]chatResumeDelivery
 }
 
 // WithMetrics attaches a metrics bundle to the manager. A nil bundle disables
@@ -309,8 +302,81 @@ func NewManager(
 		createFile: func(path string) (*os.File, error) {
 			return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
 		},
-		chatCleanup: map[string]chatCleanupState{},
+		chatCleanup: map[string]chatResumeDelivery{},
 	}
+}
+
+func (m *Manager) InitSharedSecrets() error {
+	if m.cfg.SecretsDir == "" {
+		return nil
+	}
+
+	dir := filepath.Join(m.cfg.SecretsDir, sharedSecretsSubdir)
+	if err := m.mkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create shared secrets dir: %w", err)
+	}
+
+	return nil
+}
+
+// buildStaticAuthEnv selects the Claude credential to fold into the
+// shared secrets file. Empty map when ClaudeAuthDir is configured (the
+// worker reads creds from the bind-mounted dir, not env).
+func buildStaticAuthEnv(cfg *config.Config) map[string]string {
+	static := map[string]string{}
+	if cfg.ClaudeAuthDir != "" {
+		return static
+	}
+
+	switch {
+	case cfg.ClaudeOAuthToken != "":
+		static["CLAUDE_CODE_OAUTH_TOKEN"] = cfg.ClaudeOAuthToken
+	case cfg.AnthropicAPIKey != "":
+		static["ANTHROPIC_API_KEY"] = cfg.AnthropicAPIKey
+	}
+
+	return static
+}
+
+// StartTokenRefresher initialises the shared secrets directory via
+// InitSharedSecrets, performs the first token mint synchronously, and then
+// spawns a background goroutine that re-mints on expiry. The initial mint is
+// fail-closed: if it fails, StartTokenRefresher returns the error immediately
+// and the caller should treat it as fatal at boot time. Subsequent mint
+// failures in the goroutine loop are retried with exponential backoff and do
+// not propagate. In env-var fallback mode (cfg.SecretsDir empty),
+// InitSharedSecrets is a no-op, the initial mint is skipped, and the
+// spawned goroutine logs and returns immediately.
+func (m *Manager) StartTokenRefresher(ctx context.Context) error {
+	if err := m.InitSharedSecrets(); err != nil {
+		return err
+	}
+
+	r := newTokenRefresher(tokenRefresherConfig{
+		Token:      m.token,
+		SecretsDir: m.cfg.SecretsDir,
+		StaticEnv:  buildStaticAuthEnv(m.cfg),
+		Logger:     m.logger,
+	})
+
+	// Synchronous initial mint+write so the HTTP listener can't accept a
+	// trigger before /run/cm-secrets/env exists. Skipped in disabled mode
+	// (env-var fallback) where there's no file to write.
+	if !r.disabled {
+		if _, _, err := r.doOneRefresh(ctx); err != nil {
+			return fmt.Errorf("initial github token refresh: %w", err)
+		}
+	}
+
+	m.wg.Add(1)
+
+	go func() {
+		defer m.wg.Done()
+
+		r.Run(ctx)
+	}()
+
+	return nil
 }
 
 // withCleanupTimeout returns a fresh, parent-detached context bounded by
@@ -396,10 +462,9 @@ func (m *Manager) Wait() {
 func (m *Manager) run(ctx context.Context, payload RunConfig) string {
 	log := m.logger.With("card_id", payload.CardID, "project", payload.Project)
 
-	containerID, delivery, secretValues, err := m.startContainer(ctx, payload)
+	containerID, _, secretValues, err := m.startContainer(ctx, payload)
 	if err != nil {
 		log.Error("failed to start container", "error", err)
-		m.removeSecretsFile(delivery, log)
 
 		// Use a detached context for the callback: if start raced with a Kill
 		// (or the runner is shutting down), ctx is already cancelled and the
@@ -437,7 +502,7 @@ func (m *Manager) run(ctx context.Context, payload RunConfig) string {
 
 	// Wait for container to finish and return its outcome so the caller's
 	// duration histogram carries the right label.
-	return m.waitAndCleanup(ctx, containerID, delivery, payload, secretValues, log)
+	return m.waitAndCleanup(ctx, containerID, payload, secretValues, log)
 }
 
 // runningCallbackAsync fires ReportStatus("running") on a background
@@ -480,10 +545,11 @@ func (m *Manager) runningCallbackAsync(payload RunConfig, log *slog.Logger) {
 	}()
 }
 
-// secretsMountTarget is the in-container path where the per-container
-// secrets file is bind-mounted read-only. It is a PATH, not a credential;
-// the gosec G101 flag is a false positive.
-const secretsMountTarget = "/run/cm-secrets/env" //nolint:gosec // path, not a credential
+// secretsMountTarget is the in-container directory where the shared secrets
+// dir is bind-mounted read-only. The entrypoint sources the `env` file inside
+// this directory. It is a PATH, not a credential; the gosec G101 flag is a
+// false positive.
+const secretsMountTarget = "/run/cm-secrets" //nolint:gosec // path, not a credential
 
 func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string, secretDelivery, []string, error) {
 	img := payload.RunnerImage
@@ -505,34 +571,25 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		return "", secretDelivery{}, nil, err
 	}
 
-	// Generate GitHub App token. Expiry is discarded for now — the runner
-	// mints fresh per spawn and hands the token off to the container.
+	// Generate a GitHub token for the runner's own git pull of the skills repo.
+	// This token is NOT passed into the container — rotating credentials reach
+	// the container via the shared secrets dir that the tokenRefresher maintains.
 	gitToken, _, err := m.token.GenerateToken(ctx)
 	if err != nil {
 		return "", secretDelivery{}, nil, fmt.Errorf("generate git token: %w", err)
 	}
 
-	// Secrets (CM_GIT_TOKEN, CM_MCP_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
-	// ANTHROPIC_API_KEY) are written to a mode-0600 file on a tmpfs dir
-	// and bind-mounted read-only into the container at
-	// /run/cm-secrets/env. This keeps them out of HostConfig.Env (so
-	// `docker inspect` cannot leak them) and out of PID 1's initial
-	// /proc/1/environ. The same values are also collected into
-	// secretValues so the per-container Redactor can mask their literal
-	// forms in output.
-	secrets := map[string]string{
-		"CM_GIT_TOKEN": gitToken,
-	}
-	if payload.MCPAPIKey != "" {
-		secrets["CM_MCP_API_KEY"] = payload.MCPAPIKey
-	}
-
-	// Build environment variables — NON-SECRET ONLY.
+	// Build environment variables. CM_MCP_API_KEY is per-card and doesn't
+	// rotate, so it rides directly in Env rather than the shared dir.
 	env := []string{
 		"CM_CARD_ID=" + payload.CardID,
 		"CM_PROJECT=" + payload.Project,
 		"CM_MCP_URL=" + payload.MCPURL,
 		"CM_REPO_URL=" + normalizeRepoURL(payload.RepoURL),
+	}
+
+	if payload.MCPAPIKey != "" {
+		env = append(env, "CM_MCP_API_KEY="+payload.MCPAPIKey)
 	}
 
 	if payload.CorrelationID != "" {
@@ -562,46 +619,43 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	env = m.appendCommonEnv(env, payload.TaskSkills)
 
-	// Apply highest-priority Claude auth method only.
-	// Priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
-	// The auth-dir bind is shared with chat-mode via claudeAuthMount(); the
-	// env-based modes (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) go through
-	// the secrets file in both modes — card adds them inline below; chat
-	// pre-builds them into opts.AuthEnv via BuildChatAuthEnv before StartChat
-	// runs.
 	var mounts []mount.Mount
 
 	if authMount, ok := m.claudeAuthMount(); ok {
 		mounts = append(mounts, authMount)
-	} else {
-		switch {
-		case m.cfg.ClaudeOAuthToken != "":
-			secrets["CLAUDE_CODE_OAUTH_TOKEN"] = m.cfg.ClaudeOAuthToken
-		case m.cfg.AnthropicAPIKey != "":
-			secrets["ANTHROPIC_API_KEY"] = m.cfg.AnthropicAPIKey
-		}
 	}
 
 	if skillsMount, ok := m.taskSkillsMount(ctx, gitToken); ok {
 		mounts = append(mounts, skillsMount)
 	}
 
-	// Collect secret values (deterministic order, sorted by key) for the
-	// per-container Redactor so output redacts literal values in addition
-	// to the static KEY=... patterns.
-	secretKeys := slices.Sorted(maps.Keys(secrets))
-
-	secretValues := make([]string, 0, len(secrets))
-
-	for _, k := range secretKeys {
-		secretValues = append(secretValues, secrets[k])
+	// Determine secret delivery mode and collect secret values for the
+	// per-container Redactor. In file mode, the tokenRefresher manages the
+	// shared dir contents; in env-var mode (SecretsDir == ""), mint inline.
+	delivery, err := m.buildSecretDelivery(ctx)
+	if err != nil {
+		return "", secretDelivery{}, nil, fmt.Errorf("build secret delivery: %w", err)
 	}
 
-	// Prepare secret delivery: try writing to a tmpfs file first. In dev mode,
-	// fall back to env-var delivery if the secrets dir is not writable.
-	delivery, err := m.prepareSecrets(sanitizeContainerName(payload.Project, payload.CardID), secrets)
-	if err != nil {
-		return "", secretDelivery{}, nil, fmt.Errorf("prepare secrets: %w", err)
+	// Collect secret values for the per-container Redactor so log output
+	// redacts literal credential values in addition to the static KEY=... patterns.
+	// In file mode the actual values are unknown here; we only redact MCPAPIKey.
+	// CM_GIT_TOKEN is intentionally absent: the runner doesn't know the live value
+	// at spawn time (only the refresher does). Threat model: worker logs leaking a
+	// token are an unlikely and low-impact path on a single-tenant host. If future
+	// redaction is needed, the refresher should publish via a thread-safe accessor.
+	var secretValues []string
+
+	if payload.MCPAPIKey != "" {
+		secretValues = append(secretValues, payload.MCPAPIKey)
+	}
+
+	if delivery.Mode == secretModeEnvVar {
+		for _, e := range delivery.EnvVars {
+			if idx := strings.IndexByte(e, '='); idx >= 0 {
+				secretValues = append(secretValues, e[idx+1:])
+			}
+		}
 	}
 
 	// Wire the delivery into the container configuration.
@@ -694,95 +748,43 @@ func isPermissionDenied(err error) bool {
 	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS)
 }
 
-// prepareSecrets decides how secrets are delivered to the container.
-//
-//   - Tries to write a mode-0600 file under cfg.SecretsDir (file mode).
-//   - If the directory cannot be created or the file cannot be opened due to
-//     os.ErrPermission / syscall.EROFS AND the runner is in dev mode, falls
-//     back to env-var delivery with a WARN log.
-//   - Any other error, or the same permission error in production mode, is
-//     returned unchanged so the caller fails closed.
-//
-// containerName is used (with a random nonce) to make the on-disk filename
-// human-recognisable and unique; it is not load-bearing for security.
-func (m *Manager) prepareSecrets(containerName string, secrets map[string]string) (secretDelivery, error) {
-	dir := m.cfg.SecretsDir
-	if dir == "" {
-		dir = "/var/run/cm-runner/secrets" //nolint:gosec // path, not a credential
-	}
-
-	if err := m.mkdirAll(dir, 0o700); err != nil {
-		if isPermissionDenied(err) && m.cfg.IsDev() {
-			m.logger.Warn("dev profile: secrets_dir not writable, falling back to env-var delivery",
-				"dir", dir, "error", err)
-
-			return secretDelivery{Mode: secretModeEnvVar, EnvVars: secretsToEnvVars(secrets)}, nil
+// buildSecretDelivery decides how secrets are delivered to the container.
+// When SecretsDir is set, the singleton tokenRefresher maintains the shared
+// dir; workers bind-mount it read-only at /run/cm-secrets/ (file mode).
+// When SecretsDir is empty (unit tests without a shared dir), a fresh token is
+// minted inline and all secrets are folded into Container.Env (env-var mode).
+func (m *Manager) buildSecretDelivery(ctx context.Context) (secretDelivery, error) {
+	if m.cfg.SecretsDir == "" {
+		token, _, err := m.token.GenerateToken(ctx)
+		if err != nil {
+			return secretDelivery{}, fmt.Errorf("mint github token: %w", err)
 		}
 
-		return secretDelivery{}, fmt.Errorf("create secrets dir: %w", err)
-	}
+		envVars := []string{"CM_GIT_TOKEN=" + token}
 
-	// A 16-byte random nonce avoids collisions if the same name is reused
-	// while a previous file is still being unlinked.
-	var nonce [8]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return secretDelivery{}, fmt.Errorf("generate secrets nonce: %w", err)
-	}
-
-	base := containerName + "-" + hex.EncodeToString(nonce[:]) + ".env"
-	path := filepath.Join(dir, base)
-
-	f, err := m.createFile(path)
-	if err != nil {
-		if isPermissionDenied(err) && m.cfg.IsDev() {
-			m.logger.Warn("dev profile: secrets_dir not writable, falling back to env-var delivery",
-				"dir", dir, "error", err)
-
-			return secretDelivery{Mode: secretModeEnvVar, EnvVars: secretsToEnvVars(secrets)}, nil
+		for k, v := range buildStaticAuthEnv(m.cfg) {
+			envVars = append(envVars, k+"="+v)
 		}
 
-		return secretDelivery{}, fmt.Errorf("open secrets file: %w", err)
+		return secretDelivery{Mode: secretModeEnvVar, EnvVars: envVars}, nil
 	}
 
-	// Deterministic iteration for stable tests and reviewable diffs.
-	keys := slices.Sorted(maps.Keys(secrets))
-
-	for _, k := range keys {
-		if _, werr := fmt.Fprintf(f, "export %s='%s'\n", k, shellSingleQuoteEscape(secrets[k])); werr != nil {
-			_ = f.Close()
-			_ = os.Remove(path)
-
-			return secretDelivery{}, fmt.Errorf("write secret %s: %w", k, werr)
-		}
-	}
-
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-
-		return secretDelivery{}, fmt.Errorf("close secrets file: %w", err)
-	}
-
-	return secretDelivery{Mode: secretModeFile, FilePath: path}, nil
+	return secretDelivery{
+		Mode:     secretModeFile,
+		FilePath: filepath.Join(m.cfg.SecretsDir, sharedSecretsSubdir),
+	}, nil
 }
 
-// secretsToEnvVars converts a secrets map to a sorted slice of KEY=VALUE
-// strings suitable for appending to container.Config.Env.
-func secretsToEnvVars(secrets map[string]string) []string {
-	keys := slices.Sorted(maps.Keys(secrets))
-
-	vars := make([]string, 0, len(secrets))
-	for _, k := range keys {
-		vars = append(vars, k+"="+secrets[k])
-	}
-
-	return vars
+// shellSingleQuoteEscape returns s with every `'` replaced by `'\”` so the
+// result can be safely embedded inside a single-quoted shell string.
+func shellSingleQuoteEscape(s string) string {
+	return strings.ReplaceAll(s, `'`, `'\''`)
 }
 
-// applySecretsDelivery wires the runner's secret-delivery decision into the
-// container spec. In file mode it appends the tmpfs bind-mount for
-// /run/cm-secrets/env; in env-var fallback mode it appends the secrets to
-// the env slice. Both card-mode and chat-mode call this so the two delivery
-// modes stay symmetric.
+// applySecretsDelivery wires the secret-delivery decision into the container
+// spec. In file mode it appends the shared-dir bind-mount at /run/cm-secrets/;
+// in env-var fallback mode it appends the secrets to the env slice.
+// Both card-mode and chat-mode call this so the two delivery modes stay symmetric.
 func applySecretsDelivery(env []string, mounts []mount.Mount, delivery secretDelivery) ([]string, []mount.Mount) {
 	switch delivery.Mode {
 	case secretModeFile:
@@ -797,25 +799,6 @@ func applySecretsDelivery(env []string, mounts []mount.Mount, delivery secretDel
 	}
 
 	return env, mounts
-}
-
-// shellSingleQuoteEscape returns s with every `'` replaced by `'\”` so the
-// result can be safely embedded inside a single-quoted shell string.
-func shellSingleQuoteEscape(s string) string {
-	return strings.ReplaceAll(s, `'`, `'\''`)
-}
-
-// removeSecretsFile best-effort unlinks the per-container secrets file from
-// the host. No-op for env-var delivery (nothing to unlink) or if the file
-// path is empty.
-func (m *Manager) removeSecretsFile(d secretDelivery, log *slog.Logger) {
-	if d.Mode == secretModeEnvVar || d.FilePath == "" {
-		return
-	}
-
-	if err := os.Remove(d.FilePath); err != nil && !os.IsNotExist(err) {
-		log.Warn("failed to remove secrets file", "path", d.FilePath, "error", err)
-	}
 }
 
 // chatResumeMountTarget is the in-container path where the rehydration
@@ -1001,7 +984,7 @@ func buildPrimingContent(payload RunConfig) string {
 	return content
 }
 
-func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, delivery secretDelivery, payload RunConfig, secrets []string, log *slog.Logger) string {
+func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payload RunConfig, secrets []string, log *slog.Logger) string {
 	// Defers run LIFO, so the declared order here is the REVERSE of the
 	// execution order. We want the tracker entry to disappear first so
 	// `/message`, `/promote`, and `/end-session` requests that race with
@@ -1009,9 +992,8 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, delive
 	// write against a dead container). H21.
 	//
 	// Actual execution order:
-	//   1. tracker.Remove     — unpublish the entry (also closes stdin).
-	//   2. removeSecretsFile  — unlink the host-side per-container secrets file.
-	//   3. removeContainer    — delete the Docker container (bounded ctx
+	//   1. tracker.Remove  — unpublish the entry (also closes stdin).
+	//   2. removeContainer — delete the Docker container (bounded ctx
 	//      so a hung dockerd cannot stall the goroutine).
 	defer func() {
 		rmCtx, cancel := withDockerCleanupTimeout(context.Background())
@@ -1019,7 +1001,6 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, delive
 
 		m.removeContainer(rmCtx, containerID, log)
 	}()
-	defer m.removeSecretsFile(delivery, log)
 	defer m.tracker.Remove(payload.Project, payload.CardID)
 
 	// Stream container logs in real time.
@@ -2108,10 +2089,10 @@ type StartChatOpts struct {
 	// MCPAPIKey authenticates MCP calls. Sets CM_MCP_API_KEY. Empty is
 	// permitted when CM's MCP listener has no auth (loopback dev mode).
 	MCPAPIKey string
-	// AuthEnv contains Claude auth and git token vars (e.g. ANTHROPIC_API_KEY,
-	// CM_GIT_TOKEN). The caller builds this map — typically via buildAuthEnv or
-	// equivalent — and all entries are merged into the container env.
-	AuthEnv map[string]string
+	// GitToken is the GitHub installation token used solely for the runner's
+	// own taskSkillsMount git pull and never reaches the container env or
+	// shared secrets file.
+	GitToken string
 	// Model is the Claude model the chat container should run. Sets
 	// CM_ORCHESTRATOR_MODEL; the entrypoint passes this to `claude --model`.
 	// Empty falls back to the entrypoint default (claude-sonnet-4-6).
@@ -2167,14 +2148,18 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 		return "", fmt.Errorf("StartChat: pull image: %w", err)
 	}
 
-	// Build env — chat-specific, non-secret values only. Secrets
-	// (CM_MCP_API_KEY plus every entry of opts.AuthEnv) are routed through
-	// prepareSecrets so they land on a tmpfs file bind-mounted into the
-	// container at /run/cm-secrets/env. This keeps them out of
-	// container.Config.Env where `docker inspect` would leak them.
+	// Build env — chat-specific values. CM_MCP_API_KEY is per-session and
+	// doesn't rotate, so it rides directly in Env. Rotating credentials
+	// (CM_GIT_TOKEN, Claude auth) are owned by the tokenRefresher and reach
+	// the container via the shared secrets dir mount.
 	env := []string{
 		"CM_CHAT_SESSION=" + opts.SessionID,
 	}
+
+	if opts.MCPAPIKey != "" {
+		env = append(env, "CM_MCP_API_KEY="+opts.MCPAPIKey)
+	}
+
 	if opts.Project != "" {
 		env = append(env, "CM_CHAT_PROJECT="+opts.Project)
 	}
@@ -2193,22 +2178,6 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 
 	env = m.appendCommonEnv(env, opts.TaskSkills)
 
-	// Build the chat-mode secrets map. AuthEnv is treated as opaque-but-
-	// sensitive: the runner only ever populates it via BuildChatAuthEnv which
-	// puts auth credentials (git token, Claude OAuth, Anthropic API key) in
-	// there. Anything the caller passes is moved to tmpfs alongside MCPAPIKey.
-	secrets := make(map[string]string, len(opts.AuthEnv)+1)
-
-	for k, v := range opts.AuthEnv {
-		if v != "" {
-			secrets[k] = v
-		}
-	}
-
-	if opts.MCPAPIKey != "" {
-		secrets["CM_MCP_API_KEY"] = opts.MCPAPIKey
-	}
-
 	// Sanitise a container name from session ID (may contain arbitrary chars).
 	// Truncate at 63 chars — Docker's enforced container name limit.
 	name := "cmr-chat-" + containerNameRe.ReplaceAllString(strings.ToLower(opts.SessionID), "-")
@@ -2216,9 +2185,9 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 		name = name[:63]
 	}
 
-	delivery, err := m.prepareSecrets(name, secrets)
+	delivery, err := m.buildSecretDelivery(ctx)
 	if err != nil {
-		return "", fmt.Errorf("StartChat: prepare secrets: %w", err)
+		return "", fmt.Errorf("StartChat: build secret delivery: %w", err)
 	}
 
 	// Materialise the rehydration payload (resume.jsonl + resume.meta.json)
@@ -2254,15 +2223,15 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 		containerCfg.Labels[LabelProject] = opts.Project
 	}
 
-	// Auth-dir bind mount is shared with card-mode. Env-based Claude modes
-	// (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) now flow through the
-	// secrets file, not env.
+	// Auth-dir bind mount is shared with card-mode.
 	var mounts []mount.Mount
 	if authMount, ok := m.claudeAuthMount(); ok {
 		mounts = append(mounts, authMount)
 	}
 
-	if skillsMount, ok := m.taskSkillsMount(ctx, opts.AuthEnv["CM_GIT_TOKEN"]); ok {
+	// opts.GitToken is used only for the runner's own git pull of the skills
+	// repo — it does NOT reach the container env or secrets.
+	if skillsMount, ok := m.taskSkillsMount(ctx, opts.GitToken); ok {
 		mounts = append(mounts, skillsMount)
 	}
 
@@ -2283,7 +2252,6 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 
 	resp, err := m.docker.ContainerCreate(ctx, containerCfg, m.baseHostConfig(ctx, opts.MCPURL, mounts), nil, nil, name)
 	if err != nil {
-		m.removeSecretsFile(delivery, m.logger)
 		m.removeChatResume(resumeDelivery, m.logger)
 
 		return "", fmt.Errorf("StartChat: create container: %w", err)
@@ -2299,7 +2267,6 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 				"container_id", resp.ID, "error", rmErr)
 		}
 
-		m.removeSecretsFile(delivery, m.logger)
 		m.removeChatResume(resumeDelivery, m.logger)
 
 		return "", fmt.Errorf("StartChat: start container: %w", err)
@@ -2316,24 +2283,21 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 	// delivery handles here so the goroutine can release them on exit
 	// without needing the secret/resume types in its signature.
 	m.chatCleanupMu.Lock()
-	m.chatCleanup[resp.ID] = chatCleanupState{
-		delivery:       delivery,
-		resumeDelivery: resumeDelivery,
-	}
+	m.chatCleanup[resp.ID] = resumeDelivery
 	m.chatCleanupMu.Unlock()
 
 	return resp.ID, nil
 }
 
 // DeleteChatCleanup pops the cleanup state stashed by StartChat for the given
-// container ID and runs the host-side file cleanup (secrets file + chat
-// resume dir). Called by webhook rollback paths that abort BEFORE invoking
-// WaitAndCleanupChat — in those paths the wait goroutine is not running,
-// so no one else will perform the cleanup. Safe to call on an unknown ID:
-// returns without touching the filesystem.
+// container ID and removes the chat resume dir. Called by webhook rollback
+// paths that abort BEFORE invoking WaitAndCleanupChat — in those paths the
+// wait goroutine is not running, so no one else will perform the cleanup.
+// Safe to call on an unknown ID: returns without touching the filesystem.
+// The shared secrets dir is NOT removed — it is owned by the tokenRefresher.
 func (m *Manager) DeleteChatCleanup(containerID string) {
 	m.chatCleanupMu.Lock()
-	state, ok := m.chatCleanup[containerID]
+	rd, ok := m.chatCleanup[containerID]
 	delete(m.chatCleanup, containerID)
 	m.chatCleanupMu.Unlock()
 
@@ -2341,8 +2305,7 @@ func (m *Manager) DeleteChatCleanup(containerID string) {
 		return
 	}
 
-	m.removeSecretsFile(state.delivery, m.logger)
-	m.removeChatResume(state.resumeDelivery, m.logger)
+	m.removeChatResume(rd, m.logger)
 }
 
 // WaitAndCleanupChat launches a wg-tracked goroutine that waits for the chat
@@ -2375,7 +2338,7 @@ func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 		defer m.wg.Done()
 
 		m.chatCleanupMu.Lock()
-		state, hasState := m.chatCleanup[containerID]
+		rd, hasResume := m.chatCleanup[containerID]
 		delete(m.chatCleanup, containerID)
 		m.chatCleanupMu.Unlock()
 
@@ -2400,10 +2363,10 @@ func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 
 		m.removeContainer(rmCtx, containerID, log)
 
-		// Unlink the per-container secrets file (no-op in env-fallback mode).
-		if hasState {
-			m.removeSecretsFile(state.delivery, log)
-			m.removeChatResume(state.resumeDelivery, log)
+		// Remove the per-session chat resume dir. The shared secrets dir is
+		// owned by the tokenRefresher and must not be removed here.
+		if hasResume {
+			m.removeChatResume(rd, log)
 		}
 	}()
 }
@@ -2623,34 +2586,23 @@ func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mo
 	}
 }
 
-// BuildChatAuthEnv builds the auth environment map for chat containers. It
-// generates a GitHub token (for git operations) and selects the Claude auth
-// method from config. The returned map is merged into StartChatOpts.AuthEnv.
-func (m *Manager) BuildChatAuthEnv(ctx context.Context) map[string]string {
-	env := make(map[string]string)
+// BuildChatAuthEnv mints a GitHub installation token for the runner's own
+// taskSkillsMount git pull. Claude auth and CM_GIT_TOKEN for the container
+// are owned by the tokenRefresher and reach the worker via the shared secrets
+// dir — this token must not be forwarded to the container.
+func (m *Manager) BuildChatAuthEnv(ctx context.Context) string {
+	if m.token == nil {
+		return ""
+	}
 
-	if m.token != nil {
-		tok, _, err := m.token.GenerateToken(ctx)
-		if err == nil && tok != "" {
-			env["CM_GIT_TOKEN"] = tok
-		} else if err != nil && m.logger != nil {
+	tok, _, err := m.token.GenerateToken(ctx)
+	if err != nil {
+		if m.logger != nil {
 			m.logger.Warn("BuildChatAuthEnv: github token generation failed", "error", err)
 		}
+
+		return ""
 	}
 
-	// Apply Claude auth priority: claude_auth_dir > claude_oauth_token > anthropic_api_key.
-	// The auth-dir bind is added by claudeAuthMount(); if it is in play, do
-	// NOT also inject env-based credentials — matches card-mode cascade.
-	if m.cfg.ClaudeAuthDir != "" {
-		return env
-	}
-
-	switch {
-	case m.cfg.ClaudeOAuthToken != "":
-		env["CLAUDE_CODE_OAUTH_TOKEN"] = m.cfg.ClaudeOAuthToken
-	case m.cfg.AnthropicAPIKey != "":
-		env["ANTHROPIC_API_KEY"] = m.cfg.AnthropicAPIKey
-	}
-
-	return env
+	return tok
 }

@@ -48,7 +48,7 @@ type ContainerRunner interface {
 	DeleteChatCleanup(containerID string)
 	Stop(ctx context.Context, containerID string) error
 	WorkerImage() string
-	BuildChatAuthEnv(ctx context.Context) map[string]string
+	BuildChatAuthEnv(ctx context.Context) string
 }
 
 // TrackerService is the interface to the task/chat tracker used by the webhook handler.

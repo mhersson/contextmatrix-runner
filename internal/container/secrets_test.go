@@ -1,13 +1,10 @@
 package container
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"io"
-	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -21,277 +18,113 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
-// testSecretsManager returns a Manager with the filesystem hooks replaced by
-// the provided functions. All Docker-related fields are wired to no-ops
-// because prepareSecrets does not invoke the Docker client.
-func testSecretsManager(t *testing.T, cfg *config.Config, mkdirAll func(string, os.FileMode) error, createFile func(string) (*os.File, error)) *Manager {
+// testBuildSecretDeliveryManager returns a minimal Manager for testing
+// buildSecretDelivery. Docker fields are not wired; buildSecretDelivery only
+// reads cfg and calls m.token.GenerateToken in env-var mode.
+func testBuildSecretDeliveryManager(t *testing.T, cfg *config.Config) *Manager {
 	t.Helper()
 
-	m := &Manager{
+	return &Manager{
 		cfg:      cfg,
-		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:   testLogger(),
+		token:    testPATProvider(t),
 		dnsCache: newDNSCache(dnsCacheTTL, dnsCacheCapacity),
 		resolver: net.DefaultResolver,
-	}
-
-	if mkdirAll != nil {
-		m.mkdirAll = mkdirAll
-	} else {
-		m.mkdirAll = os.MkdirAll
-	}
-
-	if createFile != nil {
-		m.createFile = createFile
-	} else {
-		m.createFile = func(path string) (*os.File, error) {
+		mkdirAll: os.MkdirAll,
+		createFile: func(path string) (*os.File, error) {
 			return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
+		},
+	}
+}
+
+// TestBuildSecretDelivery_FileMode verifies that when SecretsDir is set,
+// buildSecretDelivery returns secretModeFile pointing at SecretsDir/shared.
+func TestBuildSecretDelivery_FileMode(t *testing.T) {
+	cfg := &config.Config{
+		SecretsDir: t.TempDir(),
+	}
+
+	m := testBuildSecretDeliveryManager(t, cfg)
+
+	delivery, err := m.buildSecretDelivery(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, secretModeFile, delivery.Mode)
+	assert.Equal(t, filepath.Join(cfg.SecretsDir, "shared"), delivery.FilePath,
+		"FilePath must be SecretsDir/shared")
+	assert.Empty(t, delivery.EnvVars, "EnvVars must be empty in file mode")
+}
+
+// TestBuildSecretDelivery_EnvVarMode verifies that when SecretsDir is empty,
+// buildSecretDelivery mints a token and returns secretModeEnvVar with all
+// required env vars.
+func TestBuildSecretDelivery_EnvVarMode(t *testing.T) {
+	cfg := &config.Config{
+		SecretsDir:      "",
+		AnthropicAPIKey: "sk-test",
+	}
+
+	m := testBuildSecretDeliveryManager(t, cfg)
+
+	delivery, err := m.buildSecretDelivery(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, secretModeEnvVar, delivery.Mode)
+	assert.Empty(t, delivery.FilePath, "FilePath must be empty in env-var mode")
+	assert.NotEmpty(t, delivery.EnvVars, "EnvVars must be populated in env-var mode")
+
+	var hasGitToken, hasAnthropicKey bool
+
+	for _, e := range delivery.EnvVars {
+		if strings.HasPrefix(e, "CM_GIT_TOKEN=") {
+			hasGitToken = true
+		}
+
+		if strings.HasPrefix(e, "ANTHROPIC_API_KEY=") {
+			hasAnthropicKey = true
 		}
 	}
 
-	return m
+	assert.True(t, hasGitToken, "CM_GIT_TOKEN must be in EnvVars for env-var delivery")
+	assert.True(t, hasAnthropicKey, "ANTHROPIC_API_KEY must be in EnvVars for env-var delivery")
 }
 
-// devConfig returns a minimal config in dev mode, pointing SecretsDir at a
-// temp directory the test owns.
-func devConfig(t *testing.T) *config.Config {
-	t.Helper()
-
-	return &config.Config{
-		DeploymentProfile: config.ProfileDev,
-		SecretsDir:        t.TempDir() + "/secrets",
-		AnthropicAPIKey:   "sk-test",
-	}
-}
-
-// prodConfig returns a minimal config in production mode.
-func prodConfig(t *testing.T) *config.Config {
-	t.Helper()
-
-	return &config.Config{
-		DeploymentProfile: config.ProfileProduction,
-		SecretsDir:        t.TempDir() + "/secrets",
-		AnthropicAPIKey:   "sk-test",
-	}
-}
-
-// testSecrets is a small set of k/v pairs used across multiple sub-tests.
-var testSecrets = map[string]string{
-	"GITHUB_TOKEN": "ghp_abc123",
-	"API_KEY":      "super-secret",
-}
-
-func TestPrepareSecrets(t *testing.T) {
-	permErr := os.ErrPermission
-
-	tests := []struct {
-		name       string
-		cfg        func(*testing.T) *config.Config
-		mkdirAll   func(string, os.FileMode) error
-		createFile func(string) (*os.File, error)
-		wantMode   secretMode
-		wantErr    bool
-		// wantEnvVars are KEY=VALUE strings that must appear in EnvVars
-		// when Mode == secretModeEnvVar.
-		wantEnvVars []string
-		// wantNoFile asserts that no bind-mount file was created.
-		wantNoFile bool
-	}{
-		{
-			name: "dev + writable: uses file mode",
-			cfg:  devConfig,
-			// Use real filesystem (mkdirAll nil -> os.MkdirAll). SecretsDir
-			// points at a TempDir the test already owns, so it is writable.
-			mkdirAll:   nil,
-			createFile: nil,
-			wantMode:   secretModeFile,
-		},
-		{
-			name: "dev + unwritable mkdir: falls back to env-var",
-			cfg:  devConfig,
-			mkdirAll: func(_ string, _ os.FileMode) error {
-				return permErr
-			},
-			wantMode:    secretModeEnvVar,
-			wantEnvVars: []string{"API_KEY=super-secret", "GITHUB_TOKEN=ghp_abc123"},
-			wantNoFile:  true,
-		},
-		{
-			name: "dev + unwritable createFile: falls back to env-var",
-			cfg:  devConfig,
-			// mkdirAll succeeds (real os.MkdirAll), but createFile fails.
-			mkdirAll: os.MkdirAll,
-			createFile: func(_ string) (*os.File, error) {
-				return nil, permErr
-			},
-			wantMode:    secretModeEnvVar,
-			wantEnvVars: []string{"API_KEY=super-secret", "GITHUB_TOKEN=ghp_abc123"},
-			wantNoFile:  true,
-		},
-		{
-			name: "production + unwritable mkdir: returns error, no fallback",
-			cfg:  prodConfig,
-			mkdirAll: func(_ string, _ os.FileMode) error {
-				return permErr
-			},
-			wantErr: true,
-		},
-		{
-			name:     "production + unwritable createFile: returns error, no fallback",
-			cfg:      prodConfig,
-			mkdirAll: os.MkdirAll,
-			createFile: func(_ string) (*os.File, error) {
-				return nil, permErr
-			},
-			wantErr: true,
-		},
-		{
-			name: "non-permission error in dev mode: returns error unchanged",
-			cfg:  devConfig,
-			mkdirAll: func(_ string, _ os.FileMode) error {
-				return errors.New("no space left on device")
-			},
-			wantErr: true,
-		},
+// TestBuildSecretDelivery_EnvVarMode_OAuthToken verifies that OAuth token
+// takes priority over Anthropic API key in env-var delivery mode.
+func TestBuildSecretDelivery_EnvVarMode_OAuthToken(t *testing.T) {
+	cfg := &config.Config{
+		SecretsDir:       "",
+		ClaudeOAuthToken: "oauth-tok",
+		AnthropicAPIKey:  "sk-fallback",
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := tc.cfg(t)
-			m := testSecretsManager(t, cfg, tc.mkdirAll, tc.createFile)
+	m := testBuildSecretDeliveryManager(t, cfg)
 
-			payload := RunConfig{Mode: ModeTask, CardID: "TEST-001", Project: "proj"}
-			delivery, err := m.prepareSecrets(sanitizeContainerName(payload.Project, payload.CardID), testSecrets)
-
-			if tc.wantErr {
-				require.Error(t, err)
-
-				return
-			}
-
-			require.NoError(t, err)
-			assert.Equal(t, tc.wantMode, delivery.Mode)
-
-			switch delivery.Mode {
-			case secretModeFile:
-				assert.NotEmpty(t, delivery.FilePath)
-				assert.Empty(t, delivery.EnvVars)
-
-				// File must exist and be readable.
-				b, readErr := os.ReadFile(delivery.FilePath)
-				require.NoError(t, readErr)
-				assert.Contains(t, string(b), "GITHUB_TOKEN")
-
-				// Clean up.
-				_ = os.Remove(delivery.FilePath)
-
-			case secretModeEnvVar:
-				assert.Empty(t, delivery.FilePath)
-				assert.NotEmpty(t, delivery.EnvVars)
-
-				for _, want := range tc.wantEnvVars {
-					assert.Contains(t, delivery.EnvVars, want,
-						"env-var delivery must include %s", want)
-				}
-
-				if tc.wantNoFile {
-					// Confirm no file was left on disk.
-					dir := cfg.SecretsDir
-					if dir == "" {
-						dir = "/var/run/cm-runner/secrets"
-					}
-
-					entries, _ := os.ReadDir(dir)
-					assert.Empty(t, entries, "no file should have been written in env-var mode")
-				}
-			}
-		})
-	}
-}
-
-// TestRemoveSecretsFile verifies the no-op semantics for env-var delivery.
-func TestRemoveSecretsFile(t *testing.T) {
-	t.Run("env-var mode: no-op, no error", func(t *testing.T) {
-		cfg := devConfig(t)
-		m := testSecretsManager(t, cfg, nil, nil)
-		log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-		// Should not panic or error even though FilePath is empty.
-		d := secretDelivery{Mode: secretModeEnvVar}
-		m.removeSecretsFile(d, log) // no assertion needed; just must not panic
-	})
-
-	t.Run("file mode: removes file", func(t *testing.T) {
-		cfg := devConfig(t)
-		m := testSecretsManager(t, cfg, nil, nil)
-
-		// Create a real temp file to simulate the secrets file.
-		f, err := os.CreateTemp(t.TempDir(), "secrets-*.env")
-		require.NoError(t, err)
-
-		_ = f.Close()
-
-		d := secretDelivery{Mode: secretModeFile, FilePath: f.Name()}
-		log := slog.New(slog.NewTextHandler(io.Discard, nil))
-		m.removeSecretsFile(d, log)
-
-		_, statErr := os.Stat(f.Name())
-		assert.True(t, os.IsNotExist(statErr), "file must be removed")
-	})
-
-	t.Run("file mode: already removed is a no-op", func(t *testing.T) {
-		cfg := devConfig(t)
-		m := testSecretsManager(t, cfg, nil, nil)
-
-		d := secretDelivery{Mode: secretModeFile, FilePath: t.TempDir() + "/nonexistent.env"}
-		// Must not log a warning or error when the file is already gone.
-		var buf bytes.Buffer
-
-		warnLog := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-		m.removeSecretsFile(d, warnLog)
-		assert.Empty(t, buf.String(), "no warning expected for already-removed file")
-	})
-}
-
-// TestPrepareSecrets_WarnLogged verifies that the WARN message is emitted
-// when dev mode triggers the env-var fallback.
-func TestPrepareSecrets_WarnLogged(t *testing.T) {
-	cfg := devConfig(t)
-
-	var logBuf bytes.Buffer
-
-	handler := slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})
-	logger := slog.New(handler)
-
-	m := &Manager{
-		cfg:      cfg,
-		logger:   logger,
-		dnsCache: newDNSCache(dnsCacheTTL, dnsCacheCapacity),
-		resolver: net.DefaultResolver,
-		mkdirAll: func(_ string, _ os.FileMode) error {
-			return os.ErrPermission
-		},
-		createFile: func(_ string) (*os.File, error) {
-			return nil, os.ErrPermission
-		},
-	}
-
-	payload := RunConfig{Mode: ModeTask, CardID: "WARN-001", Project: "proj"}
-	delivery, err := m.prepareSecrets(sanitizeContainerName(payload.Project, payload.CardID), testSecrets)
-
+	delivery, err := m.buildSecretDelivery(context.Background())
 	require.NoError(t, err)
+
 	assert.Equal(t, secretModeEnvVar, delivery.Mode)
-	assert.Contains(t, logBuf.String(), "dev profile",
-		"expected WARN log containing 'dev profile', got: %s", logBuf.String())
+
+	var hasOAuth, hasAnthropicKey bool
+
+	for _, e := range delivery.EnvVars {
+		if strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN=") {
+			hasOAuth = true
+		}
+
+		if strings.HasPrefix(e, "ANTHROPIC_API_KEY=") {
+			hasAnthropicKey = true
+		}
+	}
+
+	assert.True(t, hasOAuth, "CLAUDE_CODE_OAUTH_TOKEN must be in EnvVars when OAuthToken is set")
+	assert.False(t, hasAnthropicKey, "ANTHROPIC_API_KEY must not appear when OAuthToken takes priority")
 }
 
-// TestSecretsDelivered_EnvVarMode_IntegrationStartContainer verifies that in
-// env-var delivery mode:
-//   - secrets appear in container.Config.Env (not hidden via bind-mount)
-//   - the /run/cm-secrets/env bind-mount is NOT added to HostConfig.Mounts
-//
-// It uses a real temp dir for SecretsDir and injects a permission error on
-// mkdirAll so the dev-mode fallback is exercised end-to-end through
-// prepareSecrets inside startContainer.
+// TestSecretsDelivered_EnvVarMode_IntegrationStartContainer verifies that when
+// SecretsDir is empty (the env-var fallback path used in tests without a shared
+// dir), all secrets appear in container.Config.Env and the secrets bind-mount
+// is NOT added to HostConfig.Mounts.
 func TestSecretsDelivered_EnvVarMode_IntegrationStartContainer(t *testing.T) {
 	var (
 		capturedEnv    []string
@@ -309,23 +142,19 @@ func TestSecretsDelivered_EnvVarMode_IntegrationStartContainer(t *testing.T) {
 		return dockercontainer.CreateResponse{ID: "envvar-ctr"}, nil
 	}
 
-	devCfg := &config.Config{
+	// SecretsDir is empty → env-var delivery path.
+	envCfg := &config.Config{
 		DeploymentProfile: config.ProfileDev,
 		BaseImage:         "test-image:latest",
-		SecretsDir:        t.TempDir() + "/unwritable",
+		SecretsDir:        "", // triggers env-var fallback
 		AnthropicAPIKey:   "sk-test-api-key",
 		ImagePullPolicy:   config.PullAlways,
 		ContainerTimeout:  "1h",
 	}
-	devCfg.ParseContainerTimeout()
+	envCfg.ParseContainerTimeout()
 
 	tr := tracker.New()
-	m := NewManager(mock, tr, nil, testPATProvider(t), nil, devCfg, testLogger())
-
-	// Override mkdirAll to simulate an unwritable secrets directory.
-	m.mkdirAll = func(_ string, _ os.FileMode) error {
-		return os.ErrPermission
-	}
+	m := NewManager(mock, tr, nil, testPATProvider(t), nil, envCfg, testLogger())
 
 	payload := RunConfig{
 		Mode:    ModeTask,
@@ -351,7 +180,7 @@ func TestSecretsDelivered_EnvVarMode_IntegrationStartContainer(t *testing.T) {
 
 	assert.True(t, foundToken, "CM_GIT_TOKEN must be in container Env for env-var delivery")
 
-	// The /run/cm-secrets/env bind-mount must NOT be present.
+	// The secrets bind-mount must NOT be present in env-var mode.
 	for _, target := range capturedMounts {
 		assert.NotEqual(t, secretsMountTarget, target,
 			"secrets bind-mount must not be added in env-var delivery mode")
@@ -369,13 +198,7 @@ func startContainerAndCapture(t *testing.T, m *Manager, payload RunConfig, tr *t
 		Project: payload.Project,
 	}))
 
-	cid, delivery, secretValues, err := m.startContainer(context.Background(), payload)
-	if err == nil {
-		// Best-effort cleanup; ignore errors.
-		m.removeSecretsFile(delivery, testLogger())
-
-		_ = cid
-	}
+	_, delivery, secretValues, err := m.startContainer(context.Background(), payload)
 
 	return delivery, secretValues, err
 }
