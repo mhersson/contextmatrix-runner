@@ -200,7 +200,9 @@ func renderSecretsFile(gitToken string, static map[string]string) (string, error
 	// credential-protocol line that git parses.
 	for i := 0; i < len(gitToken); i++ {
 		c := gitToken[i]
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+
+		isAllowed := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'
+		if !isAllowed {
 			return "", errInvalidTokenChars
 		}
 	}
