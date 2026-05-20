@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -24,6 +25,13 @@ import (
 const (
 	maxRetries     = 3
 	requestTimeout = 10 * time.Second
+	// bearerFallbackLogInterval is the minimum gap between Error-level logs
+	// emitted from the deprecated Bearer fallback path in VerifyAutonomous.
+	// The first call always logs; subsequent calls within the window are
+	// suppressed so a hot-loop verifier does not drown the log aggregator,
+	// but the cmr_callback_bearer_fallback_total counter still ticks on
+	// every call so dashboards see the full rate.
+	bearerFallbackLogInterval = 5 * time.Minute
 )
 
 // statusRequest is the JSON body sent to ContextMatrix.
@@ -67,6 +75,14 @@ type Client struct {
 	logger                     *slog.Logger
 	useHMACForVerifyAutonomous bool
 	metrics                    *metrics.Metrics
+	// bearerFallbackLastLogUnix is the unix-seconds timestamp of the most
+	// recent Error-level log emitted from the Bearer fallback path. Updated
+	// via atomic CAS so concurrent VerifyAutonomous calls rate-limit to one
+	// Error log per bearerFallbackLogInterval window without blocking on a
+	// mutex. The companion cmr_callback_bearer_fallback_total counter is
+	// incremented on every call, so dashboards still see the full rate
+	// even when logs are throttled.
+	bearerFallbackLastLogUnix atomic.Int64
 }
 
 // NewClient creates a new callback client. By default VerifyAutonomous is
@@ -74,7 +90,14 @@ type Client struct {
 // cross-repo transition if the ContextMatrix server still expects Bearer.
 // The HTTP transport is wrapped with otelhttp so every outgoing request
 // becomes a child span of whatever caller context the request is made in.
+//
+// A nil logger is replaced with slog.Default() so retry / fallback paths
+// can always log without a nil-deref panic. Fix W5 in REVIEW.md.
 func NewClient(cmURL, apiKey string, logger *slog.Logger) *Client {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &Client{
 		httpClient: &http.Client{
 			Timeout:   requestTimeout,
@@ -124,6 +147,10 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 	}
 
 	for attempt := range maxRetries {
+		// Each retry uses a fresh ts (and therefore a fresh HMAC
+		// signature), so the receiver's replay cache — which keys on the
+		// (method, uri, timestamp, signature) tuple — will treat each
+		// attempt as a distinct request and will not self-409 the retry.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusURI, body, ts)
 
@@ -157,10 +184,21 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointLabel(status)).Inc()
 		}
 
-		// Explicit Timer + defer Stop so ctx cancellation does not leak the
-		// timer (time.After drops its reference only when it fires). backoff
-		// is per-attempt, so declaring the timer inside the loop body is
-		// correct — each attempt gets a fresh timer.
+		// Skip the backoff on the final attempt — the loop is about to exit
+		// regardless of how long we wait. Without this, a maxRetries=3 run
+		// burns ~4s on a stopped timer before returning the failure. Fix
+		// W6 in REVIEW.md.
+		if attempt == maxRetries-1 {
+			break
+		}
+
+		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does not
+		// leak the timer (time.After drops its reference only when it
+		// fires). backoff is per-attempt, so declaring the timer inside
+		// the loop body is correct — each attempt gets a fresh timer.
+		// Under Go 1.23+ the runtime GC's a stopped timer even if its
+		// channel was not drained after Stop returns false, so no manual
+		// drain is needed.
 		backoff := time.Duration(1<<uint(attempt)) * time.Second
 		timer := time.NewTimer(backoff)
 
@@ -197,6 +235,9 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 	var lastErr error
 
 	for attempt := range maxRetries {
+		// Each retry uses a fresh ts (and a fresh HMAC signature), so the
+		// receiver's replay cache treats each attempt as a distinct
+		// request and does not self-409 the retry.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillURI, body, ts)
 
@@ -247,6 +288,24 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 			"error", lastErr.Error(),
 		)
 
+		if c.metrics != nil {
+			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointSkillEngaged).Inc()
+		}
+
+		// Skip the backoff on the final attempt — the loop is about to exit
+		// regardless of how long we wait. Without this, a maxRetries=3 run
+		// burns ~4s on a stopped timer before returning the failure. Fix
+		// W6 in REVIEW.md.
+		if attempt == maxRetries-1 {
+			break
+		}
+
+		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does
+		// not leak the timer. backoff is per-attempt, so declaring the
+		// timer inside the loop body is correct — each attempt gets a
+		// fresh timer. Under Go 1.23+ the runtime GC's a stopped timer
+		// even if its channel was not drained after Stop returns false,
+		// so no manual drain is needed.
 		backoff := time.Duration(1<<uint(attempt)) * time.Second
 		timer := time.NewTimer(backoff)
 
@@ -278,6 +337,9 @@ func (c *Client) KnowledgeStatus(ctx context.Context, req KnowledgeStatusRequest
 	var lastErr error
 
 	for attempt := range maxRetries {
+		// Each retry uses a fresh ts (and a fresh HMAC signature), so the
+		// receiver's replay cache treats each attempt as a distinct
+		// request and does not self-409 the retry.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, uri, body, ts)
 
@@ -329,6 +391,24 @@ func (c *Client) KnowledgeStatus(ctx context.Context, req KnowledgeStatusRequest
 			"error", lastErr.Error(),
 		)
 
+		if c.metrics != nil {
+			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointKnowledgeStatus).Inc()
+		}
+
+		// Skip the backoff on the final attempt — the loop is about to exit
+		// regardless of how long we wait. Without this, a maxRetries=3 run
+		// burns ~4s on a stopped timer before returning the failure. Fix
+		// W6 in REVIEW.md.
+		if attempt == maxRetries-1 {
+			break
+		}
+
+		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does
+		// not leak the timer. backoff is per-attempt, so declaring the
+		// timer inside the loop body is correct — each attempt gets a
+		// fresh timer. Under Go 1.23+ the runtime GC's a stopped timer
+		// even if its channel was not drained after Stop returns false,
+		// so no manual drain is needed.
 		backoff := time.Duration(1<<uint(attempt)) * time.Second
 		timer := time.NewTimer(backoff)
 
@@ -407,6 +487,14 @@ type cardResponse struct {
 //
 // project and cardID are url.PathEscape'd unconditionally (M27) so values
 // like "my project" or "CARD/42" produce a well-formed URL in either mode.
+//
+// Transient errors (5xx, connection reset, etc.) are retried up to
+// maxRetries times with exponential backoff, mirroring ReportStatus /
+// ReportSkillEngaged / KnowledgeStatus. A 4xx response is non-retryable
+// (isClientError short-circuits) and returns immediately. Fix W2 in
+// REVIEW.md: the pre-fix VerifyAutonomous failed-closed on the first
+// transient error, which propagated as a 502 to CM even when a single
+// retry would have succeeded.
 func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (bool, error) {
 	reqURL := fmt.Sprintf("%s/api/v1/cards/%s/%s/autonomous",
 		c.contextMatrixURL,
@@ -414,6 +502,71 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 		url.PathEscape(cardID),
 	)
 
+	var lastErr error
+
+	for attempt := range maxRetries {
+		autonomous, err := c.doVerifyAutonomous(ctx, reqURL)
+		if err == nil {
+			return autonomous, nil
+		}
+
+		lastErr = err
+
+		if isClientError(err) {
+			return false, err
+		}
+
+		c.logger.Warn("verify-autonomous callback failed, retrying",
+			"attempt", attempt+1,
+			"project", project,
+			"card_id", cardID,
+			"error", err.Error(),
+		)
+
+		if ce, ok := errors.AsType[*Error](err); ok {
+			c.logger.Debug("verify-autonomous callback failed, upstream body",
+				"attempt", attempt+1,
+				"project", project,
+				"card_id", cardID,
+				"detail", ce.DetailForLog(),
+			)
+		}
+
+		if c.metrics != nil {
+			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointVerifyAutonomous).Inc()
+		}
+
+		// Skip the backoff on the final attempt — the loop is about to exit
+		// regardless of how long we wait. Mirrors the existing W6 fix in
+		// the POST callbacks.
+		if attempt == maxRetries-1 {
+			break
+		}
+
+		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does
+		// not leak the timer. backoff is per-attempt; under Go 1.23+ the
+		// runtime GC's a stopped timer even if its channel was not drained
+		// after Stop returns false, so no manual drain is needed.
+		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		timer := time.NewTimer(backoff)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return false, fmt.Errorf("verify-autonomous callback failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// doVerifyAutonomous performs a single VerifyAutonomous HTTP request and
+// decodes the response. Extracted from the retry loop so VerifyAutonomous
+// can re-issue the request on a transient error without duplicating the
+// signing + parsing logic.
+func (c *Client) doVerifyAutonomous(ctx context.Context, reqURL string) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return false, fmt.Errorf("create verify-autonomous request: %w", err)
@@ -423,7 +576,9 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 		// HMAC bound to method+URI with an empty body. Binding the URI
 		// (path + query) prevents a captured signature from being replayed
 		// against a different endpoint, and binding the timestamp prevents
-		// replay outside the clock-skew window.
+		// replay outside the clock-skew window. Each retry uses a fresh
+		// timestamp so the receiver's replay cache treats every attempt
+		// as a distinct request.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 
 		uri, perr := verifyAutonomousURI(reqURL)
@@ -439,7 +594,19 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 		// compatible with a CM server that has not yet rolled the HMAC
 		// change. Leaks the HMAC secret to anyone who can read the
 		// Authorization header; remove once the server accepts HMAC.
+		//
+		// Audit trail: increment the cmr_callback_bearer_fallback_total
+		// counter on every call so dashboards alert as soon as this path
+		// is taken in prod, and emit a rate-limited Error log so the same
+		// signal shows up in centralized log aggregators without spamming
+		// them on every VerifyAutonomous request.
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+		if c.metrics != nil {
+			c.metrics.CallbackBearerFallbackTotal.Inc()
+		}
+
+		c.logBearerFallback()
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -572,13 +739,22 @@ func newError(fullURL string, statusCode int, body []byte) *Error {
 }
 
 // sanitizeURLForError returns scheme://host/path for fullURL, dropping query
-// string and fragment (which can embed credentials or tokens). If the URL
-// cannot be parsed it is replaced with "<invalid-url>" so nothing leaks.
+// string, fragment, and any embedded userinfo (which can embed credentials or
+// tokens). A misconfigured base URL of the form https://user:token@host/path
+// would otherwise leak the credentials into error messages propagated to
+// clients and log aggregators. If the URL cannot be parsed it is replaced
+// with "<invalid-url>" so nothing leaks.
 func sanitizeURLForError(fullURL string) string {
 	u, err := url.Parse(fullURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "<invalid-url>"
 	}
+
+	// Strip userinfo before reading u.Host: net/url's Host field does not
+	// include userinfo (that lives on u.User), so this guards against a
+	// future change that would include it. Clearing the field is the
+	// belt-and-braces step on top of building the URL by hand below.
+	u.User = nil
 
 	return u.Scheme + "://" + u.Host + u.Path
 }
@@ -602,6 +778,16 @@ func (e *Error) StatusCode() int {
 }
 
 func isClientError(err error) bool {
+	// Context-cancellation and deadline-exceeded errors are terminal: there
+	// is no point burning another attempt's backoff before the next
+	// ctx.Done() select wakes up. Treat them as "client" errors so the
+	// retry loop returns immediately. Without this short-circuit a cancelled
+	// or expired request would log a Warn retry line and sleep one backoff
+	// before the next iteration's ctx-select catches the cancellation.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
 	if ce, ok := errors.AsType[*Error](err); ok {
 		return ce.statusCode >= 400 && ce.statusCode < 500
 	}
@@ -621,4 +807,46 @@ func endpointLabel(status string) string {
 	default:
 		return "status"
 	}
+}
+
+// Endpoint labels for cmr_callback_retries_total on the skill-engaged and
+// knowledge-status callbacks. Kept as constants so the label set stays
+// closed and matches what dashboards key on.
+const (
+	endpointSkillEngaged    = "skill_engaged"
+	endpointKnowledgeStatus = "knowledge_status"
+	// endpointVerifyAutonomous labels retries of the read-only
+	// VerifyAutonomous GET so transient CM failures (a brief 5xx or a
+	// connection reset) show up in the same cmr_callback_retries_total
+	// series as the POST callbacks rather than disappearing into a
+	// fail-closed 502 response on the runner. Fix W2 in REVIEW.md.
+	endpointVerifyAutonomous = "verify_autonomous"
+)
+
+// logBearerFallback emits an Error-level log noting that the deprecated
+// Bearer fallback for VerifyAutonomous was taken. The log is rate-limited
+// to one entry per bearerFallbackLogInterval (5m) across all goroutines on
+// this Client; the rate-limit is implemented as an atomic CAS on the
+// last-log timestamp so a hot path of VerifyAutonomous calls does not
+// drown the log aggregator. The cmr_callback_bearer_fallback_total
+// counter is always incremented (in the caller), so dashboards still see
+// the full call rate.
+func (c *Client) logBearerFallback() {
+	now := time.Now().Unix()
+	last := c.bearerFallbackLastLogUnix.Load()
+
+	if now-last < int64(bearerFallbackLogInterval/time.Second) {
+		return
+	}
+
+	// CAS: only the winner of the race logs. Losers fall through silently
+	// and rely on the counter for the audit trail.
+	if !c.bearerFallbackLastLogUnix.CompareAndSwap(last, now) {
+		return
+	}
+
+	c.logger.Error(
+		"VerifyAutonomous took the deprecated Bearer fallback — the shared HMAC secret is being shipped in the Authorization header; set use_hmac_for_verify_autonomous=true once the ContextMatrix server accepts HMAC on this endpoint",
+		"rate_limited_per", bearerFallbackLogInterval.String(),
+	)
 }

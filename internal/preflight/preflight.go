@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 )
@@ -199,6 +200,20 @@ func Loop(ctx context.Context, p Probes, passed *atomic.Bool, interval time.Dura
 }
 
 func retryLoop(ctx context.Context, p Probes, passed *atomic.Bool, interval time.Duration, logger *slog.Logger, onSuccess func()) {
+	// The preflight package is dependency-light and does not import the
+	// metrics bundle, so we log the panic via slog only (parity with the
+	// rest of the runner's metric-less recover sites). Without this defer
+	// a panic in a probe Fn — even an unlikely one from a fake or a stub —
+	// would unwind the retry loop forever, leaving /readyz pinned at 503
+	// until the runner is manually restarted.
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("preflight retry loop panicked",
+				"panic", r,
+				"stack", string(debug.Stack()))
+		}
+	}()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 

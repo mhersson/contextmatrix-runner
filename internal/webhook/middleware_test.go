@@ -95,6 +95,50 @@ func TestMetricsMiddleware_ObservesEndpointAndStatus(t *testing.T) {
 	assert.True(t, foundHist, "request histogram label set not found")
 }
 
+// TestMetricsMiddleware_UnknownPathBucketsAsOther verifies that an arbitrary
+// URL (the cardinality-blowup vector) collapses to the "other" endpoint label
+// rather than producing a fresh series per unique path. metrics.NormalizeEndpoint
+// is the cardinality firewall and the middleware must route every label
+// through it.
+func TestMetricsMiddleware_UnknownPathBucketsAsOther(t *testing.T) {
+	mx := metrics.New()
+
+	handler := withMetrics(mx, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
+		"/foo/random-uuid-3f9c2c11", http.NoBody)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	families, err := mx.Registry.Gather()
+	require.NoError(t, err)
+
+	var (
+		gotOtherBucket bool
+		sawRawPath     bool
+	)
+
+	for _, f := range families {
+		if f.GetName() != "cmr_webhook_requests_total" {
+			continue
+		}
+
+		for _, m := range f.Metric {
+			l := labelMap(m.Label)
+			switch l["endpoint"] {
+			case "other":
+				gotOtherBucket = true
+			case "foo/random-uuid-3f9c2c11":
+				sawRawPath = true
+			}
+		}
+	}
+
+	assert.True(t, gotOtherBucket, `unknown path must increment endpoint="other"`)
+	assert.False(t, sawRawPath, "raw request path must not appear as a label value (cardinality firewall bypass)")
+}
+
 // TestMetricsMiddleware_RateLimitedCode verifies that 429s produce the
 // rate_limited code bucket.
 func TestMetricsMiddleware_RateLimitedCode(t *testing.T) {

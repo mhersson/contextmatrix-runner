@@ -30,6 +30,14 @@ const (
 	// Status: 409.
 	CodeConflict = "conflict"
 
+	// CodeForbidden is returned for authoritative refusals where the request
+	// is well-formed and authenticated but a server-side policy/state check
+	// disallows the operation (e.g. /promote when CM has not yet flipped the
+	// card's autonomous flag). Distinct from CodeConflict so clients can
+	// differentiate a state-conflict (409) from a policy refusal (403).
+	// Status: 403.
+	CodeForbidden = "forbidden"
+
 	// CodeLimitReached is returned by /trigger when max_concurrent has been
 	// hit. Status: 429.
 	CodeLimitReached = "limit_reached"
@@ -64,4 +72,23 @@ const (
 	// etc). Message is a fixed string — raw err.Error() is NEVER echoed to
 	// the client; the full error is logged server-side. Status: 500.
 	CodeInternal = "internal"
+)
+
+// Stable error messages reused across handlers so the wire-level shape stays
+// consistent for the same condition regardless of whether the request came in
+// through the card-mode or chat-mode code path. Clients should branch on
+// Code, not on Message, but the messages still need to match so operator
+// dashboards and log aggregators are not split by an irrelevant string
+// difference. See Fix W1 in REVIEW.md.
+const (
+	// MsgNotInteractive is the wire message returned with CodeConflict when a
+	// container exists but stdin is not attached (the container was started
+	// in non-interactive mode). Used by /message, /promote, /end-session for
+	// both card-mode and chat-mode requests.
+	MsgNotInteractive = "container is not in interactive mode"
+
+	// MsgNoContainerTracked is the wire message returned with CodeNotFound
+	// when no container is tracked for the lookup key (card_id+project, or
+	// session_id). Used by /message, /promote, /end-session, /chat/end.
+	MsgNoContainerTracked = "no container tracked"
 )

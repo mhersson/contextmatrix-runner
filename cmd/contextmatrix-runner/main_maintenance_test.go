@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -136,27 +139,83 @@ func TestMaintenanceLoop_ExitsOnDrain(t *testing.T) {
 		"no sweep ticks must fire after drain exit")
 }
 
-// TestMaintenanceLoop_NonPositiveIntervalIsNoop checks the defensive branch:
-// a zero/negative interval should log and return immediately without
-// spinning a runaway ticker.
-func TestMaintenanceLoop_NonPositiveIntervalIsNoop(t *testing.T) {
+// TestMaintenanceLoop_NonPositiveIntervalBlocksUntilCancel verifies the
+// defensive branch:
+//
+//   - A zero/negative interval logs one warning and then blocks on
+//     ctx.Done() instead of returning. The outer respawn-with-backoff wrapper
+//     in main() would otherwise interpret a clean return as a panic-recover
+//     and respawn the goroutine every ~5 s for the process lifetime, spamming
+//     the log with "loop disabled" warnings.
+//   - No ticks fire while disabled.
+//   - The goroutine exits cleanly once ctx is cancelled.
+func TestMaintenanceLoop_NonPositiveIntervalBlocksUntilCancel(t *testing.T) {
 	target := &stubMaintenanceTarget{}
 	health := &stubMaintenanceHealth{}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
 
 	go func() {
 		defer close(done)
 
-		runMaintenanceLoopWithHealth(context.Background(), target, 0, health, testLogger())
+		runMaintenanceLoopWithHealth(ctx, target, 0, health, testLogger())
 	}()
 
+	// The loop must NOT return on its own while ctx is alive. Sample for
+	// long enough to catch a spurious return that would respawn-loop in
+	// production wiring.
 	select {
 	case <-done:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("maintenance loop must return immediately on non-positive interval")
+		t.Fatal("disabled loop returned before ctx cancel — outer respawn wrapper would busy-loop")
+	case <-time.After(250 * time.Millisecond):
+		// expected: still blocked
 	}
 
 	assert.Equal(t, int32(0), target.cleanupCalls.Load(), "no ticks must fire when disabled")
 	assert.Equal(t, int32(0), target.sweepCalls.Load(), "no sweep ticks must fire when disabled")
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("maintenance loop did not exit on ctx cancel after disabled-config block")
+	}
+}
+
+// TestMaintenanceLoop_DisabledDoesNotProduceRepeatedWarnings verifies the
+// disabled path emits exactly one WARN (not one per respawn-backoff tick).
+// Without C2 the outer respawn loop in main() would log "maintenance loop
+// disabled" every ~5 s for the process lifetime.
+func TestMaintenanceLoop_DisabledDoesNotProduceRepeatedWarnings(t *testing.T) {
+	target := &stubMaintenanceTarget{}
+	health := &stubMaintenanceHealth{}
+
+	var buf bytes.Buffer
+
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		runMaintenanceLoopWithHealth(ctx, target, 0, health, logger)
+	}()
+
+	time.Sleep(250 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("disabled loop did not exit on ctx cancel")
+	}
+
+	got := strings.Count(buf.String(), "maintenance loop disabled")
+	assert.Equal(t, 1, got, "disabled config must log exactly one WARN (got %d in %q)", got, buf.String())
 }

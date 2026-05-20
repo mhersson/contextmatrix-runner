@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,6 +47,18 @@ var (
 	// forceCleanupTimeout bounds each per-container kill during the
 	// force-cleanup pass, so one wedged Docker call can't stall shutdown.
 	forceCleanupTimeout = 5 * time.Second
+	// tracerShutdownTimeout bounds the span-flush + exporter shutdown at
+	// process exit. Smaller than httpShutdownTimeout because the BSP only
+	// needs to drain in-memory buffers and the exporter only needs to flush
+	// the last batch over the wire — a slow collector should not be
+	// allowed to extend total process lifetime by 10 s.
+	tracerShutdownTimeout = 5 * time.Second
+	// callbackShutdownTimeout bounds each per-container Kill / KillChat /
+	// ReportStatus call during the shutdown sweep. A dedicated per-call
+	// budget means one slow ContextMatrix callback cannot starve the
+	// remaining containers — the previous shape shared one 30 s
+	// managerDrainTimeout across every container in a single loop.
+	callbackShutdownTimeout = 10 * time.Second
 )
 
 // broadcasterDropAdapter bridges logbroadcast.DropObserver to the Prometheus
@@ -58,7 +72,49 @@ func (a broadcasterDropAdapter) ObserveDrop() {
 		return
 	}
 
-	a.m.BroadcasterDropsTotal.WithLabelValues("all").Inc()
+	a.m.BroadcasterDropsTotal.Inc()
+}
+
+// broadcasterPanicAdapter bridges logbroadcast.PanicObserver to the runner's
+// panic_recovered counter so a panic in the broadcaster's drop-reporter
+// goroutine bumps the same metric as the main.go-managed background
+// goroutines. logbroadcast is a leaf package; the adapter keeps it free of
+// Prometheus / metrics imports.
+type broadcasterPanicAdapter struct {
+	m *metrics.Metrics
+}
+
+func (a broadcasterPanicAdapter) ObservePanic(goroutine string) {
+	if a.m == nil {
+		return
+	}
+
+	a.m.PanicRecoveredTotal.WithLabelValues(goroutine).Inc()
+}
+
+// recoverBackgroundGoroutine logs and counts a panic that escapes a
+// top-level goroutine spawned by main(). Callers must `defer
+// recoverBackgroundGoroutine(...)` so a panic in a third-party library
+// (Docker SDK, prometheus collector, etc.) does not unwind the runner
+// process; an isolated background goroutine should not be able to bring
+// down /trigger, /logs, or the admin server.
+func recoverBackgroundGoroutine(logger *slog.Logger, mx *metrics.Metrics, label string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+
+	if mx != nil {
+		mx.PanicRecoveredTotal.WithLabelValues(label).Inc()
+	}
+
+	if logger != nil {
+		logger.Error("background goroutine panicked",
+			"goroutine", label,
+			"panic", r,
+			"stack", string(debug.Stack()),
+		)
+	}
 }
 
 func main() {
@@ -113,7 +169,7 @@ func main() {
 			githubauth.WithAPIBaseURL(cfg.GitHub.APIBaseURL),
 		)
 		if err != nil {
-			slog.Error("failed to construct GitHub App provider", "error", err)
+			logger.Error("failed to construct GitHub App provider", "error", err)
 			os.Exit(1)
 		}
 
@@ -121,17 +177,17 @@ func main() {
 	case "pat":
 		tp, err := githubauth.NewPATProvider(cfg.GitHub.PAT.Token)
 		if err != nil {
-			slog.Error("failed to construct GitHub PAT provider", "error", err)
+			logger.Error("failed to construct GitHub PAT provider", "error", err)
 			os.Exit(1)
 		}
 
 		tokenProvider = tp
 	default:
-		slog.Error("unreachable: invalid auth_mode after Validate()", "value", cfg.GitHub.AuthMode)
+		logger.Error("unreachable: invalid auth_mode after Validate()", "value", cfg.GitHub.AuthMode)
 		os.Exit(1)
 	}
 
-	slog.Info("github token provider initialized", "auth_mode", cfg.GitHub.AuthMode)
+	logger.Info("github token provider initialized", "auth_mode", cfg.GitHub.AuthMode)
 	// NOTE: NOT wrapped in CachingProvider — runner mints fresh per spawn
 	// (tokens hand off to long-lived worker containers; freshness at delivery matters).
 
@@ -141,16 +197,23 @@ func main() {
 	cb.SetUseHMACForVerifyAutonomous(cfg.UseHMACForVerifyAutonomous)
 
 	if !cfg.UseHMACForVerifyAutonomous {
-		// Cross-repo transition knob. Log loudly at startup so operators
-		// can't silently run the deprecated Bearer mode forever.
-		logger.Warn(
-			"Bearer fallback for VerifyAutonomous is deprecated; " +
-				"ContextMatrix server must accept HMAC by the next release — " +
-				"remove use_hmac_for_verify_autonomous: false once the server is upgraded",
+		// Cross-repo transition knob. Log at Error level so operators
+		// can't silently run the deprecated Bearer mode forever — the
+		// fallback ships the shared HMAC secret in an Authorization
+		// header, which anyone with access to a single request log can
+		// then use to forge signed callbacks in either direction.
+		logger.Error(
+			"DEPRECATED — secret leaks via Authorization header — set use_hmac_for_verify_autonomous=true; " +
+				"the Bearer fallback ships the shared HMAC secret to ContextMatrix as `Authorization: Bearer <apiKey>` " +
+				"and will be removed once every deployed CM server accepts HMAC on the autonomous-verify endpoint",
 		)
 	}
 
-	broadcaster := logbroadcast.NewBroadcaster(logger, broadcasterDropAdapter{m: mx})
+	broadcaster := logbroadcast.NewBroadcasterWithPanicObserver(
+		logger,
+		broadcasterDropAdapter{m: mx},
+		broadcasterPanicAdapter{m: mx},
+	)
 	mgr := container.NewManager(docker, trk, cb, tokenProvider, broadcaster, cfg, logger).WithMetrics(mx)
 
 	// HealthState is the shared view of whether preflight has passed and
@@ -175,7 +238,25 @@ func main() {
 	// all os.Exit calls in main above any defer, satisfying the
 	// exitAfterDefer linter rule.
 	defer func() { _ = docker.Close() }()
-	defer func() { _ = broadcaster.Close(context.Background()) }()
+	defer func() {
+		// Bound the broadcaster drain. Without a deadline a wedged
+		// reporter goroutine (e.g. a misbehaving slog handler) would
+		// pin process exit indefinitely. We reuse the tracer-shutdown
+		// budget here as a convenient "tail of shutdown" duration —
+		// not because the two operations are equivalent (the tracer
+		// DOES make a final OTLP/HTTP flush over the network; the
+		// broadcaster only drains an in-memory ticker / logger). 5 s is
+		// generous for the broadcaster's purely-local work and tight
+		// enough that a stuck logger handler cannot extend total
+		// process lifetime by more than the tracer's own ceiling. If
+		// the broadcaster's needs ever diverge meaningfully, split this
+		// off into its own constant rather than reshaping
+		// tracerShutdownTimeout's semantics.
+		bcCtx, bcCancel := context.WithTimeout(context.Background(), tracerShutdownTimeout)
+		defer bcCancel()
+
+		_ = broadcaster.Close(bcCtx)
+	}()
 	defer monitorCancel()
 
 	// Run preflight. It runs synchronously for the first attempt so the
@@ -187,22 +268,80 @@ func main() {
 	preflight.Loop(monitorCtx, probes, &health.PreflightPassed, preflight.DefaultRetryInterval, logger,
 		func() { mx.PreflightLastSuccessSec.SetToCurrentTime() })
 
-	// Clean up any orphan containers from a previous crash.
-	if err := mgr.CleanupOrphans(context.Background()); err != nil {
+	// Clean up any orphan containers from a previous crash. Bound the
+	// boot-time sweep with the same per-tick budget the maintenance loop
+	// uses so a wedged dockerd cannot stall boot indefinitely — without a
+	// deadline a hung CleanupOrphans call would pin the runner before the
+	// HTTP listener ever opens.
+	bootCleanupCtx, bootCleanupCancel := context.WithTimeout(context.Background(), maintenanceCleanupTimeout)
+	if err := mgr.CleanupOrphans(bootCleanupCtx); err != nil {
 		logger.Warn("orphan cleanup failed", "error", err)
 	}
+
+	bootCleanupCancel()
 
 	// Background dockerd health monitor. Three consecutive ping failures
 	// (90s) call os.Exit(1) so systemd restarts the runner with a fresh
 	// Docker SDK client. The docker SDK auto-reconnects for most
 	// operations but not all; this is the escape hatch.
-	go container.MonitorDockerd(monitorCtx, docker, logger)
+	//
+	// Wrapped in a recover loop so a panic inside the Docker SDK can never
+	// unwind the whole runner. On panic we wait a short backoff and
+	// re-spawn the monitor — dockerd health monitoring must stay alive for
+	// the lifetime of the process.
+	go func() {
+		const monitorRespawnBackoff = 5 * time.Second
+
+		for {
+			func() {
+				defer recoverBackgroundGoroutine(logger, mx, metrics.GoroutineMonitorDockerd)
+
+				container.MonitorDockerdWithMetrics(monitorCtx, docker, logger, mx)
+			}()
+
+			// Clean exit on ctx cancel — don't respawn.
+			if monitorCtx.Err() != nil {
+				return
+			}
+
+			// Panic path: pause briefly then respawn so we don't hot-loop.
+			select {
+			case <-monitorCtx.Done():
+				return
+			case <-time.After(monitorRespawnBackoff):
+			}
+		}
+	}()
 
 	// Background maintenance loop: periodically sweeps orphaned worker
 	// containers and prunes dangling images. Closes the M12 gap where
 	// CleanupOrphans only ran once at startup and the image cache grew
 	// unbounded across worker-image upgrades.
-	go runMaintenanceLoop(monitorCtx, mgr, cfg.MaintenanceInterval, health, logger)
+	//
+	// Same respawn-on-panic discipline as the dockerd monitor — the
+	// maintenance loop must keep ticking even if a single Docker SDK call
+	// panics inside CleanupOrphans / PruneImages.
+	go func() {
+		const maintenanceRespawnBackoff = 5 * time.Second
+
+		for {
+			func() {
+				defer recoverBackgroundGoroutine(logger, mx, metrics.GoroutineMaintenanceLoop)
+
+				runMaintenanceLoop(monitorCtx, mgr, cfg.MaintenanceInterval, health, logger)
+			}()
+
+			if monitorCtx.Err() != nil {
+				return
+			}
+
+			select {
+			case <-monitorCtx.Done():
+				return
+			case <-time.After(maintenanceRespawnBackoff):
+			}
+		}
+	}()
 
 	// Webhook handler.
 	webhookSkew := time.Duration(cfg.WebhookReplaySkewSeconds) * time.Second
@@ -232,11 +371,20 @@ func main() {
 	mux := http.NewServeMux()
 	wh.Register(mux)
 
-	// HTTP server. otelhttp wraps the whole mux so every request gets a span.
+	// HTTP server. otelhttp wraps the whole mux so every request gets a
+	// span. The default "operation" name "cmr" makes every span opaque in
+	// the trace UI; switching to "METHOD /allowed-path" gives operators an
+	// actual breakdown by route. metrics.NormalizeEndpoint bounds path
+	// cardinality to the same allowlist used by webhook metrics so a probe
+	// spamming /nonexistent paths cannot explode trace series.
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           otelhttp.NewHandler(mux, "cmr"),
+		Addr: addr,
+		Handler: otelhttp.NewHandler(mux, "cmr",
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return r.Method + " " + metrics.NormalizeEndpoint(r.URL.Path)
+			}),
+		),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -249,7 +397,7 @@ func main() {
 
 	// Running-containers gauge refresher — don't poll per-add/remove, that
 	// would be too chatty and couples the tracker to Prometheus.
-	stopGauge := startRunningContainersGauge(trk, mx, 30*time.Second)
+	stopGauge := startRunningContainersGauge(trk, mx, logger, 30*time.Second)
 	defer stopGauge()
 
 	// Start the main server.
@@ -279,6 +427,33 @@ func main() {
 	sig := <-sigCh
 	logger.Info("received signal, shutting down", "signal", sig)
 
+	// Install the force-exit watcher BEFORE detaching the first one so SIGINT
+	// / SIGTERM is continuously registered. If we called signal.Stop(sigCh)
+	// before signal.Notify(forceCh, ...), a signal arriving in the gap would
+	// fall back to the default disposition and the process would be killed
+	// silently — operators would lose the "second signal forces exit" branch
+	// without any log line explaining what happened. The runtime accepts
+	// overlapping registrations safely, so layering forceCh on top of sigCh
+	// is the safe order.
+	forceCh := make(chan os.Signal, 1)
+	signal.Notify(forceCh, syscall.SIGTERM, syscall.SIGINT)
+	signal.Stop(sigCh)
+
+	// forceDone unblocks the force-exit watcher when shutdown finishes
+	// cleanly, so it doesn't outlive the process.
+	forceDone := make(chan struct{})
+	defer close(forceDone)
+	defer signal.Stop(forceCh)
+
+	go func() {
+		select {
+		case sig := <-forceCh:
+			logger.Error("received second signal during shutdown, forcing exit", "signal", sig)
+			os.Exit(1)
+		case <-forceDone:
+		}
+	}()
+
 	shutdown(shutdownDeps{
 		logger:        logger,
 		srv:           srv,
@@ -290,20 +465,31 @@ func main() {
 		replayCancel:  replayCancel,
 	})
 
-	// Admin server and tracer shut down on a fresh bounded ctx so a
-	// misbehaving collector or admin handler cannot stall the runner exit.
-	tearDownCtx, tearDownCancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
-	defer tearDownCancel()
+	// Allocate a fresh bounded context for each remaining tear-down step.
+	// Sharing one budget between adminSrv.Shutdown and shutdownTracer is a
+	// silent foot-gun: a slow admin drain leaves the tracer flush with
+	// near-zero budget and span batches get dropped without a log line.
+	adminCtx, adminCancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
 
 	if adminSrv != nil {
-		if err := adminSrv.Shutdown(tearDownCtx); err != nil {
+		if err := adminSrv.Shutdown(adminCtx); err != nil {
 			logger.Error("admin server shutdown error", "error", err)
 		}
 	}
 
-	if err := shutdownTracer(tearDownCtx); err != nil {
+	adminCancel()
+
+	// Tracer flush gets its own, smaller budget. 5s is generous for an
+	// in-memory BSP flush + a single OTLP/HTTP batch; if the collector is
+	// unreachable the exporter will time out internally and the runner
+	// proceeds rather than waiting the full 10s of httpShutdownTimeout.
+	tracerCtx, tracerCancel := context.WithTimeout(context.Background(), tracerShutdownTimeout)
+
+	if err := shutdownTracer(tracerCtx); err != nil {
 		logger.Error("tracer shutdown error", "error", err)
 	}
+
+	tracerCancel()
 
 	logger.Info("runner stopped")
 }
@@ -384,6 +570,12 @@ func shutdown(d shutdownDeps) {
 	}
 
 	// Step 4: ask every container to stop, and tell CM.
+	//
+	// We use a top-level shutdownCtx for the manager-drain wait below, but
+	// each per-container callback gets its own bounded context so one slow
+	// ContextMatrix response cannot drain the budget for the rest of the
+	// fleet — previously a single 30 s ReportStatus could starve the
+	// remaining containers' status callbacks.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), managerDrainTimeout)
 	defer shutdownCancel()
 
@@ -392,9 +584,12 @@ func shutdown(d shutdownDeps) {
 			if info.SessionID != "" {
 				d.logger.Info("killing chat container on shutdown", "session_id", info.SessionID)
 
-				if err := d.manager.KillChat(shutdownCtx, info.SessionID); err != nil {
+				killCtx, killCancel := context.WithTimeout(context.Background(), callbackShutdownTimeout)
+				if err := d.manager.KillChat(killCtx, info.SessionID); err != nil {
 					d.logger.Warn("failed to kill chat container", "session_id", info.SessionID, "error", err)
 				}
+
+				killCancel()
 
 				continue
 			}
@@ -406,9 +601,12 @@ func shutdown(d shutdownDeps) {
 			}
 
 			if d.callback != nil {
-				if err := d.callback.ReportStatus(shutdownCtx, info.CardID, info.Project, "failed", "runner shutting down"); err != nil {
+				cbCtx, cbCancel := context.WithTimeout(context.Background(), callbackShutdownTimeout)
+				if err := d.callback.ReportStatus(cbCtx, info.CardID, info.Project, "failed", "runner shutting down"); err != nil {
 					d.logger.Warn("failed to report shutdown status", "card_id", info.CardID, "error", err)
 				}
+
+				cbCancel()
 			}
 		}
 	}
@@ -501,7 +699,16 @@ func runMaintenanceLoop(ctx context.Context, mgr maintenanceTarget, interval tim
 
 func runMaintenanceLoopWithHealth(ctx context.Context, mgr maintenanceTarget, interval time.Duration, health maintenanceHealth, logger *slog.Logger) {
 	if interval <= 0 {
+		// Log once, then block on ctx.Done() so the outer respawn-with-
+		// backoff wrapper does not interpret the disabled config as a
+		// crash-and-respawn signal. Returning here would spin a fresh
+		// "loop disabled" log line every 5 s for the lifetime of the
+		// process.
 		logger.Warn("maintenance loop disabled: non-positive interval", "interval", interval)
+
+		if ctx != nil {
+			<-ctx.Done()
+		}
 
 		return
 	}
@@ -637,28 +844,82 @@ func buildAdminServer(
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
+		// Parity with the main server so a long-lived keep-alive connection
+		// to /metrics (e.g. from a misconfigured Prometheus scraper) does
+		// not pin a goroutine indefinitely.
+		IdleTimeout: 120 * time.Second,
 	}
 }
 
 // startRunningContainersGauge polls tracker.Count() on a ticker and publishes
 // the result to the running-containers gauge. Returns a stop function the
 // caller must invoke on shutdown.
-func startRunningContainersGauge(trk *tracker.Tracker, mx *metrics.Metrics, interval time.Duration) func() {
+//
+// The stop func is idempotent (wrapped in sync.Once) so a double-call from a
+// defer plus an explicit shutdown does not panic with "close of closed
+// channel".
+//
+// The ticker is created inside the goroutine so its lifetime is guaranteed to
+// match the goroutine's; the previous shape leaked the ticker when the
+// goroutine panicked (recoverBackgroundGoroutine recovered and the goroutine
+// exited, but `ticker.Stop()` was inside the case body and never ran). The
+// poller also wraps itself in a respawn-with-backoff loop matching the
+// dockerd / maintenance monitors so a one-off panic inside Prometheus or
+// tracker code doesn't permanently stop gauge updates.
+func startRunningContainersGauge(trk *tracker.Tracker, mx *metrics.Metrics, logger *slog.Logger, interval time.Duration) func() {
 	stop := make(chan struct{})
-	ticker := time.NewTicker(interval)
+
+	// Defensive guard: time.NewTicker panics on a non-positive interval. The
+	// outer respawn-with-backoff loop would recover the panic but immediately
+	// re-enter the same path and panic again every gaugeRespawnBackoff,
+	// pegging a CPU on the recover path for the lifetime of the process.
+	// Bail out with a noop stop func instead so a misconfigured caller gets
+	// a single warning at boot rather than a continuous panic-respawn spam
+	// in the logs.
+	if interval <= 0 {
+		if logger != nil {
+			logger.Warn("running-containers gauge disabled: non-positive interval", "interval", interval)
+		}
+
+		return func() {}
+	}
 
 	go func() {
+		const gaugeRespawnBackoff = 5 * time.Second
+
 		for {
+			exited := func() (stopped bool) {
+				defer recoverBackgroundGoroutine(logger, mx, metrics.GoroutineRunningContainers)
+
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-stop:
+						return true
+					case <-ticker.C:
+						mx.RunningContainers.Set(float64(trk.Count()))
+					}
+				}
+			}()
+
+			if exited {
+				return
+			}
+
+			// Panic path: pause briefly then respawn so we don't hot-loop
+			// on a persistent fault. Also respect the stop signal so a
+			// shutdown landing during the backoff still exits promptly.
 			select {
 			case <-stop:
-				ticker.Stop()
-
 				return
-			case <-ticker.C:
-				mx.RunningContainers.Set(float64(trk.Count()))
+			case <-time.After(gaugeRespawnBackoff):
 			}
 		}
 	}()
 
-	return func() { close(stop) }
+	var once sync.Once
+
+	return func() { once.Do(func() { close(stop) }) }
 }

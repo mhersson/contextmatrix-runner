@@ -188,12 +188,14 @@ github:
   # api_base_url: "https://api.acme.ghe.com"  # Env: CMR_GITHUB_API_BASE_URL
 ```
 
-For GitHub Enterprise, `github.host` and optionally `github.api_base_url` must
-point to the enterprise instance. Leave both empty for standard `github.com`.
-The git host inside containers is derived automatically from the repo URL, so no
-extra git configuration is required. Set the matching `github.host` (or
-`github.api_base_url`) in ContextMatrix so both sides target the same enterprise
-instance.
+For GitHub Enterprise, set `github.host` to the enterprise hostname. The runner
+derives `github.api_base_url` as `https://<host>/api/v3` (the standard GHES
+pattern) when only `host` is set. Override `api_base_url` explicitly for non-
+standard layouts such as GHEC-DR (`https://api.acme.ghe.com`). Leave both empty
+for standard `github.com`. The git host inside containers is derived
+automatically from the repo URL, so no extra git configuration is required.
+Set the matching `github.host` (or `github.api_base_url`) in ContextMatrix so
+both sides target the same enterprise instance.
 
 For end-to-end setup of a GitHub App or PAT covering both the runner and the
 contextmatrix server, see

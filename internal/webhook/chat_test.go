@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mhersson/contextmatrix-runner/internal/container"
+	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -75,6 +77,8 @@ func (f *chatFakeRunner) Stop(ctx context.Context, containerID string) error {
 
 	return nil
 }
+
+func (f *chatFakeRunner) KillChat(_ context.Context, _ string) error { return nil }
 
 func (f *chatFakeRunner) WorkerImage() string { return f.workerImage }
 
@@ -333,6 +337,49 @@ func TestChatStart_RollbackOnTrackerFailure(t *testing.T) {
 	assert.True(t, stopCalled, "Stop must be called to roll back the container on tracker failure")
 }
 
+// TestChatStart_RollbackMetricsIncremented verifies the W7 fix: when the
+// rollback Stop returns an error after a tracker-reservation failure, the
+// cmr_chat_rollback_failures_total counter ticks so operator dashboards can
+// alarm on orphaned chat containers.
+func TestChatStart_RollbackMetricsIncremented(t *testing.T) {
+	tr := tracker.New()
+	mx := metrics.New()
+
+	fake := &chatFakeRunner{
+		startChatFn: func(_ context.Context, _ container.StartChatOpts) (string, error) {
+			// Seed the tracker so AddChat fails with ErrAlreadyTracked,
+			// forcing the rollback Stop path.
+			_ = tr.AddChat(&tracker.ContainerInfo{SessionID: "sess-rb-metric"})
+
+			return "container-rb", nil
+		},
+		stopFn: func(_ context.Context, _ string) error {
+			return errors.New("stop blew up")
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil).WithMetrics(mx)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/chat/start", ChatStartPayload{SessionID: "sess-rb-metric"})
+	h.hmacAuth(h.handleChatStart)(w, req)
+
+	// Counter should have ticked exactly once on the rollback.
+	families, err := mx.Registry.Gather()
+	require.NoError(t, err)
+
+	var counterVal float64
+
+	for _, fam := range families {
+		if fam.GetName() == "cmr_chat_rollback_failures_total" {
+			require.Len(t, fam.Metric, 1)
+			counterVal = fam.Metric[0].GetCounter().GetValue()
+		}
+	}
+
+	assert.InDelta(t, 1.0, counterVal, 0.0001,
+		"cmr_chat_rollback_failures_total must increment when rollback Stop fails")
+}
+
 // TestChatEnd_Success verifies that /chat/end closes stdin, stops the
 // container, removes the tracker entry, and returns 200. A second call
 // returns 404 because the entry is gone.
@@ -362,7 +409,10 @@ func TestChatEnd_Success(t *testing.T) {
 	req := signedRequest(t, "/chat/end", ChatEndPayload{SessionID: "sess-end"})
 	h.hmacAuth(h.handleChatEnd)(w, req)
 
-	assert.Equal(t, http.StatusOK, w.Code)
+	// 202 (W10): /chat/end accepts the request, closes stdin, and the
+	// container exits asynchronously through WaitAndCleanupChat — mirrors
+	// /end-session.
+	assert.Equal(t, http.StatusAccepted, w.Code)
 
 	var resp SuccessResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
@@ -405,7 +455,8 @@ func TestChatEnd_StopsEvenWhenStdinAlreadyClosed(t *testing.T) {
 	req := signedRequest(t, "/chat/end", ChatEndPayload{SessionID: "sess-no-stdin"})
 	h.hmacAuth(h.handleChatEnd)(w, req)
 
-	assert.Equal(t, http.StatusOK, w.Code)
+	// 202 (W10): matches the happy path.
+	assert.Equal(t, http.StatusAccepted, w.Code)
 	assert.True(t, stopCalled, "Stop must be called even when stdin was not attached")
 	assert.False(t, tr.HasChat("sess-no-stdin"))
 }
@@ -812,4 +863,162 @@ func TestChatStart_PrimerWriteError_DoesNotFailRequest(t *testing.T) {
 
 	assert.Equal(t, http.StatusAccepted, w.Code,
 		"handler must return 202 even when primer stdin write fails")
+}
+
+// wedgedChatTrackerWrapper blocks WriteStdinChat indefinitely on a chosen
+// session_id until CloseStdinChat is called for that session. Used to
+// simulate a wedged hijacked stdin socket — i.e. the failure mode W1
+// targets: a write whose underlying TCP socket is blocked on kernel-buffer
+// pressure or a slow peer. Once CloseStdinChat fires the blocked Write
+// inside WriteStdinChat returns and the worker goroutine exits.
+type wedgedChatTrackerWrapper struct {
+	*tracker.Tracker
+	mu                sync.Mutex
+	wedgedSessionID   string
+	releaseCh         chan struct{}
+	writesStarted     int
+	closeStdinCalled  int
+	closeStdinErrCh   chan error
+	releaseOnceCalled atomic.Bool
+}
+
+func newWedgedChatTrackerWrapper(t *testing.T, sessionID string) *wedgedChatTrackerWrapper {
+	t.Helper()
+
+	return &wedgedChatTrackerWrapper{
+		Tracker:         tracker.New(),
+		wedgedSessionID: sessionID,
+		releaseCh:       make(chan struct{}),
+		closeStdinErrCh: make(chan error, 4),
+	}
+}
+
+func (w *wedgedChatTrackerWrapper) WriteStdinChat(sessionID string, b []byte) error {
+	w.mu.Lock()
+
+	wedged := sessionID == w.wedgedSessionID
+	if wedged {
+		w.writesStarted++
+	}
+
+	w.mu.Unlock()
+
+	if !wedged {
+		return w.Tracker.WriteStdinChat(sessionID, b)
+	}
+
+	// Block until releaseCh is closed (either by an explicit test signal
+	// or by CloseStdinChat below). Mirrors a tracker.WriteStdinChat that
+	// is stuck inside the underlying socket Write — Close on the writer
+	// would normally unblock it.
+	<-w.releaseCh
+
+	return errors.New("write released after wedge")
+}
+
+func (w *wedgedChatTrackerWrapper) CloseStdinChat(sessionID string) error {
+	w.mu.Lock()
+	w.closeStdinCalled++
+	w.mu.Unlock()
+
+	// Treat the chat-mode CloseStdinChat as the unblocker: the production
+	// path force-closes the underlying writer which makes the blocked
+	// Write inside the worker goroutine return. Use sync.Once semantics
+	// via atomic.Bool so a double-Close is a no-op (idempotent).
+	if w.releaseOnceCalled.CompareAndSwap(false, true) {
+		close(w.releaseCh)
+	}
+
+	err := w.Tracker.CloseStdinChat(sessionID)
+
+	// Best-effort capture for assertions; non-blocking so we don't stall
+	// in tests that don't drain the channel.
+	select {
+	case w.closeStdinErrCh <- err:
+	default:
+	}
+
+	return err
+}
+
+// TestChatStart_PrimingWriteTimeoutDoesNotStallRequest pins Fix W1: a
+// wedged hijacked stdin socket whose Write blocks indefinitely must NOT
+// freeze the /chat/start HTTP request thread. The handler must bound the
+// wait by chatPrimingWriteTimeout, force-close the chat container's stdin
+// to unblock the in-flight Write, and still return 202 to the client so
+// no orphaned chat container is left behind.
+//
+// NOT t.Parallel: this test mutates the package-level
+// chatPrimingWriteTimeout var; running it alongside other chat-mode
+// priming tests would race the variable read inside writeChatStdinWithTimeout.
+func TestChatStart_PrimingWriteTimeoutDoesNotStallRequest(t *testing.T) {
+	// Shrink the timeout so the test runs in tens of ms rather than the
+	// 5s production budget. Restored via t.Cleanup so subsequent tests
+	// in this binary observe the original 5s budget.
+	saved := chatPrimingWriteTimeout
+	chatPrimingWriteTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { chatPrimingWriteTimeout = saved })
+
+	const sessionID = "01SESS-WEDGE"
+
+	tr := newWedgedChatTrackerWrapper(t, sessionID)
+
+	fake := &chatFakeRunner{
+		workerImage: "worker:latest",
+		attachChatStdinFn: func(_ context.Context, sid, _ string) error {
+			tr.SetStdinChat(sid, &nopWriteCloser{}, nil)
+
+			return nil
+		},
+	}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL, nil, 0, nil)
+
+	req := signedRequest(t, "/chat/start", ChatStartPayload{
+		SessionID: sessionID,
+		Project:   "p",
+		Primer:    "PRIMER-TEXT-WEDGED",
+	})
+	w := httptest.NewRecorder()
+
+	// Bound the whole request by a generous slack budget. If W1's timeout
+	// isn't installed the goroutine blocks forever and this fires.
+	done := make(chan struct{})
+
+	start := time.Now()
+
+	go func() {
+		defer close(done)
+
+		h.hmacAuth(h.handleChatStart)(w, req)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("/chat/start did not return within budget after wedged priming write; goroutine appears stalled")
+	}
+
+	elapsed := time.Since(start)
+
+	// /chat/start must still complete with 202 — orphaning the container
+	// is the failure mode the fix-open posture deliberately avoids.
+	require.Equal(t, http.StatusAccepted, w.Code,
+		"handler must return 202 even when priming write times out")
+
+	// The whole handler must return within a tight envelope after the
+	// timeout fires (timeout + slack for goroutine scheduling).
+	require.Less(t, elapsed, chatPrimingWriteTimeout+1*time.Second,
+		"/chat/start must return within timeout+slack; took %s", elapsed)
+
+	// CloseStdinChat must have fired exactly once as the unblock action.
+	tr.mu.Lock()
+	gotCloseCalls := tr.closeStdinCalled
+	gotWritesStarted := tr.writesStarted
+	tr.mu.Unlock()
+
+	assert.Equal(t, 1, gotCloseCalls,
+		"timeout path must call CloseStdinChat exactly once to unblock the worker goroutine")
+	assert.GreaterOrEqual(t, gotWritesStarted, 1,
+		"the wedged write must have been attempted (so the timeout actually fired against a blocked goroutine)")
 }

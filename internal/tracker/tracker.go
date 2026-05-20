@@ -46,11 +46,22 @@ var ErrAlreadyTracked = errors.New("container already tracked")
 // so that the live writer/onClose pair is always reachable from the tracker
 // entry even while a concurrent SetStdin/Remove is racing for it.
 //
-// Invariant: once SetStdin allocates a stdinState for a ContainerInfo, the
-// pointer is never reset to nil for that entry's lifetime. Only the writer
-// field (stdin.stdin) is nil'd on close. Callers that have already acquired
-// tracker mu can therefore nil-check info.stdin as an early-out, and still
-// re-check the writer under stdin.mu.
+// Concurrency model:
+//
+//   - info.stdin (the *stdinState pointer) is written by SetStdin under
+//     tracker.mu (held for write).
+//   - Readers (WriteStdin, CloseStdin, MarkStdinClosed, and the chat
+//     variants) capture info.stdin into a local while holding tracker.mu
+//     (RLock), THEN release tracker.mu BEFORE touching stdin.mu. This
+//     synchronises the field access (silencing the race detector — see
+//     Fix W8 in REVIEW.md) without holding tracker.mu across the
+//     potentially-blocking Write/Close on a hijacked TCP socket.
+//   - Once info.stdin is allocated it is never reset to nil for that
+//     entry's lifetime; only the writer field (info.stdin.stdin) is
+//     nil'd on close. The pointer is therefore "set once, then stable"
+//     once visible to readers — they only need to nil-check the pointer
+//     to distinguish "container was never interactive" from "container
+//     was interactive at some point".
 //
 // Locking order: tracker.mu (read or write) MUST be acquired before stdin.mu.
 // The reverse order is not permitted in this package and would deadlock
@@ -182,21 +193,32 @@ func (t *Tracker) UpdateContainerID(project, cardID, containerID string) {
 	}
 }
 
-// Cancel invokes the stored context.CancelFunc for the tracked entry under
-// the tracker mu so the entry cannot be removed mid-call. Returns false if
-// no container is tracked; returns true if an entry exists (the call is a
-// no-op if Cancel is nil).
+// Cancel invokes the stored context.CancelFunc for the tracked entry.
+// Returns false if no container is tracked; returns true if an entry exists
+// (the call is a no-op if Cancel is nil).
+//
+// Lock discipline: the Cancel function pointer is captured under tracker.mu
+// (read), then the lock is released BEFORE the cancel func is invoked. This
+// mirrors Remove and prevents deadlock-by-self if the registered cancel
+// func reaches back into the tracker (e.g. a CancelFunc whose closure ends
+// up calling Snapshot or Has on the same Tracker). Invoking it under RLock
+// would block any concurrent writer the cancel func transitively waits on.
 func (t *Tracker) Cancel(project, cardID string) bool {
 	t.mu.RLock()
-	defer t.mu.RUnlock()
 
 	info, ok := t.containers[key(project, cardID)]
 	if !ok {
+		t.mu.RUnlock()
+
 		return false
 	}
 
-	if info.Cancel != nil {
-		info.Cancel()
+	cancel := info.Cancel
+
+	t.mu.RUnlock()
+
+	if cancel != nil {
+		cancel()
 	}
 
 	return true
@@ -206,34 +228,33 @@ func (t *Tracker) Cancel(project, cardID string) bool {
 // onClose is an optional callback invoked by Remove after the writer is closed
 // (e.g. to release the underlying network connection for a HijackedResponse).
 //
-// The entire operation executes under tracker.mu (held for write) so a
-// concurrent Remove cannot observe a partially-attached stdin. stdin.mu is
-// acquired nested inside tracker.mu, matching the package-wide lock order.
-//
-// H20 fix: the old implementation released tracker.mu before assigning
-// info.stdin.stdin, creating a window in which a concurrent Remove could
-// delete the entry and the late-arriving SetStdin would then orphan the
-// writer/onClose on a ContainerInfo no longer reachable from the tracker —
-// leaking the hijacked TCP connection. If SetStdin observes the entry has
-// already been removed, we close the writer synchronously and invoke
-// onClose so the connection still gets released.
+// Behaviour and locking:
+//   - Common path (entry present): tracker.mu is held for write while we
+//     allocate the stdinState (if needed) and assign the writer / onClose
+//     under stdin.mu nested inside tracker.mu. This matches the package-wide
+//     lock order and prevents a concurrent Remove from observing a partially-
+//     attached stdin.
+//   - Late-arrival path (entry already Removed): tracker.mu is released
+//     BEFORE we touch w/onClose, then closeWriterAsync runs the close +
+//     onClose dispatch on a goroutine under stdinCloseTimeout. This is the
+//     H20 + late-arrival watchdog fix: a wedged hijacked TCP socket whose
+//     Close() blocks on kernel-buffer pressure or a slow peer must not be
+//     able to freeze tracker.mu for the rest of the runner.
 func (t *Tracker) SetStdin(project, cardID string, w io.WriteCloser, onClose func()) {
+	k := key(project, cardID)
+
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
-	info, ok := t.containers[key(project, cardID)]
+	info, ok := t.containers[k]
 	if !ok {
-		// The entry was already Removed. Close the writer synchronously so
-		// the underlying hijacked connection does not leak, and invoke
-		// onClose so downstream cleanup (e.g. HijackedResponse.Close) still
-		// runs exactly once.
-		if w != nil {
-			_ = w.Close()
-		}
-
-		if onClose != nil {
-			onClose()
-		}
+		// The entry was already Removed. Release tracker.mu BEFORE closing
+		// the writer / invoking onClose so a wedged hijacked TCP socket
+		// (Close blocks on kernel-buffer pressure or a slow peer) cannot
+		// freeze the entire tracker for concurrent operations. We close
+		// asynchronously under stdinCloseTimeout, mirroring the
+		// Remove → closeStdinAsync path.
+		t.mu.Unlock()
+		closeWriterAsync(w, onClose, k)
 
 		return
 	}
@@ -246,6 +267,8 @@ func (t *Tracker) SetStdin(project, cardID string, w io.WriteCloser, onClose fun
 	info.stdin.stdin = w
 	info.stdin.onClose = onClose
 	info.stdin.mu.Unlock()
+
+	t.mu.Unlock()
 }
 
 // WriteStdin writes b to the container's attached stdin. Returns:
@@ -256,64 +279,163 @@ func (t *Tracker) SetStdin(project, cardID string, w io.WriteCloser, onClose fun
 //     closed (CloseStdin, Remove, or a prior /end-session).
 //
 // Callers map these to 404, 409, and 410 Gone respectively.
+//
+// Lock discipline: both the map lookup and the snapshot of info.stdin
+// happen under tracker.mu (RLock). The lock is released BEFORE acquiring
+// stdin.mu so a slow writer's Close on stdin.mu cannot block readers on
+// tracker.mu. This is the W8 fix — the older code read info.stdin
+// without synchronisation, which the race detector flagged on
+// concurrent SetStdin + WriteStdin even though the access pattern is
+// logically safe (a missed write returns the benign
+// ErrNoStdinAttached). Capturing under RLock makes the read happens-
+// before the write in SetStdin and silences the detector without
+// changing the lock ordering.
 func (t *Tracker) WriteStdin(project, cardID string, b []byte) error {
 	t.mu.RLock()
-	info, ok := t.containers[key(project, cardID)]
-	t.mu.RUnlock()
 
+	info, ok := t.containers[key(project, cardID)]
 	if !ok {
+		t.mu.RUnlock()
+
 		return fmt.Errorf("%s/%s: %w", project, cardID, ErrNotTracked)
 	}
 
-	if info.stdin == nil {
+	stdin := info.stdin
+
+	t.mu.RUnlock()
+
+	if stdin == nil {
 		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
 	}
 
-	info.stdin.mu.Lock()
-	defer info.stdin.mu.Unlock()
+	stdin.mu.Lock()
+	defer stdin.mu.Unlock()
 
-	if info.stdin.stdin == nil {
+	if stdin.stdin == nil {
 		// stdin pointer exists (SetStdin was called at some point) but the
 		// writer has been nil'd, meaning CloseStdin/Remove already closed
 		// it. This is the /end-session-then-/message path.
 		return fmt.Errorf("stdin closed for %s/%s: %w", project, cardID, ErrStdinClosed)
 	}
 
-	_, err := info.stdin.stdin.Write(b)
+	_, err := stdin.stdin.Write(b)
 
 	return err
+}
+
+// MarkStdinClosed flips the tracker's view of the stdin writer to "closed"
+// without invoking Close on it. Used by the priming-write timeout path,
+// which force-closes the underlying writer directly (bypassing the
+// tracker's lock-ordered close to avoid a deadlock against the in-flight
+// Write that holds stdin.mu). After the force-close the writer is no
+// longer usable, but tracker.WriteStdin would still attempt to write to
+// it and surface the I/O error as a generic 500 rather than the more
+// accurate 410 ErrStdinClosed. This call leaves info.stdin non-nil (so
+// the entry stays addressable for Remove) but sets info.stdin.stdin to
+// nil under stdin.mu, so future WriteStdin / CloseStdin return
+// ErrStdinClosed.
+//
+// Returns ErrNotTracked if the key is unknown, ErrNoStdinAttached if
+// SetStdin was never called. Safe to call multiple times.
+func (t *Tracker) MarkStdinClosed(project, cardID string) error {
+	t.mu.RLock()
+
+	info, ok := t.containers[key(project, cardID)]
+	if !ok {
+		t.mu.RUnlock()
+
+		return fmt.Errorf("%s/%s: %w", project, cardID, ErrNotTracked)
+	}
+
+	stdin := info.stdin
+
+	t.mu.RUnlock()
+
+	if stdin == nil {
+		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
+	}
+
+	stdin.mu.Lock()
+	stdin.stdin = nil
+	stdin.mu.Unlock()
+
+	return nil
+}
+
+// MarkStdinClosedChat is the chat-mode counterpart of MarkStdinClosed. See
+// MarkStdinClosed for the use case (priming-write timeout) and semantics.
+func (t *Tracker) MarkStdinClosedChat(sessionID string) error {
+	t.mu.RLock()
+
+	info, ok := t.containers[chatKey(sessionID)]
+	if !ok {
+		t.mu.RUnlock()
+
+		return fmt.Errorf("%s: %w", chatKey(sessionID), ErrNotTracked)
+	}
+
+	stdin := info.stdin
+
+	t.mu.RUnlock()
+
+	if stdin == nil {
+		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
+	}
+
+	stdin.mu.Lock()
+	stdin.stdin = nil
+	stdin.mu.Unlock()
+
+	return nil
 }
 
 // CloseStdin closes the attached stdin writer without removing the tracker
 // entry. Used to signal EOF to a containerized claude process so it exits
 // cleanly; the normal waitAndCleanup path will later call Remove.
 //
-// Returns ErrNotTracked if the key is unknown (including a TOCTOU where the
-// entry was removed between the caller's Snapshot and this call) and
-// ErrNoStdinAttached if no stdin has been set or it has already been closed.
-// Idempotent: a second call returns ErrNoStdinAttached.
+// Returns:
+//   - ErrNotTracked if the lookup key is unknown (including a TOCTOU where
+//     the entry was removed between the caller's Snapshot and this call);
+//   - ErrNoStdinAttached if no stdin was ever attached (container ran in
+//     non-interactive mode — SetStdin was never called);
+//   - ErrStdinClosed if SetStdin WAS called but the writer has since been
+//     closed (a prior CloseStdin / /end-session, or Remove's stdin cleanup).
+//
+// Idempotent: a second successful call returns ErrStdinClosed (not
+// ErrNoStdinAttached) so handlers can map a retried /end-session to 410
+// Gone instead of 409 Conflict (which would falsely imply the container
+// was never interactive). Fix W5 in REVIEW.md.
 func (t *Tracker) CloseStdin(project, cardID string) error {
 	t.mu.RLock()
-	info, ok := t.containers[key(project, cardID)]
-	t.mu.RUnlock()
 
+	info, ok := t.containers[key(project, cardID)]
 	if !ok {
+		t.mu.RUnlock()
+
 		return fmt.Errorf("%s/%s: %w", project, cardID, ErrNotTracked)
 	}
 
-	if info.stdin == nil {
+	stdin := info.stdin
+
+	t.mu.RUnlock()
+
+	if stdin == nil {
 		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
 	}
 
-	info.stdin.mu.Lock()
-	defer info.stdin.mu.Unlock()
+	stdin.mu.Lock()
+	defer stdin.mu.Unlock()
 
-	if info.stdin.stdin == nil {
-		return fmt.Errorf("no stdin attached for %s/%s: %w", project, cardID, ErrNoStdinAttached)
+	if stdin.stdin == nil {
+		// stdin pointer exists (SetStdin was called at some point) but
+		// the writer has been nil'd by a prior close. Surface this as
+		// ErrStdinClosed so an idempotent /end-session retry maps to
+		// 410 Gone rather than 409 Conflict. Fix W5 in REVIEW.md.
+		return fmt.Errorf("stdin closed for %s/%s: %w", project, cardID, ErrStdinClosed)
 	}
 
-	err := info.stdin.stdin.Close()
-	info.stdin.stdin = nil
+	err := stdin.stdin.Close()
+	stdin.stdin = nil
 
 	if err != nil {
 		return fmt.Errorf("close stdin for %s/%s: %w", project, cardID, err)
@@ -329,6 +451,11 @@ func (t *Tracker) CloseStdin(project, cardID string) error {
 //
 // Lock ordering holds: tracker.mu was released before this function is
 // called; stdin.mu is acquired inside the goroutine with no other lock held.
+//
+// Uses time.NewTimer + explicit Stop instead of time.After so the timer is
+// released as soon as the close completes; otherwise the runtime keeps the
+// underlying Timer pinned until the deadline elapses, matching the
+// callback package's retry-loop discipline. Fix W12 in REVIEW.md.
 func closeStdinAsync(info *ContainerInfo, label string) {
 	done := make(chan struct{})
 
@@ -350,10 +477,53 @@ func closeStdinAsync(info *ContainerInfo, label string) {
 		}
 	}()
 
+	timer := time.NewTimer(stdinCloseTimeout)
+	defer timer.Stop()
+
 	select {
 	case <-done:
-	case <-time.After(stdinCloseTimeout):
+	case <-timer.C:
 		slog.Warn("stdin close timed out in tracker.Remove; backgrounding",
+			"key", label, "timeout", stdinCloseTimeout)
+	}
+}
+
+// closeWriterAsync closes w and invokes onClose under a bounded watchdog.
+// Used by SetStdin/SetStdinChat's late-arrival branch (entry already Removed)
+// where there is no ContainerInfo to attach the writer to. Without this, a
+// wedged hijacked TCP socket's Close() would block tracker.mu (held for write
+// by SetStdin), freezing the entire tracker for any concurrent operation.
+//
+// label is used only in the warning log. Either w or onClose may be nil.
+//
+// Uses time.NewTimer + explicit Stop instead of time.After for parity with
+// closeStdinAsync (see Fix W12 in REVIEW.md).
+func closeWriterAsync(w io.Closer, onClose func(), label string) {
+	if w == nil && onClose == nil {
+		return
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		if w != nil {
+			_ = w.Close()
+		}
+
+		if onClose != nil {
+			onClose()
+		}
+	}()
+
+	timer := time.NewTimer(stdinCloseTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+	case <-timer.C:
+		slog.Warn("stdin close timed out in tracker.SetStdin late-arrival; backgrounding",
 			"key", label, "timeout", stdinCloseTimeout)
 	}
 }
@@ -388,9 +558,15 @@ func (t *Tracker) Remove(project, cardID string) {
 	}
 }
 
-// chatKey returns the map key for a chat-mode container.
+// chatKey returns the map key for a chat-mode container. The leading NUL
+// byte is the sentinel: project / card_id values are constrained by the
+// webhook validator's [A-Za-z0-9_.-] charset (validateIdent), so a NUL
+// can never appear in a card-mode key. A literal "__chat__" prefix used
+// to alias to a valid project name and could collide with a /trigger
+// call for project="__chat__", card_id=<sessionID>. Mirrors the
+// chatDedupSentinel pattern in webhook/message_dedup_cache.go.
 func chatKey(sessionID string) string {
-	return "__chat__/" + sessionID
+	return "\x00chat/" + sessionID
 }
 
 // AddChat registers a chat-mode container keyed by sessionID. Returns
@@ -463,57 +639,79 @@ func (t *Tracker) RemoveChat(sessionID string) {
 // WriteStdinChat writes b to the attached stdin of the chat-mode container
 // identified by sessionID. Returns ErrNotTracked, ErrNoStdinAttached, or
 // ErrStdinClosed as appropriate (matching the semantics of WriteStdin).
+//
+// Lock discipline mirrors WriteStdin: info.stdin is captured under
+// tracker.mu (RLock) so the read is correctly synchronised against
+// SetStdinChat's write to that field. Fix W8 in REVIEW.md.
 func (t *Tracker) WriteStdinChat(sessionID string, b []byte) error {
 	t.mu.RLock()
-	info, ok := t.containers[chatKey(sessionID)]
-	t.mu.RUnlock()
 
+	info, ok := t.containers[chatKey(sessionID)]
 	if !ok {
+		t.mu.RUnlock()
+
 		return fmt.Errorf("%s: %w", chatKey(sessionID), ErrNotTracked)
 	}
 
-	if info.stdin == nil {
+	stdin := info.stdin
+
+	t.mu.RUnlock()
+
+	if stdin == nil {
 		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
 	}
 
-	info.stdin.mu.Lock()
-	defer info.stdin.mu.Unlock()
+	stdin.mu.Lock()
+	defer stdin.mu.Unlock()
 
-	if info.stdin.stdin == nil {
+	if stdin.stdin == nil {
 		return fmt.Errorf("stdin closed for %s: %w", chatKey(sessionID), ErrStdinClosed)
 	}
 
-	_, err := info.stdin.stdin.Write(b)
+	_, err := stdin.stdin.Write(b)
 
 	return err
 }
 
 // CloseStdinChat closes the attached stdin writer for the chat-mode container
 // identified by sessionID without removing the tracker entry.
-// Returns ErrNotTracked if the key is unknown and ErrNoStdinAttached if no
-// stdin has been set or it has already been closed.
+//
+// Mirrors CloseStdin: returns ErrNotTracked if the key is unknown,
+// ErrNoStdinAttached if SetStdinChat was never called, and ErrStdinClosed
+// if SetStdinChat WAS called but the writer has since been closed (a prior
+// CloseStdinChat, or RemoveChat's stdin cleanup). Idempotent — a second
+// successful call returns ErrStdinClosed. Fix W5 in REVIEW.md.
 func (t *Tracker) CloseStdinChat(sessionID string) error {
 	t.mu.RLock()
-	info, ok := t.containers[chatKey(sessionID)]
-	t.mu.RUnlock()
 
+	info, ok := t.containers[chatKey(sessionID)]
 	if !ok {
+		t.mu.RUnlock()
+
 		return fmt.Errorf("%s: %w", chatKey(sessionID), ErrNotTracked)
 	}
 
-	if info.stdin == nil {
+	stdin := info.stdin
+
+	t.mu.RUnlock()
+
+	if stdin == nil {
 		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
 	}
 
-	info.stdin.mu.Lock()
-	defer info.stdin.mu.Unlock()
+	stdin.mu.Lock()
+	defer stdin.mu.Unlock()
 
-	if info.stdin.stdin == nil {
-		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
+	if stdin.stdin == nil {
+		// stdin pointer exists (SetStdinChat was called) but writer has
+		// been nil'd by a prior close. Mirror CloseStdin: return
+		// ErrStdinClosed so the chat /end-session retry path can
+		// distinguish "closed" from "never attached".
+		return fmt.Errorf("stdin closed for %s: %w", chatKey(sessionID), ErrStdinClosed)
 	}
 
-	err := info.stdin.stdin.Close()
-	info.stdin.stdin = nil
+	err := stdin.stdin.Close()
+	stdin.stdin = nil
 
 	if err != nil {
 		return fmt.Errorf("close stdin for %s: %w", chatKey(sessionID), err)
@@ -523,22 +721,25 @@ func (t *Tracker) CloseStdinChat(sessionID string) error {
 }
 
 // SetStdinChat attaches a writable stdin handle to a tracked chat-mode
-// container. Mirrors SetStdin semantics: if the entry has already been
-// removed, w is closed synchronously and onClose is invoked so the
-// underlying connection is not leaked.
+// container. Mirrors SetStdin semantics:
+//   - Common path (entry present): tracker.mu is held for write while we
+//     allocate stdinState and assign w/onClose under stdin.mu (nested).
+//   - Late-arrival path (entry already Removed): tracker.mu is released
+//     BEFORE w/onClose are touched, then closeWriterAsync runs the close on
+//     a goroutine under stdinCloseTimeout so a wedged hijacked TCP socket
+//     cannot freeze tracker.mu for concurrent operations.
 func (t *Tracker) SetStdinChat(sessionID string, w io.WriteCloser, onClose func()) {
+	k := chatKey(sessionID)
+
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
-	info, ok := t.containers[chatKey(sessionID)]
+	info, ok := t.containers[k]
 	if !ok {
-		if w != nil {
-			_ = w.Close()
-		}
-
-		if onClose != nil {
-			onClose()
-		}
+		// Mirror SetStdin's late-arrival fix: release tracker.mu BEFORE
+		// closing the writer / invoking onClose so a wedged hijacked TCP
+		// socket cannot freeze the tracker.
+		t.mu.Unlock()
+		closeWriterAsync(w, onClose, k)
 
 		return
 	}
@@ -551,6 +752,8 @@ func (t *Tracker) SetStdinChat(sessionID string, w io.WriteCloser, onClose func(
 	info.stdin.stdin = w
 	info.stdin.onClose = onClose
 	info.stdin.mu.Unlock()
+
+	t.mu.Unlock()
 }
 
 // Count returns the number of tracked containers.

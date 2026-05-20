@@ -158,6 +158,49 @@ func TestBuildProbes_PullIfNotPresentSkipsInspect(t *testing.T) {
 	assert.Nil(t, probes.ImageInspect, "image inspect should be unset when pulls are permitted")
 }
 
+// TestStartRunningContainersGauge_UpdatesAndStops verifies the happy path:
+// the gauge updates on tick, the stop func returns the goroutine, and a
+// second stop call is a no-op (idempotent).
+func TestStartRunningContainersGauge_UpdatesAndStops(t *testing.T) {
+	mx := metrics.New()
+	trk := tracker.New()
+
+	// Put a container in the tracker so the gauge has something to report.
+	require.NoError(t, trk.Add(&tracker.ContainerInfo{
+		CardID:      "PROJ-001",
+		Project:     "p",
+		ContainerID: "c1",
+	}))
+
+	stop := startRunningContainersGauge(trk, mx, testLogger(), 10*time.Millisecond)
+
+	assert.Eventually(t, func() bool {
+		// Gather metrics and look for cmr_running_containers.
+		families, err := mx.Registry.Gather()
+		if err != nil {
+			return false
+		}
+
+		for _, f := range families {
+			if f.GetName() != "cmr_running_containers" {
+				continue
+			}
+
+			for _, m := range f.Metric {
+				if m.Gauge != nil && m.Gauge.GetValue() == 1 {
+					return true
+				}
+			}
+		}
+
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "gauge must reflect tracker count")
+
+	stop()
+	// A second call must not panic (idempotent close).
+	stop()
+}
+
 // TestBuildAdminServer verifies that buildAdminServer returns a non-nil
 // *http.Server bound to the configured port when admin_port is non-zero,
 // and returns nil (disabled) when admin_port is 0.
@@ -177,6 +220,9 @@ func TestBuildAdminServer(t *testing.T) {
 		srv := buildAdminServer(cfg, wh, mx, trk, log)
 		require.NotNil(t, srv)
 		assert.Equal(t, fmt.Sprintf("127.0.0.1:%d", 9091), srv.Addr)
+		// IdleTimeout must mirror the main server so a keep-alive scrape
+		// cannot pin a goroutine indefinitely.
+		assert.Equal(t, 120*time.Second, srv.IdleTimeout, "admin server must set IdleTimeout for parity")
 	})
 
 	t.Run("admin_port=0 returns nil (disabled)", func(t *testing.T) {

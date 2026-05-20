@@ -508,3 +508,185 @@ func TestPublish_ReleasesLockBeforeSend(t *testing.T) {
 	close(done)
 	pubWG.Wait()
 }
+
+// panicSlogHandler is a slog.Handler that panics on every Handle call.
+// Used by TestDropReporter_RecoversFromPanic to inject a deterministic
+// panic into the broadcaster's drop-reporter goroutine without racing on
+// runtime internals.
+type panicSlogHandler struct{}
+
+func (panicSlogHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (panicSlogHandler) Handle(_ context.Context, _ slog.Record) error {
+	panic("simulated slog handler panic")
+}
+func (h panicSlogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h panicSlogHandler) WithGroup(_ string) slog.Handler      { return h }
+
+// panicObs records every ObservePanic call. Safe for concurrent use because
+// the drop-reporter goroutine is the only producer.
+type panicObs struct {
+	mu     sync.Mutex
+	labels []string
+}
+
+func (p *panicObs) ObservePanic(goroutine string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.labels = append(p.labels, goroutine)
+}
+
+func (p *panicObs) Labels() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := make([]string, len(p.labels))
+	copy(out, p.labels)
+
+	return out
+}
+
+// TestDropReporter_RecoversFromPanic verifies that a panic inside the
+// drop-reporter goroutine (e.g. a misbehaving slog handler) is recovered,
+// the PanicObserver is notified, and Close still returns instead of
+// deadlocking on reporterDone. Mirrors recoverBackgroundGoroutine semantics
+// for the main.go-managed long-lived goroutines.
+func TestDropReporter_RecoversFromPanic(t *testing.T) {
+	obs := &countingObs{}
+	pobs := &panicObs{}
+
+	// A slog logger whose handler panics on every record. flushDrops calls
+	// logger.Warn after observing at least one drop, which triggers the panic.
+	logger := slog.New(panicSlogHandler{})
+
+	// Tight interval so the reporter ticks quickly.
+	b := logbroadcast.NewBroadcasterWithIntervalAndPanicObserver(logger, obs, pobs, 25*time.Millisecond)
+
+	// Slow subscriber we never drain → drops accumulate → reporter calls Warn → panic.
+	_, unsub := b.Subscribe("")
+	defer unsub()
+
+	// Burst enough entries to ensure the buffer fills and drops accumulate.
+	for range 300 {
+		b.Publish(logbroadcast.LogEntry{
+			Timestamp: time.Now(),
+			Project:   "p",
+			CardID:    "c",
+			Type:      "text",
+			Content:   "x",
+		})
+	}
+
+	// Wait for the reporter to tick and panic-recover.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(pobs.Labels()) > 0 {
+			break
+		}
+
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	labels := pobs.Labels()
+	require.NotEmpty(t, labels, "PanicObserver must be notified when the drop-reporter panics")
+	assert.Equal(t, "broadcaster_drop_reporter", labels[0], "panic label must match the broadcaster's drop-reporter goroutine")
+
+	// Close must not block on reporterDone — the recover defer is wired
+	// before the close-reporterDone defer so the goroutine still exits.
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+
+	assert.NoError(t, b.Close(closeCtx))
+}
+
+// TestPublish_TruncatesOversizedContent verifies the maxLogEntryContentBytes
+// cap: a 1 MiB Content survives publish without panicking and the
+// delivered entry is truncated with the documented marker so subscribers
+// cannot pin worst-case heap memory.
+func TestPublish_TruncatesOversizedContent(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+
+	defer func() { _ = b.Close(context.Background()) }()
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	// 1 MiB exceeds the documented 64 KiB cap; the truncation must not panic.
+	big := strings.Repeat("X", 1<<20)
+	b.Publish(logbroadcast.LogEntry{
+		Project: "p",
+		Type:    "text",
+		Content: big,
+	})
+
+	select {
+	case got := <-ch:
+		assert.LessOrEqual(t, len(got.Content), 64*1024,
+			"truncated Content must not exceed the documented cap")
+		assert.True(t, strings.HasSuffix(got.Content, "…[truncated]"),
+			"truncated Content must end with the documented marker; got tail %q",
+			got.Content[len(got.Content)-15:])
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive the published entry")
+	}
+}
+
+// TestPublish_PreservesSmallContent verifies that the truncation guard is
+// inert for normal-sized entries: anything under the cap must pass through
+// byte-for-byte.
+func TestPublish_PreservesSmallContent(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+
+	defer func() { _ = b.Close(context.Background()) }()
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	const payload = "small payload that should survive verbatim"
+	b.Publish(logbroadcast.LogEntry{
+		Project: "p",
+		Type:    "text",
+		Content: payload,
+	})
+
+	select {
+	case got := <-ch:
+		assert.Equal(t, payload, got.Content)
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive the published entry")
+	}
+}
+
+// TestPublish_AfterCloseDropsSilently verifies that Publish gates on the
+// closed channel: any entry published after Close is discarded without
+// fanning out to surviving subscribers. Without the gate, a late Publish
+// could race the unsubscribe path and leak a half-sent entry.
+func TestPublish_AfterCloseDropsSilently(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+
+	require.NoError(t, b.Close(closeCtx))
+
+	// Publishing post-close must be a no-op; the subscriber's channel
+	// already closed (or never receives). Reading drains the closed channel.
+	b.Publish(logbroadcast.LogEntry{
+		Project: "p",
+		Type:    "text",
+		Content: "should be ignored",
+	})
+
+	// Read at most one entry; we don't care whether we observe the
+	// closed-channel zero-value or a timeout — what matters is no
+	// post-close entry is delivered.
+	select {
+	case got, ok := <-ch:
+		assert.False(t, ok, "channel should be closed; received entry instead: %+v", got)
+	case <-time.After(100 * time.Millisecond):
+		// also acceptable
+	}
+}

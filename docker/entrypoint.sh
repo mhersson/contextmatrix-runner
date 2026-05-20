@@ -196,15 +196,23 @@ if [ -n "${CM_CHAT_SESSION:-}" ]; then
         '$base + {"X-CM-Chat-Session": $session}')
 fi
 
-MCP_ENTRY=$(jq -n \
-    --arg url "$CM_MCP_URL" \
-    --argjson headers "$MCP_HEADERS" \
-    '{"contextmatrix": {"type": "http", "url": $url, "headers": $headers, "alwaysLoad": true}}')
-
 CLAUDE_JSON="$HOME/.claude.json"
 [ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
-jq --argjson mcp "$MCP_ENTRY" '.mcpServers = ((.mcpServers // {}) * $mcp)' "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp"
-mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
+
+# Skip the MCP merge entirely when CM_MCP_URL is empty/unset. Chat-mode
+# containers may opt out of MCP wiring (StartChat only sets CM_MCP_URL when
+# opts.MCPURL is non-empty); under `set -u`, dereferencing $CM_MCP_URL
+# directly would crash the entrypoint before claude starts. The merge below
+# is the only place that needs the URL, so guarding the block is sufficient.
+if [ -n "${CM_MCP_URL:-}" ]; then
+    MCP_ENTRY=$(jq -n \
+        --arg url "${CM_MCP_URL:-}" \
+        --argjson headers "$MCP_HEADERS" \
+        '{"contextmatrix": {"type": "http", "url": $url, "headers": $headers, "alwaysLoad": true}}')
+
+    jq --argjson mcp "$MCP_ENTRY" '.mcpServers = ((.mcpServers // {}) * $mcp)' "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp"
+    mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
+fi
 
 # Disable Claude Code's default cloud-only MCP servers — the worker has no
 # need for Gmail / Calendar / Drive and they'd just produce auth errors at
@@ -409,11 +417,11 @@ export PATH="$HOME/.local/bin:$PATH"
 # happier with a known cwd that exists.
 if [ -z "${CM_CHAT_SESSION:-}" ]; then
     if [ -n "${CM_BASE_BRANCH:-}" ]; then
-        echo "Cloning ${CM_REPO_URL} (branch: ${CM_BASE_BRANCH})..."
-        git clone -b "${CM_BASE_BRANCH}" -- "${CM_REPO_URL}" /home/user/workspace
+        echo "Cloning ${CM_REPO_URL:-} (branch: ${CM_BASE_BRANCH})..."
+        git clone -b "${CM_BASE_BRANCH}" -- "${CM_REPO_URL:-}" /home/user/workspace
     else
-        echo "Cloning ${CM_REPO_URL}..."
-        git clone -- "${CM_REPO_URL}" /home/user/workspace
+        echo "Cloning ${CM_REPO_URL:-}..."
+        git clone -- "${CM_REPO_URL:-}" /home/user/workspace
     fi
 fi
 mkdir -p /home/user/workspace

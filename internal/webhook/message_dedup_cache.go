@@ -19,10 +19,11 @@ import (
 // Concurrency: all exported methods are safe for concurrent use.
 // Lifecycle: see Run — it mirrors ReplayCache.Run.
 type MessageDedupCache struct {
-	mu       sync.Mutex
-	ttl      time.Duration
-	capacity int
-	now      func() time.Time
+	mu            sync.Mutex
+	ttl           time.Duration
+	capacity      int
+	now           func() time.Time
+	sweepInterval time.Duration
 
 	entries *list.List
 	index   map[string]*list.Element
@@ -52,22 +53,52 @@ func WithMessageDedupNow(now func() time.Time) MessageDedupCacheOption {
 	}
 }
 
+// WithMessageDedupSweepInterval overrides the background sweep interval used
+// by Run. Intended for tests that need a tighter tick than min(ttl/2, 60s);
+// production callers should rely on the default derivation.
+func WithMessageDedupSweepInterval(interval time.Duration) MessageDedupCacheOption {
+	return func(c *MessageDedupCache) {
+		if interval > 0 {
+			c.sweepInterval = interval
+		}
+	}
+}
+
 // NewMessageDedupCache constructs a dedup cache with the given TTL
 // and capacity. A capacity of <= 0 disables the hard cap; a TTL of
 // <= 0 disables time-based expiry.
 func NewMessageDedupCache(ttl time.Duration, capacity int, opts ...MessageDedupCacheOption) *MessageDedupCache {
 	c := &MessageDedupCache{
-		ttl:      ttl,
-		capacity: capacity,
-		now:      time.Now,
-		entries:  list.New(),
-		index:    make(map[string]*list.Element),
+		ttl:           ttl,
+		capacity:      capacity,
+		now:           time.Now,
+		sweepInterval: defaultDedupSweepInterval(ttl),
+		entries:       list.New(),
+		index:         make(map[string]*list.Element),
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 
 	return c
+}
+
+// defaultDedupSweepInterval picks min(ttl/2, 60s) so a short TTL produces a
+// proportionally faster sweep. Mirrors defaultSweepInterval in replay_cache.go.
+// Kept as a separate function (rather than reused) so the two caches' tick
+// derivations stay independently tunable.
+func defaultDedupSweepInterval(ttl time.Duration) time.Duration {
+	const maxInterval = 60 * time.Second
+	if ttl <= 0 {
+		return maxInterval
+	}
+
+	half := ttl / 2
+	if half < maxInterval {
+		return half
+	}
+
+	return maxInterval
 }
 
 // chatDedupSentinel is a chat-namespace marker for MessageDedupCache keys.
@@ -166,20 +197,25 @@ func (c *MessageDedupCache) putByKey(key string, ack CachedAck) {
 
 	now := c.now()
 
-	// Overwrite existing entry if present; otherwise append.
+	// Overwrite existing entry if present; otherwise append. Both branches
+	// take a defensive copy of ack.Body so the cache invariant ("stored
+	// bytes are owned by the cache, never aliased to caller-supplied
+	// slices") holds on every insert path. Fix W6 in REVIEW.md: the
+	// overwrite path used to alias the caller's slice while the
+	// new-entry path copied — a caller that mutated the slice after Put
+	// could corrupt the cached ack in the overwrite case only.
+	bodyCopy := make([]byte, len(ack.Body))
+	copy(bodyCopy, ack.Body)
+
 	if el, ok := c.index[key]; ok {
 		entry := el.Value.(*dedupEntry)
 		entry.stored = now
-		entry.ack = ack
+		entry.ack = CachedAck{Status: ack.Status, Body: bodyCopy}
 
 		c.entries.MoveToBack(el)
 
 		return
 	}
-
-	// Defensive copy so we own the stored bytes.
-	bodyCopy := make([]byte, len(ack.Body))
-	copy(bodyCopy, ack.Body)
 
 	el := c.entries.PushBack(&dedupEntry{
 		key:    key,
@@ -236,10 +272,12 @@ func (c *MessageDedupCache) sweep() {
 	}
 }
 
-// Run sweeps expired entries every 60s until ctx is cancelled.
-// Mirrors ReplayCache.Run; see that method's docstring.
+// Run sweeps expired entries on the cache's derived interval until ctx is
+// cancelled. The interval defaults to min(ttl/2, 60s) so a short TTL is
+// not paired with a slow sweep; override via WithMessageDedupSweepInterval
+// in tests. Mirrors ReplayCache.Run; see that method's docstring.
 func (c *MessageDedupCache) Run(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(c.sweepInterval)
 	defer ticker.Stop()
 
 	for {

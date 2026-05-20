@@ -31,6 +31,16 @@ import (
 // supposed to stay low-risk.
 type bodyKey struct{}
 
+// maxRequestBodyBytes caps the body read by hmacAuth. Payloads larger than
+// this are rejected with 413 (CodeTooLarge) BEFORE the LimitReader would
+// silently truncate them, so clients receive a useful error code rather
+// than a 401 from a signature computed against truncated bytes. The
+// validator caps (e.g. chatResumeMaxTurns × chatResumeMaxContentBytes) can
+// in theory produce a wire payload larger than this; the precheck is the
+// single chokepoint that keeps validation and authentication consistent
+// on payload size.
+const maxRequestBodyBytes = 1 << 20
+
 // ContainerRunner is the subset of container.Manager used by the webhook handler.
 // Using an interface here enables handler tests to inject fakes without needing
 // the Docker daemon or the full Manager dependency graph.
@@ -46,6 +56,7 @@ type ContainerRunner interface {
 	StreamChatLogs(ctx context.Context, sessionID, containerID, project string)
 	WaitAndCleanupChat(sessionID, containerID, project string)
 	DeleteChatCleanup(containerID string)
+	KillChat(ctx context.Context, sessionID string) error
 	Stop(ctx context.Context, containerID string) error
 	WorkerImage() string
 	BuildChatAuthEnv(ctx context.Context) string
@@ -232,7 +243,8 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 
 	var payload TriggerPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		h.logDebug("trigger: invalid JSON", "error", err)
+		h.logDebug("trigger: invalid JSON", "error", err,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
 
 		return
@@ -289,10 +301,12 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 			// card_id or a different one (M21 in REVIEW.md: the old
 			// "task already running: <card_id>" leaked tracker state).
 			h.logDebug("trigger: card already tracked",
-				"card_id", payload.CardID, "project", payload.Project)
+				"card_id", payload.CardID, "project", payload.Project,
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusConflict, CodeConflict, "conflicting container state")
 		default:
-			h.logWarn("trigger: tracker add failed", "error", err.Error())
+			h.logWarn("trigger: tracker add failed", "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 		}
 
@@ -322,7 +336,8 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 
 	var payload KillPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		h.logDebug("kill: invalid JSON", "error", err)
+		h.logDebug("kill: invalid JSON", "error", err,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
 
 		return
@@ -350,7 +365,8 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 			// errors.Join; log and still surface 500 so CM sees the failure
 			// and the next sweep can retry.
 			h.logWarn("kill: force-remove by labels failed",
-				"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
+				"card_id", payload.CardID, "project", payload.Project, "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusInternalServerError, CodeInternal, "kill failed")
 
 			return
@@ -358,14 +374,16 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 
 		if removed > 0 {
 			h.logInfo("kill: force-removed untracked container(s)",
-				"card_id", payload.CardID, "project", payload.Project, "removed", removed)
+				"card_id", payload.CardID, "project", payload.Project, "removed", removed,
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeSuccess(w, http.StatusOK, "force-removed")
 
 			return
 		}
 
 		h.logDebug("kill: container not tracked (idempotent no-op)",
-			"card_id", payload.CardID, "project", payload.Project)
+			"card_id", payload.CardID, "project", payload.Project,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeSuccess(w, http.StatusOK, "no-op (already stopped)")
 
 		return
@@ -373,7 +391,8 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.manager.Kill(payload.Project, payload.CardID); err != nil {
 		h.logWarn("kill: manager.Kill failed",
-			"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
+			"card_id", payload.CardID, "project", payload.Project, "error", err.Error(),
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusInternalServerError, CodeInternal, "kill failed")
 
 		return
@@ -391,7 +410,8 @@ func (h *Handler) handleKill(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleListContainers(w http.ResponseWriter, r *http.Request) {
 	containers, err := h.manager.ListManaged(r.Context())
 	if err != nil {
-		h.logWarn("list-containers: ListManaged failed", "error", err.Error())
+		h.logWarn("list-containers: ListManaged failed", "error", err.Error(),
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadGateway, CodeUpstreamFailure, "docker list failed")
 
 		return
@@ -419,7 +439,8 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 
 	var payload StopAllPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		h.logDebug("stop-all: invalid JSON", "error", err)
+		h.logDebug("stop-all: invalid JSON", "error", err,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
 
 		return
@@ -443,9 +464,55 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 	failed := 0
 
 	for _, info := range containers {
+		// Chat-mode entries (SessionID set, CardID empty) MUST go through
+		// KillChat — their tracker lookup key is chatKey(sessionID), and
+		// Kill(project, cardID="") would miss the entry entirely, leaking the
+		// container while reporting "failed: N".
+		if info.SessionID != "" {
+			killCtx, killCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := h.manager.KillChat(killCtx, info.SessionID); err != nil {
+				killCancel()
+
+				h.logWarn("stop-all: chat kill failed",
+					"session_id", info.SessionID, "error", err.Error(),
+					"correlation_id", correlationIDFromContext(r.Context()))
+
+				results = append(results, CardKillResult{
+					SessionID: info.SessionID,
+					Project:   info.Project,
+					OK:        false,
+					Error:     "kill failed",
+				})
+				failed++
+
+				continue
+			}
+
+			killCancel()
+
+			results = append(results, CardKillResult{
+				SessionID: info.SessionID,
+				Project:   info.Project,
+				OK:        true,
+			})
+			stopped++
+
+			continue
+		}
+
+		// Card-mode Kill is synchronous and does not accept a context. The
+		// Manager-side implementation only calls tracker.Cancel, which
+		// returns immediately after invoking the stored CancelFunc, so a
+		// single wedged Kill is structurally impossible today. If Manager.Kill
+		// is ever extended to do blocking work (waiting on Docker stop,
+		// flushing logs, etc.) it MUST be reshaped to KillWithContext so this
+		// loop does not stall the entire /stop-all response on one entry —
+		// the chat-mode branch above already follows that pattern with a 5s
+		// killCtx. Fix W2 in REVIEW.md.
 		if err := h.manager.Kill(info.Project, info.CardID); err != nil {
 			h.logWarn("stop-all: kill failed",
-				"card_id", info.CardID, "project", info.Project, "error", err.Error())
+				"card_id", info.CardID, "project", info.Project, "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
 
 			results = append(results, CardKillResult{
 				CardID:  info.CardID,
@@ -488,15 +555,12 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                 true,
-		"running_containers": h.tracker.Count(),
-		"max_concurrent":     h.maxConcurrent,
+	writeJSON(w, http.StatusOK, HealthResponse{
+		OK:                true,
+		RunningContainers: h.tracker.Count(),
+		MaxConcurrent:     h.maxConcurrent,
 	})
 }
-
-// maxMessageContent is the maximum allowed byte length for a user message.
-const maxMessageContent = 8192
 
 // handleMessage accepts a user chat message and writes it to the target
 // container's stdin as a Claude Code stream-json user turn.
@@ -513,7 +577,8 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 	var payload MessagePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		h.logDebug("message: invalid JSON", "error", err)
+		h.logDebug("message: invalid JSON", "error", err,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
 
 		return
@@ -522,7 +587,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Size cap first: an oversize content produces 413 rather than 400 to
 	// match the documented webhook contract. ValidatePayload would otherwise
 	// fold this into a 400.
-	if len(payload.Content) > maxMessageContent {
+	if len(payload.Content) > MaxMessageContentBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, CodeTooLarge, "content exceeds 8192 bytes")
 
 		return
@@ -549,14 +614,15 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !h.tracker.HasChat(payload.SessionID) {
-			writeError(w, http.StatusNotFound, CodeNotFound, "no chat container tracked")
+			writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
 
 			return
 		}
 
 		b, err := streammsg.BuildUserMessage(payload.Content)
 		if err != nil {
-			h.logWarn("message: BuildUserMessage failed", "error", err.Error())
+			h.logWarn("message: BuildUserMessage failed", "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 
 			return
@@ -565,13 +631,14 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		if err := h.tracker.WriteStdinChat(payload.SessionID, b); err != nil {
 			switch {
 			case errors.Is(err, tracker.ErrNotTracked):
-				writeError(w, http.StatusNotFound, CodeNotFound, "no chat container tracked")
+				writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
 			case errors.Is(err, tracker.ErrStdinClosed):
 				writeError(w, http.StatusGone, CodeStdinClosed, "session ended")
 			case errors.Is(err, tracker.ErrNoStdinAttached):
-				writeError(w, http.StatusConflict, CodeConflict, "container is not interactive")
+				writeError(w, http.StatusConflict, CodeConflict, MsgNotInteractive)
 			default:
-				h.logWarn("message: chat stdin write failed", "session_id", payload.SessionID, "error", err.Error())
+				h.logWarn("message: chat stdin write failed", "session_id", payload.SessionID, "error", err.Error(),
+					"correlation_id", correlationIDFromContext(r.Context()))
 				writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 			}
 
@@ -588,7 +655,8 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.logInfo("message: chat stdin written",
-			"session_id", payload.SessionID, "message_id", payload.MessageID, "content_len", len(payload.Content))
+			"session_id", payload.SessionID, "message_id", payload.MessageID, "content_len", len(payload.Content),
+			"correlation_id", correlationIDFromContext(r.Context()))
 
 		// Marshal the success ack once so retries see byte-identical bytes
 		// from the dedup cache. A marshal error here is an internal bug,
@@ -628,7 +696,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 	// 404 if no container is tracked for this (project, card_id).
 	if !h.tracker.Has(payload.Project, payload.CardID) {
-		writeError(w, http.StatusNotFound, CodeNotFound, "no container tracked")
+		writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
 
 		return
 	}
@@ -636,7 +704,8 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Build the Claude Code stream-json user message.
 	b, err := streammsg.BuildUserMessage(payload.Content)
 	if err != nil {
-		h.logWarn("message: BuildUserMessage failed", "error", err.Error())
+		h.logWarn("message: BuildUserMessage failed", "error", err.Error(),
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 
 		return
@@ -650,7 +719,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, tracker.ErrNotTracked):
 			// TOCTOU: entry was Removed between Has and WriteStdin.
-			writeError(w, http.StatusNotFound, CodeNotFound, "no container tracked")
+			writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
 		case errors.Is(err, tracker.ErrStdinClosed):
 			// M39: session has ended (stdin was attached, then closed by
 			// /end-session, CloseStdin, or Remove). 410 Gone tells the
@@ -660,10 +729,11 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, tracker.ErrNoStdinAttached):
 			// Container is tracked but was never interactive. Client
 			// requested /message on a non-HITL session.
-			writeError(w, http.StatusConflict, CodeConflict, "container is not in interactive mode")
+			writeError(w, http.StatusConflict, CodeConflict, MsgNotInteractive)
 		default:
 			h.logWarn("message: stdin write failed",
-				"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
+				"card_id", payload.CardID, "project", payload.Project, "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 		}
 
@@ -679,6 +749,14 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 			Content:   payload.Content,
 		})
 	}
+
+	// Mirror the chat path's Info log on a successful write so operator
+	// dashboards see symmetric "stdin written" signals across both modes.
+	// Fix W8 in REVIEW.md.
+	h.logInfo("message: card stdin written",
+		"card_id", payload.CardID, "project", payload.Project,
+		"message_id", payload.MessageID, "content_len", len(payload.Content),
+		"correlation_id", correlationIDFromContext(r.Context()))
 
 	// Marshal the success ack once so we can cache it byte-identically
 	// for retries. Any marshal error here is an internal bug, not a
@@ -727,7 +805,8 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 
 	var payload PromotePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		h.logDebug("promote: invalid JSON", "error", err)
+		h.logDebug("promote: invalid JSON", "error", err,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
 
 		return
@@ -741,7 +820,7 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 
 	// 404 if no container is tracked for this (project, card_id).
 	if !h.tracker.Has(payload.Project, payload.CardID) {
-		writeError(w, http.StatusNotFound, CodeNotFound, "no container tracked")
+		writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
 
 		return
 	}
@@ -750,31 +829,90 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	// Using GET (not POST) avoids re-triggering the webhook and breaking the
 	// infinite promote loop. Fail closed: refuse to write stdin unless CM
 	// confirms autonomous=true.
-	if h.cmClient != nil {
-		autonomous, err := h.cmClient.VerifyAutonomous(r.Context(), payload.Project, payload.CardID)
-		if err != nil {
-			h.logVerifyAutonomousFailure(payload, err)
-			writeUpstreamUnavailable(w)
-
-			return
+	//
+	// Fix W5 in REVIEW.md: a nil cmClient previously bypassed the entire
+	// policy gate, making the safety property a function of production
+	// wiring discipline rather than a hard invariant. We can't make
+	// cmClient required at construction time without rewriting ~80
+	// test-side NewHandler call sites, so we fail-closed here instead:
+	// production wiring in cmd/contextmatrix-runner/main.go always supplies
+	// a real client; this branch fires only in tests that deliberately
+	// exercise it (and in any future regression where cmClient is left
+	// unwired).
+	//
+	// Fix W3 in REVIEW.md: this is a runner-side misconfiguration, not an
+	// unreachable upstream — surface it as 500/CodeInternal rather than
+	// 502/CodeUpstreamFailure so operator dashboards don't blame CM for a
+	// problem on our side.
+	if h.cmClient == nil {
+		if h.logger != nil {
+			h.logger.Error("promote rejected: cmClient is not configured (runner misconfiguration)",
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"correlation_id", correlationIDFromContext(r.Context()),
+			)
 		}
 
-		if !autonomous {
-			if h.logger != nil {
-				h.logger.Warn("promote rejected: card autonomous flag is not set on contextmatrix",
-					"card_id", payload.CardID,
-					"project", payload.Project,
-				)
-			}
+		writeError(w, http.StatusInternalServerError, CodeInternal, "autonomous verification not configured")
 
-			writeError(w, http.StatusForbidden, CodeConflict, "card autonomous flag is not set on contextmatrix")
-
-			return
-		}
+		return
 	}
 
-	// Publish system LogEntry BEFORE the stdin write so the browser sees the
-	// mode switch in the correct order.
+	autonomous, err := h.cmClient.VerifyAutonomous(r.Context(), payload.Project, payload.CardID)
+	if err != nil {
+		h.logVerifyAutonomousFailure(payload, err)
+		writeUpstreamUnavailable(w)
+
+		return
+	}
+
+	if !autonomous {
+		if h.logger != nil {
+			h.logger.Warn("promote rejected: card autonomous flag is not set on contextmatrix",
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"correlation_id", correlationIDFromContext(r.Context()),
+			)
+		}
+
+		writeError(w, http.StatusForbidden, CodeForbidden, "card autonomous flag is not set on contextmatrix")
+
+		return
+	}
+
+	b, err := streammsg.BuildUserMessage(autonomousContent)
+	if err != nil {
+		h.logWarn("promote: BuildUserMessage failed", "error", err.Error(),
+			"correlation_id", correlationIDFromContext(r.Context()))
+		writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
+
+		return
+	}
+
+	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
+		switch {
+		case errors.Is(err, tracker.ErrNotTracked):
+			writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
+		case errors.Is(err, tracker.ErrStdinClosed):
+			writeError(w, http.StatusGone, CodeStdinClosed, "session ended")
+		case errors.Is(err, tracker.ErrNoStdinAttached):
+			writeError(w, http.StatusConflict, CodeConflict, MsgNotInteractive)
+		default:
+			h.logWarn("promote: stdin write failed",
+				"card_id", payload.CardID, "project", payload.Project, "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
+		}
+
+		return
+	}
+
+	// Publish system LogEntry only AFTER the stdin write succeeded so the
+	// UI never sees a phantom "promoted to autonomous mode" line for a
+	// promotion that actually failed (e.g. non-interactive container,
+	// stdin closed). Mirrors the pattern used by handleEndSession, which
+	// only publishes its "session ended" entry on success. Fix W4 in
+	// REVIEW.md.
 	if h.broadcaster != nil {
 		h.broadcaster.Publish(logbroadcast.LogEntry{
 			Timestamp: time.Now(),
@@ -785,37 +923,13 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	b, err := streammsg.BuildUserMessage(autonomousContent)
-	if err != nil {
-		h.logWarn("promote: BuildUserMessage failed", "error", err.Error())
-		writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
-
-		return
-	}
-
-	if err := h.tracker.WriteStdin(payload.Project, payload.CardID, b); err != nil {
-		switch {
-		case errors.Is(err, tracker.ErrNotTracked):
-			writeError(w, http.StatusNotFound, CodeNotFound, "no container tracked")
-		case errors.Is(err, tracker.ErrStdinClosed):
-			writeError(w, http.StatusGone, CodeStdinClosed, "session ended")
-		case errors.Is(err, tracker.ErrNoStdinAttached):
-			writeError(w, http.StatusConflict, CodeConflict, "container is not in interactive mode")
-		default:
-			h.logWarn("promote: stdin write failed",
-				"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
-			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
-		}
-
-		return
-	}
-
 	// Close stdin so the container's claude process receives EOF and exits
 	// cleanly. An already-closed stdin (e.g. a racing /end-session) is not a
 	// failure of /promote — log a warning and still return 200.
 	if err := h.tracker.CloseStdin(payload.Project, payload.CardID); err != nil {
 		h.logWarn("promote: close stdin after write failed (non-fatal)",
-			"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
+			"card_id", payload.CardID, "project", payload.Project, "error", err.Error(),
+			"correlation_id", correlationIDFromContext(r.Context()))
 	}
 
 	writeSuccess(w, http.StatusAccepted, "")
@@ -836,17 +950,32 @@ func (h *Handler) handleRefreshKnowledge(w http.ResponseWriter, r *http.Request)
 
 	var payload RefreshKnowledgePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		h.logDebug("refresh-knowledge: invalid JSON", "error", err)
+		h.logDebug("refresh-knowledge: invalid JSON", "error", err,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
 
 		return
 	}
 
-	if err := ValidateRefreshKnowledge(&payload); err != nil {
+	if err := ValidatePayload(&payload); err != nil {
 		writeValidationError(w, err)
 
 		return
 	}
+
+	// Start an OTel span covering the synchronous half of /refresh-knowledge
+	// (admission check + Manager.Run kickoff) so the request shows up in the
+	// trace tree alongside webhook.trigger. The detached ctx below does not
+	// inherit request cancellation, so the span is ended explicitly when
+	// the handler returns. Fix W3 in REVIEW.md.
+	_, span := otel.Tracer("cmr").Start(r.Context(), "webhook.refresh_knowledge")
+	span.SetAttributes(
+		attribute.String("project", payload.Project),
+		attribute.String("repo", payload.Repo),
+		attribute.String("agent_id", payload.AgentID),
+	)
+
+	defer span.End()
 
 	// Detached context — the container must outlive the HTTP request.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -879,10 +1008,12 @@ func (h *Handler) handleRefreshKnowledge(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusTooManyRequests, CodeLimitReached, "concurrency limit reached")
 		case errors.Is(err, tracker.ErrAlreadyTracked):
 			h.logDebug("refresh-knowledge: already tracked",
-				"project", payload.Project, "repo", payload.Repo)
+				"project", payload.Project, "repo", payload.Repo,
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusConflict, CodeConflict, "conflicting container state")
 		default:
-			h.logWarn("refresh-knowledge: tracker add failed", "error", err.Error())
+			h.logWarn("refresh-knowledge: tracker add failed", "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 		}
 
@@ -925,7 +1056,8 @@ func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
 
 	var payload EndSessionPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		h.logDebug("end-session: invalid JSON", "error", err)
+		h.logDebug("end-session: invalid JSON", "error", err,
+			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusBadRequest, CodeInvalidJSON, "invalid JSON")
 
 		return
@@ -938,7 +1070,7 @@ func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !h.tracker.Has(payload.Project, payload.CardID) {
-		writeError(w, http.StatusNotFound, CodeNotFound, "no container tracked")
+		writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
 
 		return
 	}
@@ -948,12 +1080,20 @@ func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, tracker.ErrNotTracked):
 			// TOCTOU: the entry was Removed between our Has and CloseStdin.
 			// Same semantic as a 404 — nothing to close.
-			writeError(w, http.StatusNotFound, CodeNotFound, "no container tracked")
+			writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
+		case errors.Is(err, tracker.ErrStdinClosed):
+			// Idempotent retry: stdin was attached earlier and has since
+			// been closed (a previous /end-session, or the cleanup path).
+			// 410 Gone tells the caller the resource is permanently
+			// unavailable — no point retrying. Mirrors /message's
+			// ErrStdinClosed mapping. Fix W5 in REVIEW.md.
+			writeError(w, http.StatusGone, CodeStdinClosed, "session ended")
 		case errors.Is(err, tracker.ErrNoStdinAttached):
-			writeError(w, http.StatusConflict, CodeConflict, "container is not in interactive mode")
+			writeError(w, http.StatusConflict, CodeConflict, MsgNotInteractive)
 		default:
 			h.logWarn("end-session: close stdin failed",
-				"card_id", payload.CardID, "project", payload.Project, "error", err.Error())
+				"card_id", payload.CardID, "project", payload.Project, "error", err.Error(),
+				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 		}
 
@@ -974,7 +1114,13 @@ func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogs streams log entries via Server-Sent Events (SSE).
-// An optional ?project= query parameter filters entries by project name.
+//
+// Filters (mutually exclusive — supplying both is a 400 invalid_field):
+//   - ?project=<name>     restricts to card-mode entries for that project.
+//   - ?session_id=<id>    restricts to chat-mode entries for that session.
+//
+// With neither filter the stream receives every entry the broadcaster fans
+// out, which is the default subscription path used by operator tooling.
 func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -988,6 +1134,17 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	if project != "" && sessionID != "" {
 		writeError(w, http.StatusBadRequest, CodeInvalidField, "project and session_id are mutually exclusive")
+
+		return
+	}
+
+	// Defence-in-depth: every other handler that touches the broadcaster
+	// nil-guards it; SSE was previously alone in trusting the field to be
+	// wired. A test fixture that constructs a Handler literal without a
+	// broadcaster (or any future regression) would panic here. Fix W4 in
+	// REVIEW.md.
+	if h.broadcaster == nil {
+		writeError(w, http.StatusInternalServerError, CodeInternal, "log broadcaster not configured")
 
 		return
 	}
@@ -1119,6 +1276,27 @@ func (h *Handler) AdminAuth(next http.HandlerFunc) http.HandlerFunc {
 // collapsing it into the generic 401 would lose diagnostic signal for CM.
 func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Content-Length precheck: hmacAuth reads at most maxRequestBodyBytes
+		// (1 MiB) below, so any larger body would be silently truncated and
+		// fail signature verification — producing a misleading 401 instead
+		// of a 413 the client can react to. Validators (e.g. chatResume*) cap
+		// their per-field sizes but their worst-case product can still exceed
+		// 1 MiB before truncation, which is the user-visible failure mode
+		// this guard prevents. Streaming bodies without a declared
+		// Content-Length still fall through to the LimitReader below; that
+		// path remains a 401, since we cannot distinguish "too large" from
+		// "signature mismatch" without reading the bytes.
+		// Fix W1 / W10 in REVIEW.md.
+		if r.ContentLength > maxRequestBodyBytes {
+			h.logDebug("hmac auth: content-length exceeds cap",
+				"remote_addr", r.RemoteAddr,
+				"content_length", r.ContentLength,
+				"max", int64(maxRequestBodyBytes))
+			writeError(w, http.StatusRequestEntityTooLarge, CodeTooLarge, "request body too large")
+
+			return
+		}
+
 		sigHeader := r.Header.Get(cmhmac.SignatureHeader)
 		if sigHeader == "" {
 			h.logDebug("hmac auth: missing signature header", "remote_addr", r.RemoteAddr)
@@ -1135,7 +1313,7 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes))
 		if err != nil {
 			// A truncated / unreadable body is indistinguishable (to a
 			// client) from a signature mismatch — both surface as 401.
@@ -1147,6 +1325,21 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		sig := strings.TrimPrefix(sigHeader, "sha256=")
 
+		// webhookReplaySkew == 0 means "use the library default"
+		// (cmhmac.DefaultMaxClockSkew) — NOT "reject every request
+		// because the allowed window is zero seconds". This fallback
+		// exists so test fixtures that construct a Handler literal
+		// without specifying skew still behave reasonably; production
+		// wiring in main.go always passes a positive value derived from
+		// config.WebhookReplaySkewSeconds. Operators that want a strict
+		// clock-skew bound must set webhook_replay_skew_seconds to a
+		// small positive integer (e.g. 30). Config.Validate() rejects
+		// negative values and caps the max at one week but currently
+		// treats 0 as "unset". Tightening the config validator to
+		// reject an explicit 0 is tracked as a follow-up in the config
+		// package; this branch is the runtime safety net so the
+		// behaviour is at least consistent regardless of how skew got
+		// to 0. Fix W11 in REVIEW.md.
 		skew := h.webhookReplaySkew
 		if skew == 0 {
 			skew = cmhmac.DefaultMaxClockSkew
