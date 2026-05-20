@@ -59,6 +59,93 @@ func signedRequest(t *testing.T, path string, payload any) *http.Request {
 	return req
 }
 
+// TestHmacAuth_ContentLengthExceedsCap pins Fix W1/W10: a request whose
+// Content-Length header exceeds the 1 MiB read cap must be rejected with
+// 413 (CodeTooLarge) BEFORE the io.LimitReader silently truncates it.
+// Without the precheck, validators that allow oversized payloads (e.g.
+// chatResumeMaxTurns × chatResumeMaxContentBytes can exceed 1 MiB) would
+// produce a misleading 401 because the signature was computed over the
+// full body but only the truncated body reaches verification.
+func TestHmacAuth_ContentLengthExceedsCap(t *testing.T) {
+	h := &Handler{apiKey: testAPIKey}
+	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("handler should not be called: 413 must short-circuit")
+	})
+
+	w := httptest.NewRecorder()
+	// Body itself can be tiny; only the declared Content-Length is checked.
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/trigger",
+		strings.NewReader("{}"))
+	req.ContentLength = int64(maxRequestBodyBytes) + 1
+	req.Header.Set(cmhmac.SignatureHeader, "sha256=abc")
+	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
+
+	handler(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code,
+		"oversized Content-Length must produce 413, not 401")
+
+	var resp ErrorResponse
+
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, CodeTooLarge, resp.Code)
+	assert.False(t, resp.OK)
+}
+
+// TestHmacAuth_ContentLengthAtCap verifies a Content-Length exactly at the
+// cap is allowed (still rejected with 401 because the signature is fake,
+// but NOT rejected with 413 first). Boundary case for W1.
+func TestHmacAuth_ContentLengthAtCap(t *testing.T) {
+	h := &Handler{apiKey: testAPIKey}
+	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("handler should not be called: bad signature must 401")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/trigger",
+		strings.NewReader("{}"))
+	req.ContentLength = int64(maxRequestBodyBytes) // exactly at the cap
+	req.Header.Set(cmhmac.SignatureHeader, "sha256=abc")
+	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
+
+	handler(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"Content-Length exactly at the cap must NOT be rejected as too large")
+}
+
+// TestHmacAuth_NoContentLengthOversizeStreamingBody pins the fallback path
+// of Fix W1: a chunked-encoding request whose Content-Length is -1 cannot
+// be prechecked, so the LimitReader inside hmacAuth still bounds the read.
+// The signature was computed over the FULL body; the truncated body fails
+// verification, producing 401. This is the documented fallback behavior:
+// we cannot return 413 for streaming bodies because we'd have to read them
+// first to know they were oversized.
+func TestHmacAuth_NoContentLengthOversizeStreamingBody(t *testing.T) {
+	h := &Handler{apiKey: testAPIKey}
+	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("handler should not be called: truncated body must 401")
+	})
+
+	// Build a request without Content-Length by reading from a body that
+	// produces more bytes than the cap. httptest.NewRequest sets
+	// ContentLength based on the io.Reader's length when known; using a
+	// LimitReader+strings.NewReader gives us len-unknown stream.
+	body := strings.Repeat("x", maxRequestBodyBytes+10)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/trigger",
+		io.NopCloser(strings.NewReader(body)))
+	req.ContentLength = -1 // simulate unknown / chunked
+	req.Header.Set(cmhmac.SignatureHeader, "sha256=abc")
+	req.Header.Set(cmhmac.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
+
+	handler(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"unknown Content-Length must fall back to LimitReader → 401, not panic")
+}
+
 func TestHmacAuth_MissingSignature(t *testing.T) {
 	h := &Handler{apiKey: testAPIKey}
 	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
@@ -192,7 +279,7 @@ func TestHandleTrigger_MissingFields(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 }
@@ -269,7 +356,7 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 	// cause a 400) and the duplicate check fired as expected.
 	assert.Equal(t, http.StatusConflict, w.Code)
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 	assert.NotContains(t, resp.Message, "invalid JSON")
@@ -368,6 +455,8 @@ func (f *reconcileFakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) 
 func (f *reconcileFakeRunner) WaitAndCleanupChat(_, _, _ string) {}
 
 func (f *reconcileFakeRunner) DeleteChatCleanup(_ string) {}
+
+func (f *reconcileFakeRunner) KillChat(_ context.Context, _ string) error { return nil }
 
 // TestHandleListContainers_ReturnsDockerAuthoritativeList confirms that the
 // endpoint surfaces every ManagedContainer returned by the manager, including
@@ -585,6 +674,8 @@ func (f *fakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
 func (f *fakeRunner) WaitAndCleanupChat(_, _, _ string) {}
 
 func (f *fakeRunner) DeleteChatCleanup(_ string) {}
+
+func (f *fakeRunner) KillChat(_ context.Context, _ string) error { return nil }
 
 // TestHandleTrigger_InteractivePropagated verifies that the Interactive field from the
 // JSON trigger body is correctly propagated into the RunConfig passed to the manager.
@@ -906,7 +997,7 @@ func TestHandleMessage_HappyPath(t *testing.T) {
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var resp Response
+	var resp SuccessResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.True(t, resp.OK)
 	assert.Equal(t, "msg-abc-123", resp.MessageID)
@@ -1008,7 +1099,7 @@ func TestHandleMessage_409_NoStdin(t *testing.T) {
 
 	assert.Equal(t, http.StatusConflict, w.Code)
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 
@@ -1052,14 +1143,35 @@ func TestHandleMessage_401_InvalidHMAC(t *testing.T) {
 
 // --- /promote handler tests ---
 
+// autonomousTrueServer starts an httptest server that always returns
+// autonomous=true so /promote happy-path tests can satisfy the W5 fail-closed
+// gate (cmClient is required; nil cmClient now produces a 502). The server is
+// torn down via t.Cleanup so callers don't need an extra defer.
+func autonomousTrueServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"autonomous":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv
+}
+
 // setupPromoteHandler builds a Handler with a tracker that has a container
-// registered (optionally with stdin attached) and a broadcaster.
+// registered (optionally with stdin attached), a broadcaster, and a real
+// callback.Client pointed at a fake CM that returns autonomous=true. After
+// fix W5, /promote refuses to write to stdin unless cmClient.VerifyAutonomous
+// returns true — so happy-path tests need a server, not a nil client.
 func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.Broadcaster, *fakeWriteCloser) {
 	t.Helper()
 
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	srv := autonomousTrueServer(t)
+	cmClient := callback.NewClient(srv.URL, "key", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testMCPURL, nil, 0, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1091,7 +1203,7 @@ func TestHandlePromote_HappyPath(t *testing.T) {
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var resp Response
+	var resp SuccessResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.True(t, resp.OK)
 
@@ -1185,7 +1297,7 @@ func TestHandlePromote_409_NoStdin(t *testing.T) {
 
 	assert.Equal(t, http.StatusConflict, w.Code)
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 }
@@ -1204,8 +1316,11 @@ func TestHandlePromote_401_InvalidHMAC(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
-	// Verify that the system LogEntry is published before the stdin write occurs.
+func TestHandlePromote_PublishAfterStdinSuccess(t *testing.T) {
+	// W4: the system LogEntry must be published only AFTER the stdin write
+	// succeeds — never before — so a failed write does not leave a phantom
+	// "promoted to autonomous mode" line in the UI. The previous ordering
+	// asserted "publish first, then write"; that was the bug W4 fixed.
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
 
@@ -1213,7 +1328,10 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 	stdinWritten := make(chan struct{}, 1)
 	controlled := &controlledWriteCloser{writeCh: stdinWritten}
 
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	srv := autonomousTrueServer(t)
+	cmClient := callback.NewClient(srv.URL, "key", slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testMCPURL, nil, 0, nil)
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
 		Project: "my-project",
@@ -1230,7 +1348,16 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	// The system LogEntry must arrive on the subscriber channel.
+	// The stdin write must have happened (signal sent before handler returned).
+	select {
+	case <-stdinWritten:
+		// good — write occurred
+	default:
+		t.Fatal("stdin was not written")
+	}
+
+	// The system LogEntry must arrive on the subscriber channel after the
+	// successful stdin write.
 	select {
 	case entry := <-ch:
 		assert.Equal(t, "system", entry.Type)
@@ -1238,13 +1365,47 @@ func TestHandlePromote_OrderingSystemBeforeStdin(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for system LogEntry")
 	}
+}
 
-	// The stdin write must have happened (signal sent before handler returned).
+// TestHandlePromote_NoPublishOnStdinFailure verifies the W4 invariant from the
+// other direction: when WriteStdin fails (here: no stdin attached → 409), the
+// handler must NOT publish the "promoted to autonomous mode" system LogEntry.
+// Previously the broadcaster.Publish call ran before WriteStdin, so a phantom
+// promotion line appeared in the UI for a promote that actually errored out.
+func TestHandlePromote_NoPublishOnStdinFailure(t *testing.T) {
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+
+	srv := autonomousTrueServer(t)
+	cmClient := callback.NewClient(srv.URL, "key", slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+	// Deliberately NO SetStdin — WriteStdin will return ErrNoStdinAttached.
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	require.Equal(t, http.StatusConflict, w.Code,
+		"non-interactive container must produce 409 from /promote")
+
+	// No system LogEntry must arrive: the failed promote must not echo into
+	// the broadcaster. Give the handler enough time to publish if it would
+	// erroneously do so (Publish is synchronous so this is generous).
 	select {
-	case <-stdinWritten:
-		// good — write occurred
-	default:
-		t.Fatal("stdin was not written")
+	case entry := <-ch:
+		t.Fatalf("no LogEntry should have been published, but got: type=%q content=%q",
+			entry.Type, entry.Content)
+	case <-time.After(100 * time.Millisecond):
+		// good — nothing published
 	}
 }
 
@@ -1323,7 +1484,7 @@ func TestHandlePromote_APIFailure_FailClosed(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, w.Code, "CM error must produce 502")
 	assert.Empty(t, fw.buf, "stdin must NOT be written when CM returns error")
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 }
@@ -1409,9 +1570,10 @@ func TestHandlePromote_AutonomousFalse_FailClosed(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code, "autonomous=false must produce 403")
 	assert.Empty(t, fw.buf, "stdin must NOT be written when autonomous=false")
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
+	assert.Equal(t, CodeForbidden, resp.Code, "autonomous=false must use CodeForbidden, not CodeConflict")
 	assert.Contains(t, resp.Message, "autonomous flag is not set")
 }
 
@@ -1443,7 +1605,7 @@ func TestHandlePromote_ClosesStdinOnSuccess(t *testing.T) {
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var resp Response
+	var resp SuccessResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.True(t, resp.OK)
 
@@ -1456,7 +1618,9 @@ func TestHandlePromote_EndSessionIdempotentAfterPromote(t *testing.T) {
 	// the idempotent 409 (stdin already closed) without panicking.
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	srv := autonomousTrueServer(t)
+	cmClient := callback.NewClient(srv.URL, "key", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testMCPURL, nil, 0, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1474,11 +1638,75 @@ func TestHandlePromote_EndSessionIdempotentAfterPromote(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, wp.Code)
 	require.True(t, fw.closed, "stdin must be closed by /promote before /end-session")
 
-	// /end-session on already-closed stdin returns 409 (idempotent, not a panic).
+	// /end-session on already-closed stdin returns 410 Gone (idempotent
+	// retry; the session was active and has been closed). Fix W5: this
+	// case used to share the 409 sentinel with "container is non-
+	// interactive", which is misleading — the container WAS interactive
+	// and is now over.
 	endPayload := EndSessionPayload{CardID: "PROJ-001", Project: "my-project"}
 	we := httptest.NewRecorder()
 	h.hmacAuth(h.handleEndSession)(we, signedRequest(t, "/end-session", endPayload))
-	assert.Equal(t, http.StatusConflict, we.Code, "/end-session after /promote must return 409")
+	assert.Equal(t, http.StatusGone, we.Code, "/end-session after /promote must return 410")
+
+	var resp ErrorResponse
+	require.NoError(t, json.Unmarshal(we.Body.Bytes(), &resp))
+	assert.Equal(t, CodeStdinClosed, resp.Code, "/end-session idempotent retry must use stdin_closed code")
+}
+
+// TestHandlePromote_NilCMClient_500Internal verifies the W3 fix: a /promote
+// against a runner whose cmClient was never wired must return 500 with
+// CodeInternal, not 502 with CodeUpstreamFailure. The original 502 implied
+// "CM is unreachable" but the actual cause is runner-side misconfiguration —
+// surface it as such so operator dashboards do not blame CM.
+func TestHandlePromote_NilCMClient_500Internal(t *testing.T) {
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	// cmClient = nil deliberately exercises the misconfiguration branch.
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+
+	fw := &fakeWriteCloser{}
+	tr.SetStdin("my-project", "PROJ-001", fw, nil)
+
+	payload := PromotePayload{CardID: "PROJ-001", Project: "my-project"}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/promote", payload)
+	h.hmacAuth(h.handlePromote)(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code,
+		"nil cmClient is a runner-side misconfiguration → 500, not 502")
+
+	var resp ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.False(t, resp.OK)
+	assert.Equal(t, CodeInternal, resp.Code,
+		"misconfiguration must surface as CodeInternal, not CodeUpstreamFailure")
+	assert.Empty(t, fw.buf, "stdin must NOT be written when cmClient is misconfigured")
+}
+
+// TestHandleLogs_NilBroadcaster_500Internal verifies the W4 fix: handleLogs
+// nil-guards the broadcaster like every other handler that touches it.
+// Without the guard a Handler constructed with a nil broadcaster would
+// panic on /logs.
+func TestHandleLogs_NilBroadcaster_500Internal(t *testing.T) {
+	// Broadcaster deliberately nil. Don't subscribe; we just want to confirm
+	// the handler returns a structured 500 instead of panicking.
+	h := NewHandler(nil, tracker.New(), nil, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	req := signedGETRequest(t, "/logs")
+
+	w := newFlushRecorder()
+	h.hmacAuth(h.handleLogs)(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code,
+		"nil broadcaster must surface as a structured 500, not a panic")
+
+	var resp ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, CodeInternal, resp.Code)
 }
 
 func TestHandlePromote_WriteFailure_StdinNotClosed(t *testing.T) {
@@ -1486,7 +1714,9 @@ func TestHandlePromote_WriteFailure_StdinNotClosed(t *testing.T) {
 	// close stdin and must return the existing error response.
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
-	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+	srv := autonomousTrueServer(t)
+	cmClient := callback.NewClient(srv.URL, "key", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := NewHandler(nil, tr, b, cmClient, testAPIKey, 3, testMCPURL, nil, 0, nil)
 
 	require.NoError(t, tr.Add(&tracker.ContainerInfo{
 		CardID:  "PROJ-001",
@@ -1504,7 +1734,7 @@ func TestHandlePromote_WriteFailure_StdinNotClosed(t *testing.T) {
 	// The write failure should produce an error response (500 internal error).
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 
@@ -1602,7 +1832,7 @@ func TestHandleEndSession_HappyPath(t *testing.T) {
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var resp Response
+	var resp SuccessResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.True(t, resp.OK)
 
@@ -1685,7 +1915,7 @@ func TestHandleEndSession_409_NoStdin(t *testing.T) {
 
 	assert.Equal(t, http.StatusConflict, w.Code)
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 
@@ -1727,12 +1957,52 @@ func TestHandleEndSession_Idempotent(t *testing.T) {
 	h.hmacAuth(h.handleEndSession)(w1, signedRequest(t, "/end-session", payload))
 	require.Equal(t, http.StatusAccepted, w1.Code)
 
-	// Second call finds no stdin attached and returns 409.
+	// Second call distinguishes "had stdin, closed" (410 Gone, idempotent
+	// retry) from "never had stdin" (409 Conflict, non-interactive). Fix
+	// W5: the pre-fix code collapsed both into 409, which made retried
+	// /end-session indistinguishable from /end-session against a card
+	// that was never interactive — operators couldn't tell whether their
+	// retry succeeded or whether the container ran in autonomous mode
+	// all along.
 	w2 := httptest.NewRecorder()
 	h.hmacAuth(h.handleEndSession)(w2, signedRequest(t, "/end-session", payload))
-	assert.Equal(t, http.StatusConflict, w2.Code)
+	assert.Equal(t, http.StatusGone, w2.Code, "second /end-session must return 410, not 409")
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w2.Body).Decode(&resp))
+	assert.Equal(t, CodeStdinClosed, resp.Code,
+		"second /end-session must use stdin_closed code, not conflict")
 
 	assert.Equal(t, 1, closeCount, "writer must be closed exactly once across two /end-session calls")
+}
+
+// TestHandleEndSession_NeverInteractive_409 is the negative case of
+// TestHandleEndSession_Idempotent: a /end-session against a container
+// that was never made interactive (SetStdin never called) must still
+// return 409 with CodeConflict / MsgNotInteractive, not 410. This
+// preserves the existing semantics of W5 — only "was interactive, now
+// closed" maps to 410.
+func TestHandleEndSession_NeverInteractive_409(t *testing.T) {
+	tr := tracker.New()
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	h := NewHandler(nil, tr, b, nil, testAPIKey, 3, testMCPURL, nil, 0, nil)
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  "PROJ-001",
+		Project: "my-project",
+	}))
+	// Deliberately do NOT call SetStdin so info.stdin is nil → 409.
+
+	payload := EndSessionPayload{CardID: "PROJ-001", Project: "my-project"}
+
+	w := httptest.NewRecorder()
+	h.hmacAuth(h.handleEndSession)(w, signedRequest(t, "/end-session", payload))
+	require.Equal(t, http.StatusConflict, w.Code)
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, CodeConflict, resp.Code,
+		"never-interactive /end-session must keep the 409/conflict shape")
 }
 
 // countingWriteCloser counts Close calls. Defined in tracker_test.go of the
@@ -1808,6 +2078,21 @@ func (s *stopAllFakeRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
 func (s *stopAllFakeRunner) WaitAndCleanupChat(_, _, _ string) {}
 
 func (s *stopAllFakeRunner) DeleteChatCleanup(_ string) {}
+
+// KillChat records a chat-mode kill the same way Kill records a card-mode kill,
+// so /stop-all tests can assert which sessions were dispatched to KillChat.
+func (s *stopAllFakeRunner) KillChat(_ context.Context, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.failFor["session:"+sessionID] {
+		return s.killErr
+	}
+
+	s.killed = append(s.killed, "session:"+sessionID)
+
+	return nil
+}
 
 func (s *stopAllFakeRunner) killedIDs() []string {
 	s.mu.Lock()
@@ -1932,6 +2217,94 @@ func TestHandleStopAll_KillFailureOnOneCard(t *testing.T) {
 	killed := fake.killedIDs()
 	assert.ElementsMatch(t, []string{"alpha/A-001", "alpha/A-003"}, killed,
 		"only non-failing cards should appear in killed list")
+}
+
+// TestHandleStopAll_ChatOnly verifies that chat-mode tracker entries are
+// dispatched through KillChat (not Kill, which would miss them because the
+// chat lookup key is chatKey(sessionID) and CardID is empty).
+func TestHandleStopAll_ChatOnly(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{SessionID: "sess-A"}))
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{SessionID: "sess-B"}))
+
+	fake := &stopAllFakeRunner{}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/stop-all", StopAllPayload{})
+	h.hmacAuth(h.handleStopAll)(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "all chat kills succeeded; expect 200")
+
+	var resp StopAllResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.OK)
+	assert.Equal(t, 2, resp.Total)
+	assert.Equal(t, 2, resp.Stopped)
+	assert.Equal(t, 0, resp.Failed)
+
+	// stopAllFakeRunner.KillChat records "session:<id>"; Kill records
+	// "<project>/<card_id>". Chat-only run must dispatch only via KillChat.
+	killed := fake.killedIDs()
+	assert.ElementsMatch(t, []string{"session:sess-A", "session:sess-B"}, killed,
+		"chat-mode entries must route through KillChat, not Kill")
+
+	// Each result entry must carry SessionID (not CardID).
+	for _, r := range resp.Results {
+		assert.NotEmpty(t, r.SessionID, "chat-mode result must populate session_id")
+		assert.Empty(t, r.CardID, "chat-mode result must not populate card_id")
+		assert.True(t, r.OK)
+	}
+}
+
+// TestHandleStopAll_MixedCardAndChat verifies that a /stop-all batch
+// containing both card-mode and chat-mode tracker entries dispatches each
+// to the right method and reports both kinds in the per-entry results.
+func TestHandleStopAll_MixedCardAndChat(t *testing.T) {
+	tr := tracker.New()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{CardID: "CARD-A", Project: "proj"}))
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{SessionID: "sess-A"}))
+
+	fake := &stopAllFakeRunner{}
+	h := NewHandler(fake, tr, nil, nil, testAPIKey, 10, testMCPURL,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/stop-all", StopAllPayload{})
+	h.hmacAuth(h.handleStopAll)(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp StopAllResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, 2, resp.Stopped)
+	assert.Equal(t, 0, resp.Failed)
+
+	killed := fake.killedIDs()
+	assert.ElementsMatch(t, []string{"proj/CARD-A", "session:sess-A"}, killed,
+		"mixed batch must dispatch card via Kill and chat via KillChat")
+
+	// Confirm result entries carry the right identifier per kind.
+	gotCard := false
+	gotChat := false
+
+	for _, r := range resp.Results {
+		switch {
+		case r.CardID != "":
+			gotCard = true
+
+			assert.Equal(t, "CARD-A", r.CardID)
+			assert.Equal(t, "proj", r.Project)
+		case r.SessionID != "":
+			gotChat = true
+
+			assert.Equal(t, "sess-A", r.SessionID)
+		}
+	}
+
+	assert.True(t, gotCard, "expected a card_id entry in Results")
+	assert.True(t, gotChat, "expected a session_id entry in Results")
 }
 
 func TestHandleStopAll_InvalidJSON(t *testing.T) {
@@ -2121,7 +2494,7 @@ func TestHandleTrigger_503WhenDraining(t *testing.T) {
 
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 
-	var resp Response
+	var resp ErrorResponse
 
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.False(t, resp.OK)

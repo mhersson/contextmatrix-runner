@@ -300,6 +300,14 @@ func TestRedact(t *testing.T) {
 			want:  "Authorization: [REDACTED]",
 		},
 		{
+			// Regression: base64-padded Bearer tokens used to slip through
+			// because '=' was missing from the character class. The redactor
+			// must mask the entire opaque token including any '=' padding.
+			name:  "Bearer token with base64 padding",
+			input: "Authorization: Bearer dGVzdHRlc3R0ZXN0dGVzdHRlc3R0ZXN0==",
+			want:  "Authorization: [REDACTED]",
+		},
+		{
 			name:  "GitHub App installation token v1",
 			input: "got token v1." + strings.Repeat("a", 40) + " back",
 			want:  "got token [REDACTED] back",
@@ -348,6 +356,56 @@ func TestRedact(t *testing.T) {
 			name:  "short v1.hex not matched (too few hex digits)",
 			input: "version v1.abcdef is fine",
 			want:  "version v1.abcdef is fine",
+		},
+		{
+			name:  "Slack bot token (xoxb-)",
+			input: "secret " + "xoxb" + "-1234567890-1234567890123-abcdefghijklmnopqrstuvwx in env",
+			want:  "secret [REDACTED] in env",
+		},
+		{
+			name:  "Slack user token (xoxp-)",
+			input: "got " + "xoxp" + "-1234567890-1234567890-abcdefghijklmnopqrstuvwx now",
+			want:  "got [REDACTED] now",
+		},
+		{
+			name:  "AWS access key ID",
+			input: "AKIAIOSFODNN7EXAMPLE in config",
+			want:  "[REDACTED] in config",
+		},
+		{
+			name:  "Google API key",
+			input: "key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI was here",
+			want:  "key=[REDACTED] was here",
+		},
+		{
+			name:  "NPM token",
+			input: "npm_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ in .npmrc",
+			want:  "[REDACTED] in .npmrc",
+		},
+		{
+			name:  "generic JWT",
+			input: "jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c shown",
+			want:  "jwt [REDACTED] shown",
+		},
+		{
+			name:  "AWS short key not matched (15 chars after AKIA)",
+			input: "AKIA1234567890ABCDE", // 14 chars after AKIA (one short)
+			want:  "AKIA1234567890ABCDE",
+		},
+		{
+			name:  "CM_MCP_API_KEY quoted value preserves key",
+			input: `CM_MCP_API_KEY="abc 123 def" next-arg`,
+			want:  `CM_MCP_API_KEY=[REDACTED] next-arg`,
+		},
+		{
+			name:  "ANTHROPIC_API_KEY empty quoted value preserves key",
+			input: `ANTHROPIC_API_KEY="" trailing`,
+			want:  `ANTHROPIC_API_KEY=[REDACTED] trailing`,
+		},
+		{
+			name:  "CLAUDE_CODE_OAUTH_TOKEN quoted with internal whitespace",
+			input: `start CLAUDE_CODE_OAUTH_TOKEN="oauth value with spaces" end`,
+			want:  `start CLAUDE_CODE_OAUTH_TOKEN=[REDACTED] end`,
 		},
 	}
 
@@ -754,4 +812,151 @@ func TestParser_IgnoresOtherToolUseEvents(t *testing.T) {
 		_, isSkill := e.(*SkillEngagedEvent)
 		assert.False(t, isSkill, "non-Skill tool_use must not produce SkillEngagedEvent")
 	}
+}
+
+// TestProcessStream_EmitsUsageEntry verifies the wire shape of the "usage"
+// LogEntry pinned to CM's chat-manager contract. The JSON tag mapping is
+// load-bearing: a typo on `cache_creation_input_tokens` →
+// `cache_creation_tokens` would silently zero out the prompt-size column in
+// the CM context-window indicator.
+func TestProcessStream_EmitsUsageEntry(t *testing.T) {
+	// stream-json assistant event with a usage block and a single text
+	// content block (so we know the usage entry is emitted in addition to
+	// the text entry, not in place of it).
+	input := `{"type":"assistant","message":{"model":"claude-opus-4","usage":{` +
+		`"input_tokens":11,"output_tokens":22,` +
+		`"cache_read_input_tokens":33,"cache_creation_input_tokens":44},` +
+		`"content":[{"type":"text","text":"ack"}]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	// Two entries expected: one "usage" + one "text".
+	require.Len(t, emitted, 2)
+
+	usage := emitted[0]
+	assert.Equal(t, "usage", usage.Type)
+	assert.Equal(t, "claude-opus-4", usage.Model)
+	assert.Empty(t, usage.Content, "usage entry must not carry Content")
+	require.NotNil(t, usage.Usage, "usage entry must carry a non-nil Usage block")
+	assert.Equal(t, int64(11), usage.Usage.InputTokens)
+	assert.Equal(t, int64(22), usage.Usage.OutputTokens)
+	assert.Equal(t, int64(33), usage.Usage.CacheReadTokens)
+	// Critical mapping: stream-json sends `cache_creation_input_tokens`,
+	// wire shape exposes it as `cache_creation_tokens`.
+	assert.Equal(t, int64(44), usage.Usage.CacheCreateTokens)
+
+	text := emitted[1]
+	assert.Equal(t, "text", text.Type)
+	assert.Equal(t, "ack", text.Content)
+}
+
+// TestProcessStream_UsageEntryWireJSONShape pins the JSON marshal shape that
+// CM's chat-manager unmarshals. Any rename of a TokenUsage field tag would
+// break the cross-repo contract without a corresponding migration; the
+// assertion captures the exact key names CM relies on.
+func TestProcessStream_UsageEntryWireJSONShape(t *testing.T) {
+	input := `{"type":"assistant","message":{"model":"claude-opus-4","usage":{` +
+		`"input_tokens":1,"output_tokens":2,` +
+		`"cache_read_input_tokens":3,"cache_creation_input_tokens":4},` +
+		`"content":[]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	require.Equal(t, "usage", emitted[0].Type)
+
+	raw, err := json.Marshal(emitted[0])
+	require.NoError(t, err)
+
+	got := string(raw)
+	assert.Contains(t, got, `"input_tokens":1`)
+	assert.Contains(t, got, `"output_tokens":2`)
+	assert.Contains(t, got, `"cache_read_tokens":3`)
+	assert.Contains(t, got, `"cache_creation_tokens":4`)
+	assert.Contains(t, got, `"model":"claude-opus-4"`)
+	assert.Contains(t, got, `"type":"usage"`)
+	// Content must be omitted (omitempty on a usage-only entry).
+	assert.NotContains(t, got, `"content":`)
+}
+
+// TestProcessStream_ScannerError_EmitsSystemEntry verifies that a
+// stream-json line exceeding maxScannerBuf surfaces as a system LogEntry
+// instead of being silently swallowed. Previously bufio.ErrTooLong
+// terminated the for-loop as if EOF; operators had no signal explaining
+// why the rest of Claude's output went missing.
+func TestProcessStream_ScannerError_EmitsSystemEntry(t *testing.T) {
+	// Build a line larger than maxScannerBuf (1 MiB) so bufio.Scanner
+	// returns ErrTooLong. The line need not be valid JSON — the
+	// oversized read fails before json.Unmarshal sees anything.
+	oversized := strings.Repeat("x", (1<<20)+1024)
+
+	logger, records := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(oversized+"\n"), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	// Expect at least one Error record describing the scanner failure.
+	var sawError bool
+
+	for _, r := range *records {
+		if r.Level >= slog.LevelError {
+			sawError = true
+
+			break
+		}
+	}
+
+	assert.True(t, sawError, "scanner failure must surface as an Error log record")
+
+	// Expect at least one emitted system entry naming the failure.
+	var sysEntry *logbroadcast.LogEntry
+
+	for i := range emitted {
+		if emitted[i].Type == "system" {
+			sysEntry = &emitted[i]
+
+			break
+		}
+	}
+
+	require.NotNil(t, sysEntry, "scanner failure must emit a system LogEntry")
+	assert.Contains(t, sysEntry.Content, "logparser")
+	assert.Contains(t, sysEntry.Content, "scan terminated")
+}
+
+// TestProcessStream_ScannerError_NilEmit verifies that a scanner failure
+// with a nil emit callback still logs the error and does not nil-panic on
+// the broadcast path.
+func TestProcessStream_ScannerError_NilEmit(t *testing.T) {
+	oversized := strings.Repeat("x", (1<<20)+1024)
+
+	logger, records := newTestLogger()
+	ProcessStream(strings.NewReader(oversized+"\n"), logger, nil)
+
+	var sawError bool
+
+	for _, r := range *records {
+		if r.Level >= slog.LevelError {
+			sawError = true
+
+			break
+		}
+	}
+
+	assert.True(t, sawError, "scanner failure must surface even when emit is nil")
 }

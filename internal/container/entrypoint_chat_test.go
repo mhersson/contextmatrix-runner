@@ -1,7 +1,10 @@
 package container
 
 import (
+	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -76,6 +79,136 @@ func TestEntrypoint_ChatModeValidation(t *testing.T) {
 		"must validate CM_CHAT_PROJECT")
 	assert.Contains(t, src, "ERROR: CM_CHAT_REPO_URL must be https://",
 		"must validate CM_CHAT_REPO_URL scheme")
+}
+
+// TestEntrypoint_MCPMergeGuardsEmptyURL verifies the MCP-merge block guards
+// the unguarded $CM_MCP_URL expansion behind a non-empty check. Chat-mode
+// containers may opt out of MCP wiring (StartChat only sets CM_MCP_URL when
+// opts.MCPURL is non-empty). Under `set -euo pipefail` the original
+// `jq -n --arg url "$CM_MCP_URL" ...` crashed with "CM_MCP_URL: unbound
+// variable" before claude could start.
+//
+// This is a source-inspection test (not an exec test): we cannot run the
+// full entrypoint.sh because it requires bind-mounted /run/cm-secrets/,
+// /claude-auth/, /host-skills/, dockerd, etc. The structural check is
+// sufficient because the regression we are guarding against is the
+// presence of an unguarded `"$CM_MCP_URL"` reference.
+func TestEntrypoint_MCPMergeGuardsEmptyURL(t *testing.T) {
+	path := entrypointPath(t)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	src := string(raw)
+
+	// The block that builds the MCP entry must live behind a non-empty
+	// CM_MCP_URL guard. We check for the guard line itself plus the
+	// MCP_ENTRY assignment to ensure the two were not separated by a
+	// refactor that left the assignment outside the guard.
+	assert.Contains(t, src, `if [ -n "${CM_MCP_URL:-}" ]; then`,
+		"entrypoint.sh must guard the MCP-merge block on a non-empty CM_MCP_URL")
+
+	// The jq argument that interpolates the URL must use the
+	// `${VAR:-}` defaulting form rather than `"$VAR"`. Without this, the
+	// `set -u` flag in the entrypoint blows up on the bare reference
+	// even though the surrounding guard would already prevent the
+	// expansion at runtime (defence-in-depth + future-proofing).
+	assert.NotContains(t, src, `jq -n --arg url "$CM_MCP_URL"`,
+		"entrypoint.sh must not reference $CM_MCP_URL bare under set -u; use ${CM_MCP_URL:-}")
+
+	// The original (pre-fix) code wrote both the MCP_ENTRY jq merge and
+	// the mv-tmp file outside any conditional. Verify the merge block
+	// lives inside the guard by extracting it.
+	guardBlock := extractIfBlock(t, src, `if [ -n "${CM_MCP_URL:-}" ]; then`)
+	assert.Contains(t, guardBlock, "MCP_ENTRY=$(jq -n",
+		"MCP_ENTRY assignment must live inside the CM_MCP_URL guard")
+	assert.Contains(t, guardBlock, `.mcpServers`,
+		"mcpServers merge must live inside the CM_MCP_URL guard")
+}
+
+// TestEntrypoint_MCPMergeEmptyURLDoesNotCrashSetU executes the relevant
+// MCP-merge snippet from entrypoint.sh under `set -euo pipefail` with
+// CM_MCP_URL unset. Pre-fix this would exit with "CM_MCP_URL: unbound
+// variable". Post-fix the guard must skip the merge cleanly.
+//
+// The snippet is the literal `if [ -n "${CM_MCP_URL:-}" ]; then ... fi`
+// block extracted from entrypoint.sh, with the surrounding helpers
+// (CLAUDE_JSON init, MCP_HEADERS placeholder) stubbed so the snippet is
+// self-contained.
+func TestEntrypoint_MCPMergeEmptyURLDoesNotCrashSetU(t *testing.T) {
+	path := entrypointPath(t)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	src := string(raw)
+	guardBlock := extractIfBlock(t, src, `if [ -n "${CM_MCP_URL:-}" ]; then`)
+	require.NotEmpty(t, guardBlock, "guard block extraction failed")
+
+	tmpHome := t.TempDir()
+
+	script := `set -euo pipefail
+unset CM_MCP_URL || true
+MCP_HEADERS='{}'
+CLAUDE_JSON="$HOME/.claude.json"
+[ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
+` + guardBlock + `
+exit 0
+`
+
+	cmd := exec.CommandContext(context.Background(), "bash", "-c", script)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + tmpHome,
+	}
+
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "guard block must not crash with empty CM_MCP_URL: %s", out)
+
+	// And the .claude.json must be left as the trivial init (no MCP
+	// servers added when CM_MCP_URL is empty).
+	body, err := os.ReadFile(filepath.Join(tmpHome, ".claude.json"))
+	require.NoError(t, err)
+	assert.Equal(t, "{}\n", string(body),
+		".claude.json must remain unchanged when CM_MCP_URL is empty")
+}
+
+// TestEntrypoint_MCPMergePopulatedURLWritesEntry asserts the merge still
+// runs when CM_MCP_URL is non-empty. Tests the positive case so a future
+// refactor that accidentally inverts the guard is caught.
+func TestEntrypoint_MCPMergePopulatedURLWritesEntry(t *testing.T) {
+	path := entrypointPath(t)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	src := string(raw)
+	guardBlock := extractIfBlock(t, src, `if [ -n "${CM_MCP_URL:-}" ]; then`)
+	require.NotEmpty(t, guardBlock)
+
+	tmpHome := t.TempDir()
+
+	script := `set -euo pipefail
+export CM_MCP_URL='https://cm.example.com/mcp/v1'
+MCP_HEADERS='{"Authorization": "Bearer test"}'
+CLAUDE_JSON="$HOME/.claude.json"
+[ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
+` + guardBlock + `
+cat "$CLAUDE_JSON"
+`
+
+	cmd := exec.CommandContext(context.Background(), "bash", "-c", script)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + tmpHome,
+	}
+
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "guard block failed with non-empty CM_MCP_URL: %s", out)
+
+	body, err := os.ReadFile(filepath.Join(tmpHome, ".claude.json"))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), `"contextmatrix"`,
+		"merged .claude.json must contain the contextmatrix MCP entry")
+	assert.Contains(t, string(body), "https://cm.example.com/mcp/v1",
+		"merged .claude.json must contain the CM_MCP_URL value")
 }
 
 // extractIfBlock returns the substring covering a single `if ... then ... fi`

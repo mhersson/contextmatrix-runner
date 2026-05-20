@@ -57,7 +57,7 @@ func TestHMACMiddleware_RejectsReplay(t *testing.T) {
 	handler(w2, mkReq())
 	assert.Equal(t, http.StatusConflict, w2.Code, "replay must be rejected")
 
-	var resp Response
+	var resp ErrorResponse
 	require.NoError(t, json.NewDecoder(w2.Body).Decode(&resp))
 	assert.False(t, resp.OK)
 	assert.Contains(t, resp.Message, "duplicate")
@@ -124,7 +124,7 @@ func TestHandleMessage_DedupReturnsOriginalAck(t *testing.T) {
 
 	require.Equal(t, http.StatusAccepted, w1.Code)
 
-	var resp1 Response
+	var resp1 SuccessResponse
 	require.NoError(t, json.NewDecoder(w1.Body).Decode(&resp1))
 	assert.True(t, resp1.OK)
 	assert.Equal(t, "stable-msg-id-42", resp1.MessageID)
@@ -147,7 +147,7 @@ func TestHandleMessage_DedupReturnsOriginalAck(t *testing.T) {
 
 	assert.Equal(t, http.StatusAccepted, w2.Code, "dedup hit must still return 202")
 
-	var resp2 Response
+	var resp2 SuccessResponse
 	require.NoError(t, json.NewDecoder(w2.Body).Decode(&resp2))
 	assert.True(t, resp2.OK)
 	assert.Equal(t, "stable-msg-id-42", resp2.MessageID, "dedup'd response must echo original message_id")

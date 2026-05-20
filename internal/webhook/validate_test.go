@@ -131,8 +131,7 @@ func TestValidateRepoURL(t *testing.T) {
 	}{
 		// happy paths
 		{"https", "https://github.com/org/repo.git", false},
-		{"https with userinfo", "https://user@github.com/org/repo.git", false},
-		{"ssh", "ssh://git@github.com/org/repo.git", false},
+		{"ssh without userinfo", "ssh://github.com/org/repo.git", false},
 		{"https with port", "https://gitlab.example.com:8443/org/repo.git", false},
 
 		// scheme rejections
@@ -143,6 +142,13 @@ func TestValidateRepoURL(t *testing.T) {
 		{"no scheme", "github.com/org/repo", true},
 		// git SCP-style path (no URL scheme — passes url.Parse but scheme is empty)
 		{"scp-style git URL", "git@github.com:org/repo.git", true},
+
+		// userinfo rejections (Fix W2): a CM-supplied URL must not embed
+		// credentials, otherwise an attacker-controlled CM could leak tokens
+		// into the worker's git config.
+		{"https with userinfo", "https://user@github.com/org/repo.git", true},
+		{"https with userinfo+password", "https://x:token@github.com/org/repo.git", true},
+		{"ssh with git@ userinfo", "ssh://git@github.com/org/repo.git", true},
 
 		// control-byte / injection rejections
 		{"newline in raw", "https://github.com\n/org", true},
@@ -185,10 +191,10 @@ func TestValidateContent(t *testing.T) {
 		{"simple text", "hello", false},
 		{"with newline allowed", "hello\nworld", false},
 		{"unicode ok", "café 🚀", false},
-		{"at size cap", strings.Repeat("a", maxContentBytes), false},
+		{"at size cap", strings.Repeat("a", MaxMessageContentBytes), false},
 
 		{"empty", "", true},
-		{"over size cap", strings.Repeat("a", maxContentBytes+1), true},
+		{"over size cap", strings.Repeat("a", MaxMessageContentBytes+1), true},
 		{"NUL byte rejected", "hello\x00world", true},
 		// 0xff alone is not valid UTF-8.
 		{"invalid utf8", string([]byte{0xff, 0xfe, 0xfd}), true},
@@ -565,10 +571,19 @@ func TestValidatePayload_ByValue(t *testing.T) {
 	require.NoError(t, ValidatePayload(ChatEndPayload{SessionID: "sess-1"}))
 }
 
-func TestValidatePayload_UnknownTypeNoop(t *testing.T) {
-	// Unknown payload type returns nil (handlers only pass known types).
-	require.NoError(t, ValidatePayload(struct{ X int }{X: 1}))
-	require.NoError(t, ValidatePayload(nil))
+// TestValidatePayload_UnknownTypeRejected verifies the W8 fix: unknown
+// payload types now fail loudly with a clear error rather than silently
+// returning nil. A handler that registers a new struct without wiring its
+// dispatch branch in ValidatePayload must surface the mistake immediately
+// rather than bypassing the validation gate.
+func TestValidatePayload_UnknownTypeRejected(t *testing.T) {
+	err := ValidatePayload(struct{ X int }{X: 1})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown payload type")
+
+	// nil is also unknown (no concrete type) so it fails the same way.
+	err = ValidatePayload(nil)
+	require.Error(t, err)
 }
 
 // -----------------------------------------------------------------------------
@@ -671,6 +686,12 @@ func (r *strictRunner) DeleteChatCleanup(_ string) {
 	r.t.Fatalf("manager.DeleteChatCleanup must not be called on invalid payload")
 }
 
+func (r *strictRunner) KillChat(_ context.Context, _ string) error {
+	r.t.Fatalf("manager.KillChat must not be called on invalid payload")
+
+	return nil
+}
+
 // -----------------------------------------------------------------------------
 // ValidateRefreshKnowledge
 // -----------------------------------------------------------------------------
@@ -731,6 +752,290 @@ func TestValidateRefreshKnowledge_AcceptsKnownDocsInOverwrite(t *testing.T) {
 		OverwriteDocs: []string{"architecture.md", "api-documentation.md"},
 	})
 	assert.NoError(t, err)
+}
+
+// TestValidateRefreshKnowledge_ReturnsValidationError ensures every rejection
+// path is wrapped in a *ValidationError carrying the offending field name so
+// the writeValidationError helper can emit the canonical "invalid <field>"
+// wire shape. Without this wrapping, callers would degrade to a generic
+// "invalid payload" body.
+func TestValidateRefreshKnowledge_ReturnsValidationError(t *testing.T) {
+	mk := func() *RefreshKnowledgePayload {
+		return &RefreshKnowledgePayload{
+			Project: "p",
+			Repo:    "r",
+			RepoURL: "https://example.com/r.git",
+			AgentID: "human:test",
+		}
+	}
+
+	cases := []struct {
+		name      string
+		mutate    func(*RefreshKnowledgePayload)
+		wantField string
+	}{
+		{"missing project", func(p *RefreshKnowledgePayload) { p.Project = "" }, "project"},
+		{"invalid project charset", func(p *RefreshKnowledgePayload) { p.Project = "a b" }, "project"},
+		{"missing repo", func(p *RefreshKnowledgePayload) { p.Repo = "" }, "repo"},
+		{"invalid repo charset (slash)", func(p *RefreshKnowledgePayload) { p.Repo = "a/b" }, "repo"},
+		{"repo control bytes", func(p *RefreshKnowledgePayload) { p.Repo = "a\nb" }, "repo"},
+		{"missing repo_url", func(p *RefreshKnowledgePayload) { p.RepoURL = "" }, "repo_url"},
+		{"non-https repo_url", func(p *RefreshKnowledgePayload) { p.RepoURL = "ssh://example.com/r.git" }, "repo_url"},
+		{"missing agent_id", func(p *RefreshKnowledgePayload) { p.AgentID = "" }, "agent_id"},
+		{"agent_id without human prefix", func(p *RefreshKnowledgePayload) { p.AgentID = "agent-foo" }, "agent_id"},
+		{"agent_id only human prefix", func(p *RefreshKnowledgePayload) { p.AgentID = "human:" }, "agent_id"},
+		{"agent_id suffix with space", func(p *RefreshKnowledgePayload) { p.AgentID = "human:a b" }, "agent_id"},
+		{"agent_id suffix with newline", func(p *RefreshKnowledgePayload) { p.AgentID = "human:a\nb" }, "agent_id"},
+		{"unknown overwrite doc", func(p *RefreshKnowledgePayload) {
+			p.OverwriteDocs = []string{"made-up.md"}
+		}, "overwrite_docs"},
+		{"bad base_branch", func(p *RefreshKnowledgePayload) { p.BaseBranch = "main\n" }, "base_branch"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := mk()
+			tc.mutate(p)
+
+			err := ValidateRefreshKnowledge(p)
+			require.Error(t, err)
+
+			var ve *ValidationError
+
+			require.ErrorAs(t, err, &ve, "must return *ValidationError so writeValidationError surfaces the field name")
+			assert.Equal(t, tc.wantField, ve.Field)
+		})
+	}
+}
+
+// TestValidateRefreshKnowledge_NilPayload mirrors the wire shape: nil is
+// rejected with a *ValidationError, not a bare fmt.Errorf.
+func TestValidateRefreshKnowledge_NilPayload(t *testing.T) {
+	err := ValidateRefreshKnowledge(nil)
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "payload", ve.Field)
+}
+
+// TestValidateTaskSkills_ReturnsValidationError ensures rejections in the
+// task_skills validator surface as a *ValidationError so the standard
+// writeValidationError helper produces "invalid task_skills" rather than
+// degrading to "invalid payload".
+func TestValidateTaskSkills_ReturnsValidationError(t *testing.T) {
+	err := ValidateTaskSkills([]string{"GoodOne", "BadOne"})
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "task_skills", ve.Field)
+}
+
+// TestValidateTaskSkills_LengthCap verifies the W10 fix: an attacker
+// shipping a million skill entries that all individually pass the charset
+// check is rejected by the slice-length cap.
+func TestValidateTaskSkills_LengthCap(t *testing.T) {
+	// At the cap = ok.
+	good := make([]string, maxTaskSkills)
+	for i := range good {
+		good[i] = "skill-x"
+	}
+
+	require.NoError(t, ValidateTaskSkills(good))
+
+	// One over the cap = rejected with task_skills field.
+	tooMany := make([]string, maxTaskSkills+1)
+	for i := range tooMany {
+		tooMany[i] = "skill-x"
+	}
+
+	err := ValidateTaskSkills(tooMany)
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "task_skills", ve.Field)
+	assert.Contains(t, ve.Reason, "too many entries")
+}
+
+// TestValidatePayload_TriggerModel verifies the W1 fix: TriggerPayload.Model
+// must be validated against chatModelPattern when non-empty, and pass through
+// when empty.
+func TestValidatePayload_TriggerModel(t *testing.T) {
+	base := func() *TriggerPayload {
+		return &TriggerPayload{
+			CardID:  "C-1",
+			Project: "p",
+			RepoURL: "https://github.com/org/repo.git",
+		}
+	}
+
+	// Empty model is allowed (optional field).
+	require.NoError(t, ValidatePayload(base()))
+
+	// Allowlisted models accepted.
+	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"} {
+		p := base()
+		p.Model = m
+		require.NoError(t, ValidatePayload(p), "model %q must be accepted", m)
+	}
+
+	// Disallowed shapes rejected with field="model".
+	for _, m := range []string{"gpt-4", "sonnet-4-6", "claude-", "claude-EVIL$"} {
+		p := base()
+		p.Model = m
+		err := ValidatePayload(p)
+		require.Error(t, err, "model %q must be rejected", m)
+
+		var ve *ValidationError
+
+		require.ErrorAs(t, err, &ve)
+		assert.Equal(t, "model", ve.Field)
+	}
+}
+
+// TestValidateRefreshKnowledge_Model verifies the W1 fix on the refresh
+// surface: Model is optional but must match chatModelPattern when set.
+func TestValidateRefreshKnowledge_Model(t *testing.T) {
+	mk := func() *RefreshKnowledgePayload {
+		return &RefreshKnowledgePayload{
+			Project: "p",
+			Repo:    "r",
+			RepoURL: "https://example.com/r.git",
+			AgentID: "human:test",
+		}
+	}
+
+	// Empty allowed.
+	require.NoError(t, ValidateRefreshKnowledge(mk()))
+
+	// Valid.
+	p := mk()
+	p.Model = "claude-sonnet-4-6"
+	require.NoError(t, ValidateRefreshKnowledge(p))
+
+	// Bad → rejected.
+	for _, m := range []string{"gpt-4", "claude-EVIL$", "claude-"} {
+		p := mk()
+		p.Model = m
+		err := ValidateRefreshKnowledge(p)
+		require.Error(t, err, "model %q must be rejected", m)
+
+		var ve *ValidationError
+
+		require.ErrorAs(t, err, &ve)
+		assert.Equal(t, "model", ve.Field)
+	}
+}
+
+// TestValidateMCPAPIKey verifies the W6 fix: the MCP API key (which is
+// forwarded into the worker env unchanged) must be validated for length,
+// UTF-8, and control bytes when non-empty.
+func TestValidateMCPAPIKey(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		wantErr bool
+	}{
+		{"empty allowed", "", false},
+		{"simple key", "secret-key", false},
+		{"max length", strings.Repeat("a", maxMCPAPIKeyBytes), false},
+		{"over length", strings.Repeat("a", maxMCPAPIKeyBytes+1), true},
+		{"invalid utf8", string([]byte{0xff, 0xfe, 0xfd}), true},
+		{"newline", "key\nfoo", true},
+		{"carriage return", "key\rfoo", true},
+		{"NUL byte", "key\x00foo", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMCPAPIKey(tc.val)
+			if tc.wantErr {
+				require.Error(t, err)
+
+				var ve *ValidationError
+
+				require.ErrorAs(t, err, &ve)
+				assert.Equal(t, "mcp_api_key", ve.Field)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestValidatePayload_TriggerMCPAPIKey verifies the W6 fix at the dispatch
+// level: an invalid MCPAPIKey on /trigger surfaces as field="mcp_api_key".
+func TestValidatePayload_TriggerMCPAPIKey(t *testing.T) {
+	p := &TriggerPayload{
+		CardID:    "C-1",
+		Project:   "p",
+		RepoURL:   "https://github.com/org/repo.git",
+		MCPAPIKey: "key\x00null",
+	}
+	err := ValidatePayload(p)
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "mcp_api_key", ve.Field)
+}
+
+// TestValidatePayload_ChatStartMCPAPIKey verifies the W6 fix at the chat
+// dispatch level.
+func TestValidatePayload_ChatStartMCPAPIKey(t *testing.T) {
+	p := &ChatStartPayload{
+		SessionID: "sess-1",
+		MCPAPIKey: "key\nwithnewline",
+	}
+	err := ValidatePayload(p)
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "mcp_api_key", ve.Field)
+}
+
+// TestValidatePayload_ChatStartPrimer_NUL verifies the W9 fix on Primer:
+// a NUL byte in the orientation text is rejected.
+func TestValidatePayload_ChatStartPrimer_NUL(t *testing.T) {
+	err := ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Primer:    "ORIENT\x00null",
+	})
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "primer", ve.Field)
+	assert.Contains(t, ve.Reason, "NUL")
+}
+
+// TestValidatePayload_ChatStartResumeContent_NUL verifies the W9 fix on
+// resume turn content.
+func TestValidatePayload_ChatStartResumeContent_NUL(t *testing.T) {
+	err := ValidatePayload(&ChatStartPayload{
+		SessionID: "sess-1",
+		Resume: &ChatResumeContext{
+			Turns: []ChatResumeTurn{
+				{Seq: 1, Role: "user", Content: "hi\x00null"},
+			},
+		},
+	})
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "resume.turns[0].content", ve.Field)
+	assert.Contains(t, ve.Reason, "NUL")
 }
 
 func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {

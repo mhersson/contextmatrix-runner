@@ -37,10 +37,11 @@ var (
 	taskSkillNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 )
 
-// maxContentBytes is the maximum permitted byte length of a MessagePayload
-// Content field. Duplicated here (rather than importing the handler const) so
-// this file is self-contained.
-const maxContentBytes = 8192
+// MaxMessageContentBytes is the maximum permitted byte length of a
+// MessagePayload Content field. Exported so the /message handler can apply
+// the same cap before structural validation runs, ensuring the wire-level
+// 413 response matches the validator-level 400 boundary.
+const MaxMessageContentBytes = 8192
 
 // containsCtlBytes reports whether s contains any of \n, \r, or NUL.
 func containsCtlBytes(s string) bool {
@@ -116,6 +117,15 @@ func validateRepoURL(v string) error {
 		return &ValidationError{Field: "repo_url", Reason: "scheme must be https or ssh"}
 	}
 
+	// Reject embedded userinfo (e.g. https://user:token@host/r). The full URL
+	// flows downstream into CM_REPO_URL and is git-cloned inside the worker;
+	// allowing userinfo would let an attacker-controlled CM inject credentials
+	// into the worker's git config and bypass the App-installation-token
+	// credential helper.
+	if u.User != nil {
+		return &ValidationError{Field: "repo_url", Reason: "must not contain userinfo"}
+	}
+
 	if u.Host == "" {
 		return &ValidationError{Field: "repo_url", Reason: "host is empty"}
 	}
@@ -141,7 +151,7 @@ func validateContent(v string) error {
 		return &ValidationError{Field: "content", Reason: "required"}
 	}
 
-	if len(v) > maxContentBytes {
+	if len(v) > MaxMessageContentBytes {
 		return &ValidationError{Field: "content", Reason: "exceeds 8192 bytes"}
 	}
 
@@ -151,6 +161,39 @@ func validateContent(v string) error {
 
 	if strings.ContainsRune(v, '\x00') {
 		return &ValidationError{Field: "content", Reason: "NUL byte not allowed"}
+	}
+
+	return nil
+}
+
+// maxMCPAPIKeyBytes caps the MCP API key length. The key is forwarded
+// verbatim into the container env (CM_MCP_API_KEY); we cap the byte length
+// to keep oversize inputs from bloating Docker create payloads and reject
+// control bytes / invalid UTF-8 so a malformed value cannot smuggle in
+// newlines or NUL bytes via the Authorization header.
+const maxMCPAPIKeyBytes = 1024
+
+// validateMCPAPIKey is the shared check used by /trigger, /chat/start and
+// /refresh-knowledge. Empty is allowed — CM may run without MCP auth in
+// loopback dev mode.
+func validateMCPAPIKey(v string) error {
+	if v == "" {
+		return nil
+	}
+
+	if len(v) > maxMCPAPIKeyBytes {
+		return &ValidationError{
+			Field:  "mcp_api_key",
+			Reason: fmt.Sprintf("exceeds %d bytes", maxMCPAPIKeyBytes),
+		}
+	}
+
+	if !utf8.ValidString(v) {
+		return &ValidationError{Field: "mcp_api_key", Reason: "not valid UTF-8"}
+	}
+
+	if containsCtlBytes(v) {
+		return &ValidationError{Field: "mcp_api_key", Reason: "control bytes not allowed"}
 	}
 
 	return nil
@@ -174,12 +217,28 @@ func validateMessageID(v string) error {
 	return nil
 }
 
+// maxTaskSkills caps the number of skill names per /trigger payload. Real
+// payloads carry a handful of entries; the cap is defence-in-depth against
+// an attacker-controlled CM shipping a million-entry slice that would still
+// pass the per-entry charset check.
+const maxTaskSkills = 64
+
 // ValidateTaskSkills checks every skill name in the slice against the
-// allowlist pattern. Empty slice is valid (means "no skills").
+// allowlist pattern. Empty slice is valid (means "no skills"). Rejections
+// are returned as *ValidationError so writeValidationError surfaces the
+// "invalid task_skills" wire shape — a raw fmt.Errorf would degrade to
+// "invalid payload".
 func ValidateTaskSkills(skills []string) error {
+	if len(skills) > maxTaskSkills {
+		return &ValidationError{
+			Field:  "task_skills",
+			Reason: fmt.Sprintf("too many entries: %d > %d", len(skills), maxTaskSkills),
+		}
+	}
+
 	for _, s := range skills {
 		if !taskSkillNamePattern.MatchString(s) {
-			return fmt.Errorf("invalid task skill name: %q", s)
+			return &ValidationError{Field: "task_skills", Reason: "name must match " + taskSkillNamePattern.String()}
 		}
 	}
 
@@ -191,9 +250,17 @@ func ValidateTaskSkills(skills []string) error {
 // can test with errors.As, or a nil error on success.
 //
 // The caller must pass a pointer to or value of one of the supported payload
-// types. Unknown types return nil (validation cannot be performed) to avoid
-// accidentally blocking extension — this is safe because handlers only ever
-// pass the payloads they declared.
+// types. Unknown types now return a non-nil error rather than silently
+// passing — a registration mistake (a new payload struct decoded by a
+// handler but never added to the dispatch below) fails the request rather
+// than bypassing the validation gate. Fix W8 in REVIEW.md.
+//
+// New payload types MUST be added to this type switch even if they have a
+// dedicated Validate<Foo> helper. Calling the helper directly from the
+// handler bypasses ValidatePayload, which is the single entry point for the
+// payload-validation surface — bypassing it splits the dispatch into two
+// inconsistent code paths and is the class of mistake that hid a missing
+// validator on /refresh-knowledge for one release cycle (Fix W2 in REVIEW.md).
 func ValidatePayload(p any) error {
 	switch v := p.(type) {
 	case *TriggerPayload:
@@ -267,9 +334,23 @@ func ValidatePayload(p any) error {
 		return validateChatEnd(v)
 	case ChatEndPayload:
 		return validateChatEnd(&v)
-	}
 
-	return nil
+	case *RefreshKnowledgePayload:
+		if v == nil {
+			return nil
+		}
+
+		return ValidateRefreshKnowledge(v)
+	case RefreshKnowledgePayload:
+		return ValidateRefreshKnowledge(&v)
+
+	default:
+		// Loud failure on unknown payload types so a registration mistake
+		// (handler decodes a new struct but forgets to wire its dispatch
+		// branch above) fails the request rather than silently bypassing
+		// the validation gate. Fix W8 in REVIEW.md.
+		return fmt.Errorf("unknown payload type %T", p)
+	}
 }
 
 func validateTrigger(p *TriggerPayload) error {
@@ -286,6 +367,22 @@ func validateTrigger(p *TriggerPayload) error {
 	}
 
 	if err := validateBaseBranch(p.BaseBranch); err != nil {
+		return err
+	}
+
+	// Model is optional; when present, must match the chat-model allowlist
+	// pattern. Value flows into `claude --model "${CM_ORCHESTRATOR_MODEL}"` in
+	// docker/entrypoint.sh; entrypoint quoting blocks argv-injection but
+	// validation here is the primary defence and keeps the surface in lockstep
+	// with /chat/start.
+	if p.Model != "" && !chatModelPattern.MatchString(p.Model) {
+		return &ValidationError{
+			Field:  "model",
+			Reason: "must match " + chatModelPattern.String(),
+		}
+	}
+
+	if err := validateMCPAPIKey(p.MCPAPIKey); err != nil {
 		return err
 	}
 
@@ -423,6 +520,10 @@ func validateChatStart(p *ChatStartPayload) error {
 		}
 	}
 
+	if err := validateMCPAPIKey(p.MCPAPIKey); err != nil {
+		return err
+	}
+
 	if p.Resume != nil {
 		if err := validateChatResume(p.Resume); err != nil {
 			return err
@@ -442,6 +543,13 @@ func validateChatStart(p *ChatStartPayload) error {
 			return &ValidationError{
 				Field:  "primer",
 				Reason: "must be valid UTF-8",
+			}
+		}
+
+		if strings.ContainsRune(p.Primer, '\x00') {
+			return &ValidationError{
+				Field:  "primer",
+				Reason: "NUL byte not allowed",
 			}
 		}
 	}
@@ -479,6 +587,16 @@ func validateChatResume(r *ChatResumeContext) error {
 				Reason: "must be valid UTF-8",
 			}
 		}
+
+		// Mirror validateContent: free-form transcript text may contain
+		// newlines but NUL bytes would smuggle through any downstream
+		// C-style consumer (libgit2, exec arg lists). Fix W9 in REVIEW.md.
+		if strings.ContainsRune(t.Content, '\x00') {
+			return &ValidationError{
+				Field:  fmt.Sprintf("resume.turns[%d].content", i),
+				Reason: "NUL byte not allowed",
+			}
+		}
 	}
 
 	return nil
@@ -488,39 +606,90 @@ func validateChatEnd(p *ChatEndPayload) error {
 	return validateIdent("session_id", p.SessionID)
 }
 
+// agentIDSuffixRE bounds the suffix after the "human:" prefix on agent_id so
+// downstream env injection cannot pass arbitrary control bytes or argv flags.
+// Same shape as identRE; documented separately for clarity at the call site.
+var agentIDSuffixRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+
 // ValidateRefreshKnowledge mirrors ValidatePayload's rules for the refresh
 // webhook: project + repo + https repo URL + human-prefixed agent_id.
 // overwrite_docs is optional; if present, every entry must be a known KB
 // doc filename to prevent the runner-side allowlist from being bypassed.
+//
+// All rejections are returned as *ValidationError so writeValidationError can
+// surface the field-name diagnostic ("invalid project", etc.). A raw
+// fmt.Errorf would degrade to "invalid payload" through the type assertion.
 func ValidateRefreshKnowledge(p *RefreshKnowledgePayload) error {
 	if p == nil {
-		return fmt.Errorf("payload required")
+		return &ValidationError{Field: "payload", Reason: "required"}
 	}
 
-	if p.Project == "" {
-		return fmt.Errorf("project required")
+	if err := validateIdent("project", p.Project); err != nil {
+		return err
 	}
 
-	if p.Repo == "" {
-		return fmt.Errorf("repo required")
+	// Repo follows the same shape as project/card_id: alphanumeric plus
+	// '.', '_', '-'. It flows through to CM_KB_REPO and into the synthetic
+	// tracker key "kb-refresh:<repo>", so a charset escape would leak into
+	// container env and tracker keys.
+	if err := validateIdent("repo", p.Repo); err != nil {
+		return err
 	}
 
 	if p.RepoURL == "" {
-		return fmt.Errorf("repo_url required")
+		return &ValidationError{Field: "repo_url", Reason: "required"}
 	}
 
 	if !strings.HasPrefix(p.RepoURL, "https://") {
-		return fmt.Errorf("repo_url must be https://")
+		return &ValidationError{Field: "repo_url", Reason: "must be https://"}
+	}
+
+	if err := validateRepoURL(p.RepoURL); err != nil {
+		return err
+	}
+
+	if err := validateBaseBranch(p.BaseBranch); err != nil {
+		return err
 	}
 
 	if !strings.HasPrefix(p.AgentID, "human:") {
-		return fmt.Errorf(`agent_id must start with "human:"`)
+		return &ValidationError{Field: "agent_id", Reason: `must start with "human:"`}
+	}
+
+	// Tighten past the prefix: reject control bytes and limit charset on the
+	// suffix so the full agent_id is safe as a container env value.
+	suffix := strings.TrimPrefix(p.AgentID, "human:")
+	if suffix == "" {
+		return &ValidationError{Field: "agent_id", Reason: "suffix required after human:"}
+	}
+
+	if containsCtlBytes(suffix) {
+		return &ValidationError{Field: "agent_id", Reason: "control bytes not allowed"}
+	}
+
+	if !agentIDSuffixRE.MatchString(suffix) {
+		return &ValidationError{Field: "agent_id", Reason: "suffix must match " + agentIDSuffixRE.String()}
 	}
 
 	for _, d := range p.OverwriteDocs {
 		if !isKnownKBDoc(d) {
-			return fmt.Errorf("overwrite_docs entry %q is not a known KB doc", d)
+			return &ValidationError{Field: "overwrite_docs", Reason: "entry is not a known KB doc"}
 		}
+	}
+
+	// Model is optional; when present, must match the chat-model allowlist
+	// pattern. Value flows into `claude --model "${CM_ORCHESTRATOR_MODEL}"`
+	// inside the worker container. Keep the validator in lockstep with the
+	// /trigger and /chat/start surface.
+	if p.Model != "" && !chatModelPattern.MatchString(p.Model) {
+		return &ValidationError{
+			Field:  "model",
+			Reason: "must match " + chatModelPattern.String(),
+		}
+	}
+
+	if err := validateMCPAPIKey(p.MCPAPIKey); err != nil {
+		return err
 	}
 
 	return nil

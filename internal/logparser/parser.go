@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
+	"github.com/mhersson/contextmatrix-runner/internal/secretenv"
 )
 
 // maxScannerBuf is the maximum token size for the scanner. Thinking blocks
@@ -44,36 +45,53 @@ var whitespaceRun = regexp.MustCompile(`\s+`)
 // redacting only the value — useful when the match appears in a docker
 // inspect-style env dump, where knowing *which* env var was present is
 // helpful for debugging.
+//
+// All patterns are RE2-safe (no backtracking, no lookaround).
 var secretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`ghp_[A-Za-z0-9_]{36,}`),           // GitHub personal access token
-	regexp.MustCompile(`gho_[A-Za-z0-9_]{36,}`),           // GitHub OAuth token
-	regexp.MustCompile(`ghu_[A-Za-z0-9_]{36,}`),           // GitHub user-to-server token
-	regexp.MustCompile(`ghs_[A-Za-z0-9_]{36,}`),           // GitHub server-to-server token
-	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`),    // GitHub fine-grained PAT
-	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`),       // Anthropic API key
-	regexp.MustCompile(`v1\.[0-9a-f]{40,}`),               // GitHub App installation token
-	regexp.MustCompile(`Bearer\s+[A-Za-z0-9._\-/+]{20,}`), // Bearer tokens in output
+	regexp.MustCompile(`ghp_[A-Za-z0-9_]{36,}`),            // GitHub personal access token
+	regexp.MustCompile(`gho_[A-Za-z0-9_]{36,}`),            // GitHub OAuth token
+	regexp.MustCompile(`ghu_[A-Za-z0-9_]{36,}`),            // GitHub user-to-server token
+	regexp.MustCompile(`ghs_[A-Za-z0-9_]{36,}`),            // GitHub server-to-server token
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`),     // GitHub fine-grained PAT
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`),        // Anthropic API key
+	regexp.MustCompile(`v1\.[0-9a-f]{40,}`),                // GitHub App installation token
+	regexp.MustCompile(`Bearer\s+[A-Za-z0-9._\-/+=]{20,}`), // Bearer tokens in output (includes '=' for base64 padding)
+
+	// Third-party tokens that may show up in worker output when a skill or
+	// the model itself prints an env var or curl command line. We redact
+	// generically rather than per-key because a single Slack / AWS / GCP
+	// credential leaking into a public log is a much worse incident than
+	// the false-positive cost of redacting one extra string.
+	regexp.MustCompile(`xox[abprs]-[A-Za-z0-9-]{10,}`),                                  // Slack tokens (bot, app, refresh, etc.)
+	regexp.MustCompile(`AKIA[A-Z0-9]{16}`),                                              // AWS access key ID
+	regexp.MustCompile(`AIza[A-Za-z0-9_-]{35}`),                                         // Google API key (Maps, Firebase, etc.)
+	regexp.MustCompile(`npm_[A-Za-z0-9]{36}`),                                           // NPM publish/automation token
+	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`), // generic JWT (header.payload.signature)
 }
 
-// envSecretKeys are environment-variable names whose values are secrets the
-// runner injects into worker containers. When they appear as KEY=value in a
-// log line (e.g. a dumped env block or a shell trace), the value is redacted
-// but the key name is preserved.
-var envSecretKeys = []string{
-	"CLAUDE_CODE_OAUTH_TOKEN",
-	"ANTHROPIC_API_KEY",
-	"CM_MCP_API_KEY",
-	"CM_GIT_TOKEN",
-}
-
-// envSecretPatterns is a derived slice of regexps matching KEY=<non-whitespace>
-// for each entry in envSecretKeys. Compiled once at package init time.
-var envSecretPatterns = buildEnvSecretPatterns(envSecretKeys)
+// envSecretPatterns is a derived slice of regexps matching
+// KEY=<non-whitespace OR "quoted">  for each entry in secretenv.Keys.
+// Compiled once at package init time so adding a new runner-managed secret
+// only requires editing secretenv.
+//
+// The value sub-expression accepts either bare runs of non-whitespace
+// (e.g. KEY=abc123) or a double-quoted value with any non-quote payload
+// (e.g. KEY="abc 123") — the previous shape `KEY=\S+` matched bare values
+// only and silently passed quoted ones through.
+var envSecretPatterns = buildEnvSecretPatterns(secretenv.Keys())
 
 func buildEnvSecretPatterns(keys []string) []*regexp.Regexp {
 	out := make([]*regexp.Regexp, 0, len(keys))
 	for _, k := range keys {
-		out = append(out, regexp.MustCompile(`(`+regexp.QuoteMeta(k)+`)=\S+`))
+		// (KEY)=(?:"[^"]*"|[^\s]*) — capture KEY so the replacement can
+		// preserve it. The value alternation tries a double-quoted string
+		// FIRST so quoted values with internal whitespace get consumed
+		// whole; falls back to a run of non-whitespace for bare tokens.
+		// RE2 uses leftmost-first alternation, so if the bare-token branch
+		// came first it would match only `"abc` and leave `123 def"` in
+		// the output. Empty quoted values ("") are matched by the quoted
+		// branch too.
+		out = append(out, regexp.MustCompile(`(`+regexp.QuoteMeta(k)+`)=(?:"[^"]*"|[^\s]*)`))
 	}
 
 	return out
@@ -405,7 +423,17 @@ func ProcessStream(r io.Reader, logger *slog.Logger, emit func(logbroadcast.LogE
 //
 // onSkillEngaged is called whenever a Skill tool_use is detected. It may be
 // nil when the caller does not need skill-engagement notifications.
+//
+// A nil logger is tolerated: ProcessStreamWithRedactor swaps in slog.Default
+// so a malformed-JSON or Skill-input warning never nil-panics. This belt is
+// not strictly needed for production wiring (main.go always passes a
+// non-nil logger), but it keeps the public API forgiving for callers that
+// only need the emit callback for tests.
 func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redactor, emit func(logbroadcast.LogEntry), onSkillEngaged func(*SkillEngagedEvent)) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	redact := func(s string) string {
 		if redactor == nil {
 			return Redact(s)
@@ -418,6 +446,25 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 	// Start at initScannerBuf; bufio.Scanner grows as needed up to maxScannerBuf.
 	// See maxScannerBuf for the memory-footprint rationale.
 	scanner.Buffer(make([]byte, 0, initScannerBuf), maxScannerBuf)
+
+	defer func() {
+		// Surface scanner failures (most commonly bufio.ErrTooLong on a
+		// stream-json line that exceeds maxScannerBuf). Without this
+		// check the goroutine silently returns as if EOF — the runner
+		// loses the rest of Claude's output and operators have no
+		// signal explaining why. We log at Error and broadcast a
+		// system LogEntry so the failure is visible in /logs.
+		if err := scanner.Err(); err != nil {
+			logger.Error("logparser: stream scan terminated with error", "error", err)
+
+			if emit != nil {
+				emit(logbroadcast.LogEntry{
+					Type:    "system",
+					Content: "logparser: stream scan terminated with error: " + err.Error(),
+				})
+			}
+		}
+	}()
 
 	for scanner.Scan() {
 		line := scanner.Text()

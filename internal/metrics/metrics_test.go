@@ -19,10 +19,13 @@ func TestNew_RegistersAllMetrics(t *testing.T) {
 	m.ContainerDuration.WithLabelValues(metrics.OutcomeSuccess).Observe(30)
 	m.RunningContainers.Set(1)
 	m.CallbackRetriesTotal.WithLabelValues("status").Inc()
-	m.BroadcasterDropsTotal.WithLabelValues("all").Inc()
+	m.CallbackBearerFallbackTotal.Inc()
+	m.BroadcasterDropsTotal.Inc()
 	m.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineRun).Inc()
 	m.ReplayCacheHitsTotal.Inc()
 	m.PreflightLastSuccessSec.Set(1_700_000_000)
+	m.DNSLookupTimeoutsTotal.Inc()
+	m.ChatRollbackFailuresTotal.Inc()
 
 	families, err := m.Registry.Gather()
 	require.NoError(t, err)
@@ -38,14 +41,48 @@ func TestNew_RegistersAllMetrics(t *testing.T) {
 		"cmr_container_duration_seconds",
 		"cmr_running_containers",
 		"cmr_callback_retries_total",
+		"cmr_callback_bearer_fallback_total",
 		"cmr_broadcaster_drops_total",
 		"cmr_panic_recovered_total",
 		"cmr_replay_cache_hits_total",
 		"cmr_preflight_last_success_timestamp_seconds",
+		"cmr_dns_lookup_timeouts_total",
+		"cmr_chat_rollback_failures_total",
 	}
 
 	for _, name := range want {
 		assert.True(t, got[name], "metric %q not registered", name)
+	}
+}
+
+// TestNew_RegistersGoAndProcessCollectors verifies that the standard
+// runtime + process collectors are wired onto the dedicated registry. The
+// runner never registers on the default global registry, so a missing
+// MustRegister call would silently drop go_* / process_* series from
+// /metrics — and operators alerting on goroutine-leak or memory growth
+// would lose every signal without any error surfaced at boot.
+func TestNew_RegistersGoAndProcessCollectors(t *testing.T) {
+	m := metrics.New()
+	require.NotNil(t, m)
+
+	families, err := m.Registry.Gather()
+	require.NoError(t, err)
+
+	want := map[string]bool{
+		"go_goroutines":                 false,
+		"go_memstats_alloc_bytes":       false,
+		"process_cpu_seconds_total":     false,
+		"process_resident_memory_bytes": false,
+	}
+
+	for _, f := range families {
+		if _, ok := want[f.GetName()]; ok {
+			want[f.GetName()] = true
+		}
+	}
+
+	for name, seen := range want {
+		assert.True(t, seen, "expected runtime/process series %q to be registered", name)
 	}
 }
 
@@ -66,13 +103,58 @@ func TestNew_MultipleCallsUseIsolatedRegistries(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestBroadcasterDropsLabelIsBounded(t *testing.T) {
+// TestNormalizeEndpoint_Allowlist verifies that every well-known path round
+// trips, and that paths outside the allowlist collapse to "other". This is
+// the cardinality firewall for both metric labels and trace span names —
+// any drift between the registered routes in webhook.Register and this
+// allowlist must surface in tests.
+func TestNormalizeEndpoint_Allowlist(t *testing.T) {
+	allowed := []string{
+		"/trigger",
+		"/kill",
+		"/stop-all",
+		"/message",
+		"/promote",
+		"/end-session",
+		"/refresh-knowledge",
+		"/chat/start",
+		"/chat/end",
+		"/logs",
+		"/containers",
+		"/health",
+		"/readyz",
+		"/metrics",
+		"/ready",
+	}
+
+	for _, p := range allowed {
+		assert.Equal(t, p, metrics.NormalizeEndpoint(p), "allowlisted path %q must round-trip", p)
+	}
+}
+
+func TestNormalizeEndpoint_UnknownPathsCollapse(t *testing.T) {
+	unknown := []string{
+		"/nonexistent",
+		"/admin/secret",
+		"/../../etc/passwd",
+		"/trigger/extra/path",
+		"",
+		"/",
+		"/TRIGGER", // case-sensitive: known paths are lowercase
+	}
+
+	for _, p := range unknown {
+		assert.Equal(t, "other", metrics.NormalizeEndpoint(p), "unknown path %q must collapse to 'other'", p)
+	}
+}
+
+func TestBroadcasterDropsIsBoundedCounter(t *testing.T) {
 	m := metrics.New()
 
-	// The "all" label is a contract: we never use dynamic card_id values.
-	// Emit many drops — the series count must remain 1.
+	// BroadcasterDropsTotal is an unlabeled Counter. Emit many drops — the
+	// series count must remain 1 by construction (no labels to vary).
 	for range 1000 {
-		m.BroadcasterDropsTotal.WithLabelValues("all").Inc()
+		m.BroadcasterDropsTotal.Inc()
 	}
 
 	families, err := m.Registry.Gather()

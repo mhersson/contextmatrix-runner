@@ -421,8 +421,10 @@ func TestCloseStdin_ClosesWriter(t *testing.T) {
 		"WriteStdin after CloseStdin must return ErrStdinClosed, not ErrNoStdinAttached")
 }
 
-// TestCloseStdin_Idempotent verifies the second call returns ErrNoStdinAttached
-// and does not close the writer again.
+// TestCloseStdin_Idempotent verifies the second call returns ErrStdinClosed
+// (Fix W5: idempotent retry surfaces the "was attached, then closed" state
+// so handlers can map to 410 Gone instead of 409 Conflict) and does not
+// close the writer again.
 func TestCloseStdin_Idempotent(t *testing.T) {
 	tr := New()
 	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
@@ -445,7 +447,10 @@ func TestCloseStdin_Idempotent(t *testing.T) {
 	require.NoError(t, tr.CloseStdin("proj", "PROJ-001"))
 
 	err := tr.CloseStdin("proj", "PROJ-001")
-	require.ErrorIs(t, err, ErrNoStdinAttached)
+	require.ErrorIs(t, err, ErrStdinClosed,
+		"second CloseStdin must return ErrStdinClosed so handlers can map to 410 Gone")
+	require.NotErrorIs(t, err, ErrNoStdinAttached,
+		"second CloseStdin must NOT return ErrNoStdinAttached (would falsely imply non-interactive)")
 
 	mu.Lock()
 	assert.Equal(t, 1, closeCount, "second CloseStdin must not re-close the writer")
@@ -460,6 +465,101 @@ func TestCloseStdin_NoStdin(t *testing.T) {
 
 	err := tr.CloseStdin("proj", "PROJ-001")
 	assert.ErrorIs(t, err, ErrNoStdinAttached)
+}
+
+// TestMarkStdinClosed_FlipsState verifies that MarkStdinClosed nils the
+// tracker's writer reference without invoking Close, so subsequent
+// WriteStdin / CloseStdin calls return ErrStdinClosed. Used by the priming-
+// write timeout path to align the tracker's state with a writer that was
+// force-closed directly (bypassing CloseStdin to avoid deadlocking against
+// an in-flight Write).
+func TestMarkStdinClosed_FlipsState(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	var closeCount atomic.Int32
+
+	w := &countingWriteCloser{
+		closeFn: func() error {
+			closeCount.Add(1)
+
+			return nil
+		},
+	}
+	tr.SetStdin("proj", "PROJ-001", w, nil)
+
+	// MarkStdinClosed must succeed and must NOT invoke Close on the writer
+	// — the caller (writePrimingWithTimeout) closed the underlying writer
+	// itself before calling MarkStdinClosed.
+	require.NoError(t, tr.MarkStdinClosed("proj", "PROJ-001"))
+	assert.EqualValues(t, 0, closeCount.Load(),
+		"MarkStdinClosed must not call Close on the writer")
+
+	// Subsequent WriteStdin should return ErrStdinClosed (mapped to 410 by
+	// the webhook /message handler).
+	err := tr.WriteStdin("proj", "PROJ-001", []byte("hi"))
+	require.ErrorIs(t, err, ErrStdinClosed)
+
+	// CloseStdin on a Mark'd entry behaves like a normal post-close call:
+	// returns ErrStdinClosed.
+	err = tr.CloseStdin("proj", "PROJ-001")
+	require.ErrorIs(t, err, ErrStdinClosed)
+
+	// Idempotent: a second Mark on a closed stdin is harmless.
+	require.NoError(t, tr.MarkStdinClosed("proj", "PROJ-001"))
+}
+
+// TestMarkStdinClosed_NotTracked verifies MarkStdinClosed returns
+// ErrNotTracked when the lookup key is unknown — the priming-timeout caller
+// uses this branch to decide between log-and-continue (entry already
+// Removed by a racing cleanup) and a louder warning.
+func TestMarkStdinClosed_NotTracked(t *testing.T) {
+	tr := New()
+	err := tr.MarkStdinClosed("proj", "MISSING")
+	assert.ErrorIs(t, err, ErrNotTracked)
+}
+
+// TestMarkStdinClosed_NoStdin verifies MarkStdinClosed returns
+// ErrNoStdinAttached when the entry exists but SetStdin was never called.
+func TestMarkStdinClosed_NoStdin(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+	err := tr.MarkStdinClosed("proj", "PROJ-001")
+	assert.ErrorIs(t, err, ErrNoStdinAttached)
+}
+
+// TestMarkStdinClosedChat_FlipsState mirrors TestMarkStdinClosed_FlipsState
+// for the chat-mode counterpart.
+func TestMarkStdinClosedChat_FlipsState(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.AddChat(&ContainerInfo{
+		ContainerID: "ctr-1",
+		SessionID:   "01SESS",
+		Image:       "test:latest",
+		StartedAt:   time.Now(),
+	}))
+
+	var closeCount atomic.Int32
+
+	w := &countingWriteCloser{
+		closeFn: func() error {
+			closeCount.Add(1)
+
+			return nil
+		},
+	}
+	tr.SetStdinChat("01SESS", w, nil)
+
+	require.NoError(t, tr.MarkStdinClosedChat("01SESS"))
+	assert.EqualValues(t, 0, closeCount.Load(),
+		"MarkStdinClosedChat must not call Close on the writer")
+
+	err := tr.WriteStdinChat("01SESS", []byte("hi"))
+	require.ErrorIs(t, err, ErrStdinClosed)
+
+	err = tr.CloseStdinChat("01SESS")
+	require.ErrorIs(t, err, ErrStdinClosed)
 }
 
 // TestCloseStdin_NotTracked verifies CloseStdin returns ErrNotTracked when
@@ -896,6 +996,49 @@ func TestTracker_ChatAndCardCoexist(t *testing.T) {
 	assert.True(t, tr.HasChat("S1"))
 }
 
+// TestChatKeyDoesNotCollideWithProject verifies that the chat-key namespace
+// sentinel (NUL byte) cannot collide with any card-mode (project, cardID)
+// key. The literal "__chat__" prefix used previously was a valid project
+// name under the webhook validator's [A-Za-z0-9_.-] charset, so a
+// /trigger call for project="__chat__", card_id=X aliased to the same map
+// entry as /chat/start for session_id=X.
+func TestChatKeyDoesNotCollideWithProject(t *testing.T) {
+	tr := New()
+
+	// Register a card-mode container using a project name that mirrors the
+	// old chat-key literal. With the legacy "__chat__/<id>" key this would
+	// alias to AddChat(SessionID=X).
+	require.NoError(t, tr.Add(&ContainerInfo{
+		ContainerID: "card-1",
+		CardID:      "X",
+		Project:     "__chat__",
+	}))
+
+	// AddChat(SessionID="X") must succeed: a separate namespace means the
+	// two entries coexist. Pre-fix this would return ErrAlreadyTracked.
+	require.NoError(t, tr.AddChat(&ContainerInfo{
+		ContainerID: "chat-1",
+		SessionID:   "X",
+	}))
+
+	// Both lookups must resolve to their respective entries.
+	assert.True(t, tr.Has("__chat__", "X"))
+	assert.True(t, tr.HasChat("X"))
+
+	card, ok := tr.Snapshot("__chat__", "X")
+	require.True(t, ok)
+	assert.Equal(t, "card-1", card.ContainerID)
+
+	chat, ok := tr.SnapshotChat("X")
+	require.True(t, ok)
+	assert.Equal(t, "chat-1", chat.ContainerID)
+
+	// And removing one must not affect the other.
+	tr.RemoveChat("X")
+	assert.True(t, tr.Has("__chat__", "X"))
+	assert.False(t, tr.HasChat("X"))
+}
+
 func TestAddChatIfUnderLimit_Basic(t *testing.T) {
 	tr := New()
 
@@ -1049,5 +1192,260 @@ func TestRemoveChat_InvokesCancel(t *testing.T) {
 	case <-ctx.Done():
 	case <-time.After(50 * time.Millisecond):
 		t.Fatal("RemoveChat did not invoke stored Cancel")
+	}
+}
+
+// TestCancel_DoesNotHoldRLockDuringCancelFunc pins Fix W5: tracker.Cancel
+// captures info.Cancel under tracker.mu (read) and releases the lock BEFORE
+// invoking it. A CancelFunc that reaches back into the tracker (e.g. calls
+// Snapshot or Has on the same Tracker) used to deadlock-by-self because
+// Cancel held the RLock while the cancel func tried to take it again. The
+// fix matches the discipline used in Remove.
+//
+// The test exercises the reentrant read path explicitly: the cancel func
+// calls Has on the same tracker. Without the fix this would still pass
+// under Go's RWMutex semantics in the absence of a queued writer, so we
+// also run a parallel writer that contends for tracker.mu.Lock(). Under
+// Go's RWMutex starvation-avoidance rules, a writer queued after the
+// initial RLock will block any subsequent RLock from inside the cancel
+// func — and tracker.Cancel would never return.
+func TestCancel_DoesNotHoldRLockDuringCancelFunc(t *testing.T) {
+	tr := New()
+
+	canceled := make(chan struct{})
+
+	cancelFn := func() {
+		// Reach back into the tracker from inside the cancel func. If
+		// tracker.Cancel still held tracker.mu (read), and a parallel
+		// writer is queued, this Has() call would block — and Cancel
+		// would never return.
+		_ = tr.Has("alpha", "ALPHA-1")
+
+		close(canceled)
+	}
+
+	require.NoError(t, tr.Add(&ContainerInfo{
+		Project: "alpha",
+		CardID:  "ALPHA-1",
+		Cancel:  cancelFn,
+	}))
+
+	// Run a parallel writer that wants tracker.mu.Lock(). With the
+	// pre-W5 behaviour, the writer would queue behind the Cancel's
+	// RLock and starve the reentrant Has() inside the cancel func.
+	writerStarted := make(chan struct{})
+	writerDone := make(chan struct{})
+
+	go func() {
+		close(writerStarted)
+		// Add a new entry — this needs tracker.mu.Lock().
+		_ = tr.Add(&ContainerInfo{Project: "beta", CardID: "BETA-1"})
+
+		close(writerDone)
+	}()
+
+	<-writerStarted
+	// Tiny pause so the writer has a chance to queue at tracker.mu.
+	time.Sleep(5 * time.Millisecond)
+
+	if !tr.Cancel("alpha", "ALPHA-1") {
+		t.Fatal("Cancel returned false for a tracked entry")
+	}
+
+	select {
+	case <-canceled:
+		// Good: cancel func ran to completion (which required acquiring
+		// the read lock again from inside).
+	case <-time.After(time.Second):
+		t.Fatal("Cancel func did not complete; tracker.Cancel still holds RLock during invocation")
+	}
+
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Parallel writer never completed; tracker.Cancel deadlocked the tracker")
+	}
+}
+
+// TestCancel_MissingEntryReturnsFalse pins the existing behaviour: Cancel
+// on an unknown (project, cardID) returns false and does not invoke any
+// cancel func.
+func TestCancel_MissingEntryReturnsFalse(t *testing.T) {
+	tr := New()
+
+	if got := tr.Cancel("nope", "MISS-1"); got {
+		t.Fatal("Cancel must return false for an entry that is not tracked")
+	}
+}
+
+// TestCancel_NilCancelFuncIsNoOp verifies that a tracked entry whose
+// Cancel field is nil still returns true and does not panic.
+func TestCancel_NilCancelFuncIsNoOp(t *testing.T) {
+	tr := New()
+	require.NoError(t, tr.Add(&ContainerInfo{
+		Project: "alpha",
+		CardID:  "ALPHA-1",
+		Cancel:  nil,
+	}))
+
+	if got := tr.Cancel("alpha", "ALPHA-1"); !got {
+		t.Fatal("Cancel must return true for a tracked entry even when Cancel is nil")
+	}
+}
+
+// TestSetStdin_LateArrivalWedgedClose_DoesNotBlockTracker exercises Fix M4:
+// when SetStdin arrives AFTER Remove (the entry is gone), the late-arrival
+// branch used to close the writer SYNCHRONOUSLY under tracker.mu (write).
+// A wedged hijacked TCP socket's Close() would therefore freeze the entire
+// tracker for any concurrent operation.
+//
+// The fix runs the Close + onClose on a background goroutine bounded by
+// stdinCloseTimeout. We verify two invariants:
+//  1. SetStdin returns within the timeout even when Close wedges forever.
+//  2. Other tracker operations (Has, Add, Count) remain responsive while
+//     the close is wedged, proving tracker.mu was released.
+func TestSetStdin_LateArrivalWedgedClose_DoesNotBlockTracker(t *testing.T) {
+	origTimeout := stdinCloseTimeout
+	stdinCloseTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { stdinCloseTimeout = origTimeout })
+
+	tr := New()
+
+	// Don't Add the key — SetStdin will hit the late-arrival branch
+	// immediately because the entry is missing.
+	blockClose := make(chan struct{})
+
+	t.Cleanup(func() { close(blockClose) })
+
+	blocking := &blockingWriteCloser{block: blockClose}
+	onClose := func() {
+		// Mirror writer behaviour: also wedge to prove the goroutine path
+		// supports onClose blockage too.
+		<-blockClose
+	}
+
+	setStdinReturned := make(chan struct{})
+
+	go func() {
+		defer close(setStdinReturned)
+
+		tr.SetStdin("proj", "PROJ-999", blocking, onClose)
+	}()
+
+	// SetStdin must return within stdinCloseTimeout + a small slack.
+	deadline := stdinCloseTimeout + 500*time.Millisecond
+	select {
+	case <-setStdinReturned:
+		// good — SetStdin completed without waiting on the wedged Close.
+	case <-time.After(deadline):
+		t.Fatalf("SetStdin blocked for more than %v on wedged Close; M4 fix is regressed", deadline)
+	}
+
+	// Concurrent tracker ops must still be responsive — proving tracker.mu
+	// was not held during the close.
+	require.NoError(t, tr.Add(info("other-proj", "OTHER-1")))
+	assert.True(t, tr.Has("other-proj", "OTHER-1"),
+		"tracker must remain responsive while wedged Close runs in background")
+	assert.Equal(t, 1, tr.Count(),
+		"tracker.Count must return promptly after late-arrival SetStdin")
+}
+
+// TestSetStdinChat_LateArrivalWedgedClose_DoesNotBlockTracker mirrors the
+// card-mode test for the chat-mode late-arrival branch.
+func TestSetStdinChat_LateArrivalWedgedClose_DoesNotBlockTracker(t *testing.T) {
+	origTimeout := stdinCloseTimeout
+	stdinCloseTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { stdinCloseTimeout = origTimeout })
+
+	tr := New()
+
+	blockClose := make(chan struct{})
+
+	t.Cleanup(func() { close(blockClose) })
+
+	blocking := &blockingWriteCloser{block: blockClose}
+
+	setStdinReturned := make(chan struct{})
+
+	go func() {
+		defer close(setStdinReturned)
+
+		tr.SetStdinChat("01MISSING", blocking, nil)
+	}()
+
+	deadline := stdinCloseTimeout + 500*time.Millisecond
+	select {
+	case <-setStdinReturned:
+		// good — SetStdinChat returned without blocking on Close.
+	case <-time.After(deadline):
+		t.Fatalf("SetStdinChat blocked for more than %v on wedged Close; M4 fix is regressed", deadline)
+	}
+
+	// Chat-mode tracker ops must still be responsive.
+	require.NoError(t, tr.AddChat(&ContainerInfo{SessionID: "01OTHER"}))
+	assert.True(t, tr.HasChat("01OTHER"))
+	assert.Equal(t, 1, tr.Count())
+}
+
+// TestSetStdin_WriteStdin_RaceUnderRace exercises Fix W8: concurrent
+// SetStdin and WriteStdin must not produce a data race on the
+// stdinState field. The invariant under test is that info.stdin is
+// "set once under tracker.mu (write), then stable" — WriteStdin
+// snapshots info under tracker.mu (RLock), releases the lock, and only
+// then nil-checks info.stdin. The race detector (-race) catches any
+// unsynchronised write to that field.
+//
+// Without the W8 invariant documentation, a future refactor that
+// re-introduced a "reset to nil" path for info.stdin would race the
+// lock-free nil-check inside WriteStdin and this test would surface
+// the regression.
+func TestSetStdin_WriteStdin_RaceUnderRace(t *testing.T) {
+	const iterations = 200
+
+	for iter := range iterations {
+		tr := New()
+		require.NoError(t, tr.Add(info("proj", "PROJ-001")))
+
+		var start sync.WaitGroup
+
+		start.Add(1)
+
+		var wg sync.WaitGroup
+
+		// Multiple readers via WriteStdin and CloseStdin: each call
+		// snapshots info under tracker.mu (RLock), drops the lock, and
+		// then dereferences info.stdin without re-acquiring tracker.mu.
+		// The -race detector flags any unsynchronised access to that
+		// field if the invariant is regressed.
+		for range 4 {
+			wg.Go(func() {
+				start.Wait()
+				runtime.Gosched()
+
+				_ = tr.WriteStdin("proj", "PROJ-001", []byte("x"))
+			})
+		}
+
+		// Writer: SetStdin under tracker.mu (write).
+		wg.Go(func() {
+			start.Wait()
+			runtime.Gosched()
+			tr.SetStdin("proj", "PROJ-001", &countingWriteCloser{}, nil)
+		})
+
+		start.Done()
+		wg.Wait()
+
+		// Clean up via Remove so each iteration starts with a fresh
+		// tracker and no zombie state leaks.
+		tr.Remove("proj", "PROJ-001")
+
+		// Tiny yield so the goroutine scheduler exercises different
+		// orderings across iterations.
+		if iter%32 == 0 {
+			runtime.Gosched()
+		}
 	}
 }

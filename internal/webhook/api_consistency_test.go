@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
 	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
@@ -174,6 +175,73 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 		}
 	}
 
+	// withTrackedAndAutonomousCM is the /promote variant of withTracked: it
+	// also wires a real callback.Client pointed at a fake CM server that
+	// returns autonomous=true. After fix W5, /promote refuses to write
+	// stdin without a cmClient, so the no-stdin / stdin-closed promote
+	// rows need this richer setup to reach the WriteStdin branch under
+	// test.
+	withTrackedAndAutonomousCM := func(project, card string, withStdin, stdinClosed bool) setup {
+		return func(t *testing.T) (*Handler, []byte, string) {
+			t.Helper()
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"autonomous":true}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			tr := tracker.New()
+			b := logbroadcast.NewBroadcaster(nil, nil)
+			cmClient := callback.NewClient(srv.URL, "key", slog.New(slog.NewTextHandler(io.Discard, nil)))
+			h := NewHandler(&noopRunner{}, tr, b, cmClient, testAPIKey, 3, testMCPURL,
+				slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+			require.NoError(t, tr.Add(&tracker.ContainerInfo{
+				CardID:  card,
+				Project: project,
+			}))
+
+			if withStdin {
+				fw := &fakeWriteCloser{}
+				tr.SetStdin(project, card, fw, nil)
+
+				if stdinClosed {
+					require.NoError(t, tr.CloseStdin(project, card))
+				}
+			}
+
+			return h, nil, ""
+		}
+	}
+
+	// withChatTracked seeds a chat-mode entry (session_id only) into the
+	// tracker so chat-mode message handling can be exercised through the
+	// same status-code matrix as card-mode rows.
+	withChatTracked := func(sessionID string, withStdin, stdinClosed bool) setup {
+		return func(t *testing.T) (*Handler, []byte, string) {
+			t.Helper()
+
+			tr := tracker.New()
+			b := logbroadcast.NewBroadcaster(nil, nil)
+			h := NewHandler(&noopRunner{}, tr, b, nil, testAPIKey, 3, testMCPURL,
+				slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+			require.NoError(t, tr.AddChat(&tracker.ContainerInfo{
+				SessionID: sessionID,
+			}))
+
+			if withStdin {
+				fw := &fakeWriteCloser{}
+				tr.SetStdinChat(sessionID, fw, nil)
+
+				if stdinClosed {
+					require.NoError(t, tr.CloseStdinChat(sessionID))
+				}
+			}
+
+			return h, nil, ""
+		}
+	}
+
 	blank := func(t *testing.T) (*Handler, []byte, string) {
 		t.Helper()
 
@@ -324,11 +392,20 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 			wantCode:   CodeStdinClosed,
 		},
 		{
+			name:       "message (chat): stdin closed (session ended) -> 410 stdin_closed",
+			setup:      withChatTracked("sess-closed", true, true),
+			path:       "/message",
+			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
+			payload:    MessagePayload{SessionID: "sess-closed", Content: "hi"},
+			wantStatus: http.StatusGone,
+			wantCode:   CodeStdinClosed,
+		},
+		{
 			name:       "message: too large -> 413 too_large",
 			setup:      withTracked("proj", "CARD-1", true, false),
 			path:       "/message",
 			handler:    func(h *Handler) http.HandlerFunc { return h.handleMessage },
-			payload:    MessagePayload{CardID: "CARD-1", Project: "proj", Content: strings.Repeat("x", maxMessageContent+1)},
+			payload:    MessagePayload{CardID: "CARD-1", Project: "proj", Content: strings.Repeat("x", MaxMessageContentBytes+1)},
 			wantStatus: http.StatusRequestEntityTooLarge,
 			wantCode:   CodeTooLarge,
 		},
@@ -372,6 +449,12 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 		},
 
 		// /promote
+		//
+		// After fix W5, /promote refuses to operate without a cmClient
+		// (autonomous verification is mandatory). Tests using the "blank"
+		// setup hit the 404 path before cmClient is touched, so they work
+		// fine; the no-stdin / stdin-closed cases need a real cmClient
+		// pointing at a fake server that returns autonomous=true.
 		{
 			name:       "promote: not tracked -> 404 not_found",
 			setup:      blank,
@@ -383,7 +466,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 		},
 		{
 			name:       "promote: no stdin -> 409 conflict",
-			setup:      withTracked("proj", "CARD-1", false, false),
+			setup:      withTrackedAndAutonomousCM("proj", "CARD-1", false, false),
 			path:       "/promote",
 			handler:    func(h *Handler) http.HandlerFunc { return h.handlePromote },
 			payload:    PromotePayload{CardID: "CARD-1", Project: "proj"},
@@ -392,7 +475,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 		},
 		{
 			name:       "promote: stdin closed -> 410 stdin_closed",
-			setup:      withTracked("proj", "CARD-1", true, true),
+			setup:      withTrackedAndAutonomousCM("proj", "CARD-1", true, true),
 			path:       "/promote",
 			handler:    func(h *Handler) http.HandlerFunc { return h.handlePromote },
 			payload:    PromotePayload{CardID: "CARD-1", Project: "proj"},
@@ -566,3 +649,5 @@ func (n *noopRunner) StreamChatLogs(_ context.Context, _, _, _ string) {}
 func (n *noopRunner) WaitAndCleanupChat(_, _, _ string) {}
 
 func (n *noopRunner) DeleteChatCleanup(_ string) {}
+
+func (n *noopRunner) KillChat(_ context.Context, _ string) error { return nil }

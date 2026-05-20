@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -36,6 +37,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/config"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
+	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -574,7 +576,7 @@ func TestRun_CustomImage(t *testing.T) {
 func TestKill(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	canceled := false
 
@@ -593,7 +595,7 @@ func TestKill(t *testing.T) {
 func TestKill_NotFound(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.Kill("proj", "PROJ-999")
 	assert.ErrorContains(t, err, "no container tracked")
@@ -616,7 +618,7 @@ func TestCleanupOrphans(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.NoError(t, err)
@@ -652,7 +654,7 @@ func TestCleanupOrphans_SkipsTrackedContainers(t *testing.T) {
 		Project: "proj", CardID: "A-001", ContainerID: "live-1",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.NoError(t, err)
@@ -660,11 +662,13 @@ func TestCleanupOrphans_SkipsTrackedContainers(t *testing.T) {
 		"only the untracked container must be removed; tracked live-1 must survive")
 }
 
-// TestCleanupOrphans_PartialFailure verifies that a per-container Stop failure
-// does not short-circuit cleanup of the remaining orphans and that the
-// returned error wraps the failure via errors.Join so callers can still see
-// which container failed.
-func TestCleanupOrphans_PartialFailure(t *testing.T) {
+// TestCleanupOrphans_StopFailureWithSuccessfulRemoveIsNotAnError asserts that
+// a per-container Stop failure that ends in a successful force-Remove is
+// logged as a warning but NOT returned as an error. The container is gone,
+// which is the only outcome that matters. Returning Stop failures as hard
+// errors used to mislead callers into thinking cleanup did not complete,
+// even when every orphan was ultimately destroyed.
+func TestCleanupOrphans_StopFailureWithSuccessfulRemoveIsNotAnError(t *testing.T) {
 	var (
 		stopIDs   []string
 		removeIDs []string
@@ -676,7 +680,7 @@ func TestCleanupOrphans_PartialFailure(t *testing.T) {
 	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
 		return []DockerContainer{
 			{ID: "orphan-1", Labels: map[string]string{LabelCardID: "A-001", LabelProject: "proj"}},
-			{ID: "orphan-2-bad", Labels: map[string]string{LabelCardID: "A-002", LabelProject: "proj"}},
+			{ID: "orphan-2-bad-stop", Labels: map[string]string{LabelCardID: "A-002", LabelProject: "proj"}},
 			{ID: "orphan-3", Labels: map[string]string{LabelCardID: "A-003", LabelProject: "proj"}},
 		}, nil
 	}
@@ -686,7 +690,7 @@ func TestCleanupOrphans_PartialFailure(t *testing.T) {
 		stopIDs = append(stopIDs, id)
 		muStop.Unlock()
 
-		if id == "orphan-2-bad" {
+		if id == "orphan-2-bad-stop" {
 			return fmt.Errorf("docker stop failed for %s", id)
 		}
 
@@ -698,25 +702,58 @@ func TestCleanupOrphans_PartialFailure(t *testing.T) {
 		removeIDs = append(removeIDs, id)
 		muRemove.Unlock()
 
+		// Every Remove succeeds — including the one whose Stop failed.
 		return nil
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
-	require.Error(t, err, "CleanupOrphans must return the joined per-container failures")
-	assert.Contains(t, err.Error(), "orphan-2-bad",
-		"joined error must identify the failing container")
-	assert.Contains(t, err.Error(), "stop orphan",
-		"joined error must describe which operation failed")
+	require.NoError(t, err,
+		"CleanupOrphans must NOT return an error when every container was ultimately removed, "+
+			"even if Stop failed for some of them")
 
-	// All three containers must have been attempted regardless of the middle
-	// failure: the bug this test guards against was aborting on first error.
-	assert.ElementsMatch(t, []string{"orphan-1", "orphan-2-bad", "orphan-3"}, stopIDs,
+	// Every orphan must have been Stop-attempted (cleanup does not abort on
+	// the first failure) and every orphan must end up Remove-attempted.
+	assert.ElementsMatch(t, []string{"orphan-1", "orphan-2-bad-stop", "orphan-3"}, stopIDs,
 		"every orphan must have ContainerStop attempted")
-	assert.ElementsMatch(t, []string{"orphan-1", "orphan-2-bad", "orphan-3"}, removeIDs,
+	assert.ElementsMatch(t, []string{"orphan-1", "orphan-2-bad-stop", "orphan-3"}, removeIDs,
 		"every orphan must have ContainerRemove attempted even after a Stop failure")
+}
+
+// TestCleanupOrphans_RemoveFailureIsAnError verifies that a Remove failure
+// (the container is genuinely still present after best-effort cleanup) IS
+// surfaced as an error so callers can alarm on it. Distinct from a Stop
+// failure, which is a warning rather than an error.
+func TestCleanupOrphans_RemoveFailureIsAnError(t *testing.T) {
+	mock := successfulMock()
+	mock.ContainerListFn = func(_ context.Context, _ container.ListOptions) ([]DockerContainer, error) {
+		return []DockerContainer{
+			{ID: "orphan-1", Labels: map[string]string{LabelCardID: "A-001", LabelProject: "proj"}},
+			{ID: "orphan-stuck", Labels: map[string]string{LabelCardID: "A-002", LabelProject: "proj"}},
+		}, nil
+	}
+	mock.ContainerStopFn = func(_ context.Context, _ string, _ container.StopOptions) error {
+		return nil
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, id string, _ container.RemoveOptions) error {
+		if id == "orphan-stuck" {
+			return fmt.Errorf("docker remove failed for %s", id)
+		}
+
+		return nil
+	}
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
+
+	err := mgr.CleanupOrphans(context.Background())
+	require.Error(t, err, "CleanupOrphans must return an error when a container could not be removed")
+	assert.Contains(t, err.Error(), "orphan-stuck",
+		"error must identify the container that failed to remove")
+	assert.Contains(t, err.Error(), "remove orphan",
+		"error must describe which operation failed")
 }
 
 func TestStreamLogs_WithLogData(t *testing.T) {
@@ -1555,6 +1592,50 @@ func TestPrimingWriteStdin_WriteDeadline(t *testing.T) {
 	assert.Equal(t, 0, tr.Count())
 }
 
+// TestWritePrimingTimeoutMarksStdinClosed verifies that when the priming
+// WriteStdin times out and we force-close the writer, the tracker's stdin
+// state is also flipped to "closed" (via MarkStdinClosed) so a subsequent
+// /message call returns ErrStdinClosed (mapped to 410 Gone) instead of
+// surfacing the closed-writer I/O error as a generic 500.
+func TestWritePrimingTimeoutMarksStdinClosed(t *testing.T) {
+	saved := primingWriteTimeout
+	primingWriteTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { primingWriteTimeout = saved })
+
+	tr := tracker.New()
+	mgr := NewManager(successfulMock(), tr, nil, nil, nil, testConfig(t), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	// Attach a blocking writer so the priming WriteStdin wedges on its
+	// Write call until the writer is force-closed by the timeout path.
+	blocker := newBlockingWriteCloser()
+	tr.SetStdin(payload.Project, payload.CardID, blocker, nil)
+
+	// Run writePrimingWithTimeout directly to exercise the timeout branch
+	// without spinning up the full Run+attach machinery.
+	mgr.writePrimingWithTimeout(payload, "ctr-priming-timeout", []byte("hello"), blocker)
+
+	// Wait for the detached priming-write goroutine to unwind (the wg
+	// guards leak detection in other tests; we just need the Mark to
+	// have landed by the time we assert).
+	mgr.Wait()
+
+	// After the timeout MarkStdinClosed must have been called on the
+	// tracker entry; a subsequent WriteStdin must therefore return
+	// ErrStdinClosed (NOT a closed-writer I/O error and NOT
+	// ErrNoStdinAttached).
+	err := tr.WriteStdin(payload.Project, payload.CardID, []byte("after"))
+	require.ErrorIs(t, err, tracker.ErrStdinClosed,
+		"WriteStdin after priming-timeout must return ErrStdinClosed (-> 410 Gone)")
+	require.NotErrorIs(t, err, tracker.ErrNoStdinAttached)
+}
+
 func TestInteractive_FalseNoStdinFlagsNoAttach(t *testing.T) {
 	var (
 		capturedCfg  *container.Config
@@ -1690,8 +1771,18 @@ func TestWaitAndCleanup_ParentContextCanceled(t *testing.T) {
 
 	mgr.Run(ctx, payload)
 
-	// Let the container get started and enter waitAndCleanup, then cancel.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until startContainer has set the container ID — confirms the
+	// run goroutine has entered waitAndCleanup and registered its defers,
+	// so cancel() exercises the ctx.Done() branch instead of racing
+	// startContainer. Mirrors the pattern used by
+	// TestKill_InteractiveContainer_RemovesContainer and friends.
+	require.Eventually(t, func() bool {
+		snap, ok := tr.Snapshot(payload.Project, payload.CardID)
+
+		return ok && snap.ContainerID != ""
+	}, 5*time.Second, 10*time.Millisecond,
+		"tracker must have container ID before cancel")
+
 	cancel()
 	mgr.Wait()
 
@@ -2005,6 +2096,136 @@ func TestWaitAndCleanup_ErrChFromContainerWait(t *testing.T) {
 	}
 }
 
+// TestWaitAndCleanup_ParentCancelRacingErrCh_ClassifiesAsKilled verifies the
+// disambiguation between OutcomeTimeout and OutcomeKilled when the Docker
+// SDK's ContainerWait writes a context-canceled error into errCh AT THE SAME
+// TIME the parent ctx is canceled.
+//
+// Go's select picks pseudo-randomly between errCh and ctx.Done(); when errCh
+// wins, the cleanup branch used to read `waitCtx.Err() != nil` and classify
+// the cancellation as a timeout, silently reporting the wrong terminal state
+// to ContextMatrix and the metrics histogram.
+//
+// The fix gates the timeout branch on
+// `errors.Is(waitCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil`
+// and routes parent-cancellation to the same path as the ctx.Done() branch.
+func TestWaitAndCleanup_ParentCancelRacingErrCh_ClassifiesAsKilled(t *testing.T) {
+	type statusReport struct {
+		status, message string
+	}
+
+	reportedStatuses := make(chan statusReport, 4)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+			Message      string `json:"message"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reportedStatuses <- statusReport{req.RunnerStatus, req.Message}:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	// errCh is buffered with a context-canceled error from the start; the
+	// mock's ContainerWait returns it unconditionally so the wait-side
+	// select sees both errCh and ctx.Done() ready at the same time (the
+	// race we are guarding against).
+	mock := successfulMock()
+	mock.ContainerCreateFn = func(_ context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		return container.CreateResponse{ID: "racey-ctr-id"}, nil
+	}
+	mock.ContainerWaitFn = func(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		errCh := make(chan error, 1)
+
+		go func() {
+			// Wait for parent ctx (operator /kill) to cancel, THEN emit
+			// the context.Canceled into errCh — Docker SDK behaviour.
+			<-ctx.Done()
+
+			errCh <- ctx.Err()
+		}()
+
+		return make(chan container.WaitResponse), errCh
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	cfg := testConfig(t)
+	// Use a comfortably-long container timeout so waitCtx never fires its
+	// real deadline; the only way errCh gets populated is via parent ctx.
+	cfg.ContainerTimeout = "1h"
+	cfg.ParseContainerTimeout()
+
+	mgr := NewManager(mock, tr, cb, tp, nil, cfg, testLogger())
+
+	payload := testPayload()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+
+	// Wait until the run goroutine has registered the container ID so the
+	// kill exercises the wait path, not the start path.
+	require.Eventually(t, func() bool {
+		snap, ok := tr.Snapshot(payload.Project, payload.CardID)
+
+		return ok && snap.ContainerID != ""
+	}, 5*time.Second, 10*time.Millisecond,
+		"tracker must have container ID before cancel")
+
+	cancel()
+	mgr.Wait()
+
+	// The failure callback must carry the "killed by operator" message,
+	// not the timeout message. Before the fix the message read "container
+	// timed out after 1h" because waitCtx.Err() was non-nil.
+	var (
+		sawFailed  bool
+		sawKilled  bool
+		sawTimeout bool
+	)
+
+drainLoop:
+	for {
+		select {
+		case s := <-reportedStatuses:
+			if s.status == "failed" {
+				sawFailed = true
+			}
+
+			if strings.Contains(s.message, "killed by operator") {
+				sawKilled = true
+			}
+
+			if strings.Contains(s.message, "timed out") {
+				sawTimeout = true
+			}
+		default:
+			break drainLoop
+		}
+	}
+
+	assert.True(t, sawFailed, "reportFailure must fire even when errCh wins the select race")
+	assert.True(t, sawKilled, "race outcome must be classified as killed_by_operator, not timeout")
+	assert.False(t, sawTimeout, "parent-ctx-cancel race must NOT be classified as a timeout")
+}
+
 // TestKillContainer_Success directly drives the killContainer helper and
 // verifies ContainerStop is called with the provided ID and grace period.
 func TestKillContainer_Success(t *testing.T) {
@@ -2024,7 +2245,7 @@ func TestKillContainer_Success(t *testing.T) {
 		return nil
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 	mgr.killContainer(context.Background(), "target-id", testLogger())
 
 	assert.Equal(t, "target-id", gotID)
@@ -2040,7 +2261,7 @@ func TestKillContainer_StopError(t *testing.T) {
 		return fmt.Errorf("docker not reachable")
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 	// Must not panic or block.
 	assert.NotPanics(t, func() {
 		mgr.killContainer(context.Background(), "id", testLogger())
@@ -2055,7 +2276,7 @@ func TestRemoveContainer_Failure(t *testing.T) {
 		return fmt.Errorf("container busy")
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	assert.NotPanics(t, func() {
 		mgr.removeContainer(context.Background(), "id", testLogger())
@@ -2351,12 +2572,120 @@ func TestPullImage_EmptyPolicyReturnsError(t *testing.T) {
 	}
 	cfg.ParseContainerTimeout()
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, cfg, testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
 
 	err := mgr.pullImage(context.Background(), "test-image:latest")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "image_pull_policy is unset")
 	assert.Contains(t, err.Error(), "programming error")
+}
+
+// TestPullImage_RegistryErrorInStream verifies pullImage surfaces a
+// registry-side error reported via the ImagePull NDJSON stream. Pre-fix
+// these errors were silently swallowed by io.Copy(io.Discard, reader),
+// and the failure only manifested later as the much less actionable
+// `ContainerCreate: no such image`.
+func TestPullImage_RegistryErrorInStream(t *testing.T) {
+	tests := []struct {
+		name       string
+		streamBody string
+		wantSubstr string
+	}{
+		{
+			name:       "top-level error field",
+			streamBody: `{"status":"Pulling fs layer","id":"abc"}` + "\n" + `{"error":"manifest unknown"}` + "\n",
+			wantSubstr: "manifest unknown",
+		},
+		{
+			name:       "errorDetail.message field",
+			streamBody: `{"errorDetail":{"message":"unauthorized: authentication required"}}` + "\n",
+			wantSubstr: "unauthorized: authentication required",
+		},
+		{
+			name: "error after progress lines",
+			streamBody: `{"status":"Pulling fs layer","id":"abc"}` + "\n" +
+				`{"status":"Downloading","id":"abc"}` + "\n" +
+				`{"error":"pull access denied"}` + "\n",
+			wantSubstr: "pull access denied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &MockDockerClient{
+				ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+					return io.NopCloser(strings.NewReader(tt.streamBody)), nil
+				},
+			}
+
+			cfg := &config.Config{
+				BaseImage:        "test-image:latest",
+				ContainerTimeout: "1h",
+				ImagePullPolicy:  config.PullAlways,
+			}
+			cfg.ParseContainerTimeout()
+
+			mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
+
+			err := mgr.pullImage(context.Background(), "test-image:latest")
+			require.Error(t, err, "stream containing %q must surface as error", tt.wantSubstr)
+			assert.Contains(t, err.Error(), tt.wantSubstr)
+		})
+	}
+}
+
+// TestPullImage_SuccessStreamReturnsNil verifies a clean NDJSON progress
+// stream (no error/errorDetail frames) returns nil and does not falsely
+// flag a successful pull as failed.
+func TestPullImage_SuccessStreamReturnsNil(t *testing.T) {
+	body := `{"status":"Pulling from library/test","id":"latest"}` + "\n" +
+		`{"status":"Pulling fs layer","id":"abc"}` + "\n" +
+		`{"status":"Downloading","id":"abc","progressDetail":{"current":100,"total":100}}` + "\n" +
+		`{"status":"Pull complete","id":"abc"}` + "\n"
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(body)), nil
+		},
+	}
+
+	cfg := &config.Config{
+		BaseImage:        "test-image:latest",
+		ContainerTimeout: "1h",
+		ImagePullPolicy:  config.PullAlways,
+	}
+	cfg.ParseContainerTimeout()
+
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
+
+	err := mgr.pullImage(context.Background(), "test-image:latest")
+	require.NoError(t, err)
+}
+
+// TestPullImage_MalformedStreamLogsButDoesNotError verifies an undecodable
+// progress line stops decoding but does not return an error — partial
+// valid prefixes can still represent a successful pull on older daemons.
+// (See the inline comment in pullImage for the rationale.)
+func TestPullImage_MalformedStreamLogsButDoesNotError(t *testing.T) {
+	body := `{"status":"Pulling fs layer"}` + "\n" + `not-json-at-all` + "\n"
+
+	mock := &MockDockerClient{
+		ImagePullFn: func(_ context.Context, _ string, _ image.PullOptions) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(body)), nil
+		},
+	}
+
+	cfg := &config.Config{
+		BaseImage:        "test-image:latest",
+		ContainerTimeout: "1h",
+		ImagePullPolicy:  config.PullAlways,
+	}
+	cfg.ParseContainerTimeout()
+
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
+
+	err := mgr.pullImage(context.Background(), "test-image:latest")
+	assert.NoError(t, err, "malformed progress line must not be a hard failure")
 }
 
 // TestWaitAndCleanup_MessageDuringCleanupGets404 verifies that the tracker
@@ -2541,7 +2870,7 @@ func TestIdleWatchdog_DoesNotKillWhileActive(t *testing.T) {
 	mock := successfulMock()
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, cfg, testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, cfg, testLogger())
 
 	var cancelled atomic.Bool
 
@@ -2644,6 +2973,107 @@ func TestIdleWatchdog_Disabled(t *testing.T) {
 		"watchdog must not fire when IdleOutputTimeout is 0 (only tracker.Remove may invoke Cancel)")
 }
 
+// TestIdleWatchdog_PanicRecovery verifies that a panic inside the watchdog's
+// inner Kill path (here, injected via a tracker Cancel func that panics) is
+// caught by the deferred recover so the goroutine exits cleanly instead of
+// unwinding into the runner crash handler. The PanicRecoveredTotal counter
+// must be incremented with the GoroutineIdleWatchdog label so operators can
+// alert on this specific class of failure.
+func TestIdleWatchdog_PanicRecovery(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IdleOutputTimeout = 50 * time.Millisecond
+	cfg.IdleWatchdogInterval = 10 * time.Millisecond
+
+	mock := successfulMock()
+
+	tr := tracker.New()
+	broadcaster := newRecordingBroadcaster()
+	t.Cleanup(broadcaster.Close)
+
+	mx := metrics.New()
+
+	mgr := NewManager(mock, tr, nil, nil, broadcaster.Broadcaster(), cfg, testLogger()).WithMetrics(mx)
+
+	// The watchdog fires once, calls m.Kill, which calls tracker.Cancel,
+	// which invokes the stored Cancel func. Make Cancel panic so the
+	// runIdleWatchdog deferred recover is exercised.
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+		Cancel:  func() { panic("synthetic watchdog Cancel panic") },
+	}))
+
+	// Seed lastOutputAt well in the past so the very first poll deems the
+	// container idle and triggers the kill path.
+	var lastOutputAt atomic.Pointer[time.Time]
+
+	stale := time.Now().Add(-time.Hour)
+	lastOutputAt.Store(&stale)
+
+	done := make(chan struct{})
+
+	// Run on a goroutine and assert it does not propagate the panic up to
+	// the test goroutine — recovery must keep the program alive.
+	go func() {
+		defer close(done)
+
+		assert.NotPanics(t, func() {
+			mgr.runIdleWatchdog(t.Context(), make(chan struct{}), "ctr-panic",
+				payload, testLogger(), &lastOutputAt, cfg.IdleOutputTimeout)
+		}, "runIdleWatchdog must recover from a panic in its inner Kill path")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog goroutine did not exit within 2s after panic")
+	}
+
+	// The deferred recover must bump cmr_panic_recovered_total{goroutine=idle_watchdog}.
+	got := panicCounterValue(t, mx, metrics.GoroutineIdleWatchdog)
+	assert.InDelta(t, 1.0, got, 0.0,
+		"PanicRecoveredTotal{goroutine=idle_watchdog} must be 1 after recovery")
+
+	// The system entry surfaced via m.handlePanic should be visible on the
+	// broadcaster — operators observe the internal-error event in /logs.
+	require.Eventually(t, func() bool {
+		for _, e := range broadcaster.Entries() {
+			if e.Type == "system" && strings.Contains(e.Content, "idle watchdog panicked") {
+				return true
+			}
+		}
+
+		return false
+	}, 2*time.Second, 10*time.Millisecond,
+		"a system 'idle watchdog panicked' event must be published after recovery")
+}
+
+// panicCounterValue returns the value of cmr_panic_recovered_total for the
+// given goroutine label, or 0 if no series exists for that label.
+func panicCounterValue(t *testing.T, mx *metrics.Metrics, goroutine string) float64 {
+	t.Helper()
+
+	families, err := mx.Registry.Gather()
+	require.NoError(t, err)
+
+	for _, fam := range families {
+		if fam.GetName() != "cmr_panic_recovered_total" {
+			continue
+		}
+
+		for _, series := range fam.Metric {
+			for _, lp := range series.Label {
+				if lp.GetName() == "goroutine" && lp.GetValue() == goroutine {
+					return series.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
 // TestPruneImages_CallsDockerWithCorrectFilters verifies PruneImages forwards
 // the prune filters (dangling=true, until=24h) to dockerd and surfaces
 // the prune report as a nil error.
@@ -2661,7 +3091,7 @@ func TestPruneImages_CallsDockerWithCorrectFilters(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.PruneImages(context.Background())
 	require.NoError(t, err)
@@ -2684,7 +3114,7 @@ func TestPruneImages_PropagatesDockerError(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.PruneImages(context.Background())
 	require.Error(t, err)
@@ -2727,7 +3157,7 @@ func (s *stubResolver) LookupHost(ctx context.Context, _ string) ([]string, erro
 func TestBuildExtraHosts_DNSTimeout(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 	mgr.resolver = &stubResolver{sleep: 5 * time.Second, addrs: []string{"10.0.0.1"}}
 
 	start := time.Now()
@@ -2747,7 +3177,7 @@ func TestBuildExtraHosts_DNSTimeout(t *testing.T) {
 func TestBuildExtraHosts_DNSCache(t *testing.T) {
 	mock := successfulMock()
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	stub := &stubResolver{addrs: []string{"192.0.2.17"}}
 	mgr.resolver = stub
@@ -2766,10 +3196,16 @@ func TestBuildExtraHosts_DNSCache(t *testing.T) {
 
 // TestRun_RunningCallbackAsync asserts that startContainer + waitAndCleanup
 // do not block on a slow running-status callback. The mock callback server
-// sleeps 500ms before responding; the whole Run must still complete well
-// under 1s because the callback is fired on a detached goroutine.
+// sleeps 500ms before responding; the Run path (start + wait + reportTerminal)
+// must still complete with the running-status callback still pending. The
+// callback is wg-tracked so mgr.Wait() drains it before returning — measure
+// only the inner Run path here, not Wait, since wg.Wait blocks on the
+// detached goroutine by design.
 func TestRun_RunningCallbackAsync(t *testing.T) {
-	var runningSeen atomic.Bool
+	var (
+		runningStartedAt atomic.Int64
+		runningSeen      atomic.Bool
+	)
 
 	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -2781,6 +3217,7 @@ func TestRun_RunningCallbackAsync(t *testing.T) {
 		_ = json.Unmarshal(body, &req)
 
 		if req.RunnerStatus == "running" {
+			runningStartedAt.Store(time.Now().UnixNano())
 			runningSeen.Store(true)
 			// Simulate a slow CM by sleeping before responding.
 			time.Sleep(500 * time.Millisecond)
@@ -2804,24 +3241,23 @@ func TestRun_RunningCallbackAsync(t *testing.T) {
 		Project: payload.Project,
 	}))
 
-	start := time.Now()
-
 	mgr.Run(context.Background(), payload)
+
+	// Wait for the slow callback handler to have started before the inner
+	// container path is done. That confirms the goroutine spawned ahead of
+	// the spawn-path returning rather than waiting for the callback inline.
+	require.Eventually(t, func() bool { return runningStartedAt.Load() != 0 },
+		2*time.Second, 10*time.Millisecond,
+		"running callback must enter the handler before Wait blocks")
+
+	// mgr.Wait drains the wg-tracked callback goroutine, so it blocks for
+	// the remainder of the 500ms sleep. That's expected and acceptable —
+	// the assertion above already confirms the callback was non-blocking
+	// for the spawn path itself.
 	mgr.Wait()
 
-	elapsed := time.Since(start)
-
-	// The container's Wait path returns immediately via the mock, so the
-	// whole Run should complete in well under 1s. If the running callback
-	// were synchronous, the 500ms CM sleep would push us past that mark.
-	assert.Less(t, elapsed, 500*time.Millisecond,
-		"Run must not block on the running-status callback; got %s", elapsed)
-
-	// Give the async callback a chance to land so we don't leak a goroutine
-	// into subsequent tests. We don't assert runningSeen inside the <500ms
-	// window because the goroutine may not have raced ahead of mgr.Wait().
-	require.Eventually(t, runningSeen.Load, 2*time.Second, 10*time.Millisecond,
-		"running callback must eventually fire on its own goroutine")
+	assert.True(t, runningSeen.Load(),
+		"running callback must fire on its own goroutine")
 }
 
 // slowCloseWriteCloser is a WriteCloser whose Close() blocks for a fixed
@@ -3185,7 +3621,7 @@ func TestListManaged_ReportsTrackerDivergence(t *testing.T) {
 		Project: "proj", CardID: "A-001", ContainerID: "tracked-abc",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	got, err := mgr.ListManaged(context.Background())
 	require.NoError(t, err)
@@ -3214,7 +3650,7 @@ func TestListManaged_DockerError(t *testing.T) {
 		return nil, fmt.Errorf("docker unreachable")
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	_, err := mgr.ListManaged(context.Background())
 	require.Error(t, err)
@@ -3251,7 +3687,7 @@ func TestForceRemoveByLabels_RemovesEveryMatch(t *testing.T) {
 		return nil
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	n, err := mgr.ForceRemoveByLabels(context.Background(), "proj", "A-001")
 	require.NoError(t, err)
@@ -3268,7 +3704,7 @@ func TestForceRemoveByLabels_NoMatchReturnsZero(t *testing.T) {
 		return nil, nil
 	}
 
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	n, err := mgr.ForceRemoveByLabels(context.Background(), "proj", "A-001")
 	require.NoError(t, err)
@@ -3280,7 +3716,7 @@ func TestForceRemoveByLabels_NoMatchReturnsZero(t *testing.T) {
 // them all — which would happen if the label filter were silently ignored
 // by Docker when the value is empty.
 func TestForceRemoveByLabels_RequiresProjectAndCard(t *testing.T) {
-	mgr := NewManager(nil, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(nil, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	_, err := mgr.ForceRemoveByLabels(context.Background(), "", "A-001")
 	require.Error(t, err)
@@ -3634,6 +4070,64 @@ func TestContainerCreate_TaskSkillsPull(t *testing.T) {
 
 		err := pullSkillsRepo(context.Background(), dir, "any-token")
 		assert.NoError(t, err, "pullSkillsRepo must return nil when dir is not a git repo")
+	})
+
+	t.Run("concurrent pulls are serialised by skillsPullMu", func(t *testing.T) {
+		// Two concurrent taskSkillsMount calls against the same Manager
+		// (same TaskSkillsDir) must not overlap inside pullSkillsRepo,
+		// because `git pull` writes .git/index.lock and cannot share a
+		// working tree. The stub records overlap by tracking the active
+		// in-flight count and asserts it never exceeds 1.
+		dir := t.TempDir()
+		cfg := testConfig(t)
+		cfg.TaskSkillsDir = dir
+
+		orig := pullSkillsRepo
+
+		t.Cleanup(func() { pullSkillsRepo = orig })
+
+		var (
+			active     atomic.Int32
+			maxActive  atomic.Int32
+			callsTotal atomic.Int32
+		)
+
+		pullSkillsRepo = func(_ context.Context, _, _ string) error {
+			n := active.Add(1)
+
+			for {
+				cur := maxActive.Load()
+				if n <= cur || maxActive.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			// Hold the slot briefly so a concurrent caller has a real
+			// chance to overlap if the mutex is missing.
+			time.Sleep(20 * time.Millisecond)
+			active.Add(-1)
+			callsTotal.Add(1)
+
+			return nil
+		}
+
+		mgr := NewManager(successfulMock(), tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
+
+		const fanout = 8
+
+		var wg sync.WaitGroup
+
+		for range fanout {
+			wg.Go(func() {
+				_, _ = mgr.taskSkillsMount(context.Background(), "tok")
+			})
+		}
+
+		wg.Wait()
+
+		assert.EqualValues(t, fanout, callsTotal.Load(),
+			"every caller must complete its pull")
+		assert.LessOrEqual(t, maxActive.Load(), int32(1),
+			"skillsPullMu must keep concurrent pulls strictly serial (max overlap = 1)")
 	})
 }
 
@@ -4604,7 +5098,7 @@ func TestListManaged_IncludesChatContainers(t *testing.T) {
 		SessionID: "S-known", Project: "proj", ContainerID: "chat-ctr-tracked",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	got, err := mgr.ListManaged(context.Background())
 	require.NoError(t, err)
@@ -4661,7 +5155,7 @@ func TestCleanupOrphans_SkipsTrackedChat(t *testing.T) {
 		SessionID: "S-live", Project: "proj", ContainerID: "live-chat",
 	}))
 
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.CleanupOrphans(context.Background())
 	require.NoError(t, err)
@@ -4860,7 +5354,7 @@ func TestKillChat_ClosesStdinThenStops(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	const (
 		sessionID   = "01TESTCHAT"
@@ -4896,7 +5390,7 @@ func TestKillChat_NotFound(t *testing.T) {
 	t.Parallel()
 
 	mock := successfulMock()
-	mgr := NewManager(mock, tracker.New(), nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tracker.New(), nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	err := mgr.KillChat(context.Background(), "no-such-session")
 	require.Error(t, err)
@@ -4923,7 +5417,7 @@ func TestKillChat_NoStdinAttached(t *testing.T) {
 	}
 
 	tr := tracker.New()
-	mgr := NewManager(mock, tr, nil, nil, nil, testConfig(t), testLogger())
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, testConfig(t), testLogger())
 
 	_, streamCancel := context.WithCancel(context.Background())
 	t.Cleanup(streamCancel)
@@ -4942,9 +5436,10 @@ func TestKillChat_NoStdinAttached(t *testing.T) {
 }
 
 // TestBuildChatAuthEnv_ReturnsGitToken verifies that BuildChatAuthEnv returns
-// a non-empty token when a token provider is wired. Claude auth (OAuth token,
-// API key) is owned by the tokenRefresher and reaches the worker via the
-// shared secrets dir — this function must not return those credentials.
+// a non-empty token when a token provider is wired AND a skills dir is
+// configured. Claude auth (OAuth token, API key) is owned by the tokenRefresher
+// and reaches the worker via the shared secrets dir — this function must not
+// return those credentials.
 func TestBuildChatAuthEnv_ReturnsGitToken(t *testing.T) {
 	t.Parallel()
 
@@ -4952,12 +5447,48 @@ func TestBuildChatAuthEnv_ReturnsGitToken(t *testing.T) {
 	cfg := &config.Config{
 		ClaudeOAuthToken: "should-not-appear",
 		AnthropicAPIKey:  "neither",
+		// TaskSkillsDir non-empty: the mint is gated on a real consumer for
+		// the token (the skills bind-mount git pull).
+		TaskSkillsDir: t.TempDir(),
 	}
 
 	mgr := NewManager(nil, tracker.New(), nil, tp, nil, cfg, testLogger())
 	tok := mgr.BuildChatAuthEnv(context.Background())
 
 	require.NotEmpty(t, tok, "BuildChatAuthEnv must return a non-empty token when a provider is wired")
+}
+
+// TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir keeps chat-mode symmetric with
+// the card-mode startContainer mint guard: without TaskSkillsDir the token has
+// no consumer, so /chat/start must pay zero GitHub API round-trips.
+func TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"token":      "ghs_should_not_be_used",
+			"expires_at": "2030-01-01T00:00:00Z",
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, err := githubauth.NewAppProviderWithKey(12345, 67890, testRSAKey(), srv.URL)
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		// TaskSkillsDir intentionally empty.
+	}
+
+	mgr := NewManager(nil, tracker.New(), nil, tp, nil, cfg, testLogger())
+	tok := mgr.BuildChatAuthEnv(context.Background())
+
+	require.Empty(t, tok, "BuildChatAuthEnv must return empty when TaskSkillsDir is unset")
+	require.Equal(t, 0, calls, "BuildChatAuthEnv must not call GenerateToken when TaskSkillsDir is unset")
 }
 
 // TestManager_StartChat_ResumeMountReadOnly verifies that StartChat binds
@@ -5138,7 +5669,7 @@ func TestManager_PrepareChatResume_FilePerms(t *testing.T) {
 
 	cfg := testConfig(t)
 
-	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+	mgr := NewManager(nil, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
 
 	resume := &ChatResume{
 		Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hi"}},
@@ -5167,7 +5698,7 @@ func TestManager_PrepareChatResume_NonceUniqueness(t *testing.T) {
 
 	cfg := testConfig(t)
 
-	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+	mgr := NewManager(nil, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
 
 	resume := &ChatResume{
 		Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "hi"}},
@@ -5195,7 +5726,7 @@ func TestManager_PrepareChatResume_CleansUpOnWriteFailure(t *testing.T) {
 
 	cfg := testConfig(t)
 
-	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+	mgr := NewManager(nil, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
 
 	// Inject a createFile that fails for resume.jsonl but succeeds for others
 	mgr.SetCreateFileForTest(func(path string) (*os.File, error) {
@@ -5231,7 +5762,7 @@ func TestManager_PrepareChatResume_FallsBackToTmpInDevMode(t *testing.T) {
 	cfg.SecretsDir = "/nonexistent/path/that/cannot/be/created"
 	cfg.DeploymentProfile = "dev"
 
-	mgr := NewManager(nil, tracker.New(), nil, nil, nil, cfg, testLogger())
+	mgr := NewManager(nil, tracker.New(), nil, testPATProvider(t), nil, cfg, testLogger())
 
 	resume := &ChatResume{
 		Turns: []ChatResumeTurn{{Seq: 1, Role: "user", Content: "fallback test"}},
@@ -5313,4 +5844,188 @@ func TestStartTokenRefresherWritesSecretsFile(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(dir, "shared", "env"))
 	require.NoError(t, err)
 	assert.Contains(t, string(b), "ghs_init")
+}
+
+// TestStreamLogs_OversizedStderrLine_DoesNotWedge exercises Fix M2: when a
+// stderr line exceeds bufio.Scanner's 1 MiB cap, the scanner aborts with
+// bufio.ErrTooLong. The pipe writer (stdcopy) would otherwise block forever
+// on its next Write into the now-undrained pipe — wedging the outer
+// streamLogs goroutine and blocking tracker.Remove + removeContainer.
+//
+// The fix closes stderrPr on scanner exit AND drains any in-flight bytes, so
+// stdcopy completes and the outer goroutine sees EOF on the docker reader.
+//
+// We verify the cleanup sequence runs within a bounded deadline rather than
+// hanging until the test timeout, which is what the pre-fix behaviour would
+// look like.
+func TestStreamLogs_OversizedStderrLine_DoesNotWedge(t *testing.T) {
+	// Build a Docker multiplexed stream with a single stderr "line" larger
+	// than the 1 MiB scanner cap, followed by EOF on the underlying reader.
+	var buf bytes.Buffer
+
+	stderrW := stdcopy.NewStdWriter(&buf, stdcopy.Stderr)
+	// 1.5 MiB of 'a' followed by a single newline — well above the 1 MiB cap
+	// so scanner.Scan returns false with bufio.ErrTooLong.
+	huge := make([]byte, (3*1024*1024)/2)
+	for i := range huge {
+		huge[i] = 'a'
+	}
+
+	_, err := stderrW.Write(append(huge, '\n'))
+	require.NoError(t, err)
+
+	mock := successfulMock()
+	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+		// io.NopCloser around the buffer EOFs at end-of-bytes, so stdcopy
+		// returns and the outer goroutine closes `done`. Without the fix
+		// the stdcopy Write into the stderr pipe would block forever
+		// because no one is reading after scanner aborts.
+		return io.NopCloser(&buf), nil
+	}
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+	tp := testTokenProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	// The whole Run + Wait cycle must complete within a bounded window. The
+	// pre-fix behaviour would hang stdcopy forever and waitAndCleanup would
+	// only release after the configured ContainerTimeout (1h in testConfig)
+	// — way past any reasonable test deadline.
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		mgr.Run(context.Background(), payload)
+		mgr.Wait()
+	}()
+
+	select {
+	case <-done:
+		// good — pipeline drained the oversized stderr and returned.
+	case <-time.After(15 * time.Second):
+		t.Fatal("streamLogs wedged on oversized stderr line; M2 fix is regressed")
+	}
+
+	assert.Equal(t, 0, tr.Count(), "tracker entry must be removed after Run completes")
+}
+
+// TestWaitAndCleanupChat_RemovesChatSecrets exercises Fix M3: the
+// AttachChatStdin-failure rollback path used to invoke RemoveChat + Stop +
+// WaitAndCleanupChat without touching DeleteChatCleanup, leaving the
+// chatSecrets entry stranded forever. WaitAndCleanupChat must now drop the
+// entry regardless of who consumed it.
+func TestWaitAndCleanupChat_RemovesChatSecrets(t *testing.T) {
+	t.Parallel()
+
+	containerID := "ctr-leak-test"
+
+	waitCh := make(chan container.WaitResponse, 1)
+	waitCh <- container.WaitResponse{StatusCode: 0}
+
+	mock := successfulMock()
+	mock.ContainerWaitFn = func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		return waitCh, make(chan error)
+	}
+	mock.ContainerRemoveFn = func(_ context.Context, _ string, _ container.RemoveOptions) error {
+		return nil
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+	tp := testPATProvider(t)
+
+	mgr := NewManager(mock, tr, cb, tp, nil, testConfig(t), testLogger())
+
+	// Stash a chat secrets entry directly (simulating StartChat's bookkeeping).
+	mgr.chatSecretsMu.Lock()
+	mgr.chatSecrets[containerID] = []string{"sk-secret"}
+	mgr.chatSecretsMu.Unlock()
+
+	mgr.WaitAndCleanupChat("sess-id", containerID, "proj")
+	mgr.Wait()
+
+	mgr.chatSecretsMu.Lock()
+	_, leaked := mgr.chatSecrets[containerID]
+	count := len(mgr.chatSecrets)
+	mgr.chatSecretsMu.Unlock()
+
+	assert.False(t, leaked,
+		"chatSecrets entry for %s must be deleted by WaitAndCleanupChat to plug AttachChatStdin-failure leak", containerID)
+	assert.Equal(t, 0, count, "chatSecrets must be empty after WaitAndCleanupChat completes")
+}
+
+// TestStartContainer_SkipsTokenMintWhenNoSkillsDir exercises Fix M5: when
+// TaskSkillsDir is unset, m.token.GenerateToken must not be called at all
+// during startContainer. A transient GitHub-API failure on a deployment that
+// does not bind-mount a skills clone used to block every card spawn.
+func TestStartContainer_SkipsTokenMintWhenNoSkillsDir(t *testing.T) {
+	t.Parallel()
+
+	// alwaysFailingTokenGen returns an error for every GenerateToken call.
+	// Wired into m.token to prove startContainer does NOT call it when
+	// TaskSkillsDir == "" (the production posture for deployments without
+	// a skills clone).
+	alwaysFail := &failingTokenGen{err: errors.New("synthetic github API failure")}
+
+	cfg := testConfig(t)
+	// Default testConfig has TaskSkillsDir == "" already, but be explicit
+	// because the test depends on it.
+	cfg.TaskSkillsDir = ""
+	// SecretsDir != "" means buildSecretDelivery uses file mode and does
+	// NOT mint a token of its own (the refresher owns that key). Combined
+	// with TaskSkillsDir == "", no GenerateToken call should be made.
+	require.NotEmpty(t, cfg.SecretsDir)
+
+	mock := successfulMock()
+
+	tr := tracker.New()
+	cb := callback.NewClient("http://unused:9999", "test-secret-key-that-is-long-enough", testLogger())
+
+	mgr := NewManager(mock, tr, cb, alwaysFail, nil, cfg, testLogger())
+
+	payload := testPayload()
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID:  payload.CardID,
+		Project: payload.Project,
+	}))
+
+	// startContainer should NOT propagate any token-mint error because it
+	// must not call GenerateToken at all in this configuration. Run end-to-end
+	// proves the spawn path succeeds; the alwaysFail provider is wired so the
+	// test fails loudly if anything mints a token.
+	mgr.Run(context.Background(), payload)
+	mgr.Wait()
+
+	assert.Zero(t, alwaysFail.calls.Load(),
+		"startContainer must not call GenerateToken when TaskSkillsDir is empty")
+	assert.Equal(t, 0, tr.Count(), "tracker entry should be released after Run completes")
+}
+
+// failingTokenGen is a TokenGenerator that returns err on every call and
+// counts invocations. Used by TestStartContainer_SkipsTokenMintWhenNoSkillsDir
+// to prove that GenerateToken is never called when no skills clone is bound.
+type failingTokenGen struct {
+	err   error
+	calls atomic.Int32
+}
+
+func (f *failingTokenGen) GenerateToken(_ context.Context) (string, time.Time, error) {
+	f.calls.Add(1)
+
+	return "", time.Time{}, f.err
 }

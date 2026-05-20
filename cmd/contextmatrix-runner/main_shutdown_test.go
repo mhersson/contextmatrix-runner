@@ -267,11 +267,11 @@ func TestShutdown_WedgedContainer(t *testing.T) {
 		"shutdown should finish within a few seconds, elapsed %s", elapsed)
 
 	// Kill was called exactly once for the one tracked container.
-	assert.GreaterOrEqual(t, int32(1), mgr.killed.Load(), "Kill should have run for every tracked container")
+	assert.GreaterOrEqual(t, mgr.killed.Load(), int32(1), "Kill should have run for every tracked container")
 	// ForceKillContainer was attempted in the backstop phase.
-	assert.GreaterOrEqual(t, int32(1), mgr.forceCall.Load(), "ForceKillContainer must run in the backstop phase")
+	assert.GreaterOrEqual(t, mgr.forceCall.Load(), int32(1), "ForceKillContainer must run in the backstop phase")
 	// Callback was attempted at least once.
-	assert.GreaterOrEqual(t, int32(1), cb.calls.Load(), "CM should be told about the shutting-down container")
+	assert.GreaterOrEqual(t, cb.calls.Load(), int32(1), "CM should be told about the shutting-down container")
 
 	// Let mgr.Wait finally return so no goroutine is left behind.
 	close(mgr.waitDone)

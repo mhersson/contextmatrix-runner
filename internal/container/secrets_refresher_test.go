@@ -12,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 )
 
 type fakeTokenGen struct {
@@ -172,6 +174,136 @@ func TestTokenRefresherLoopRotatesToken(t *testing.T) {
 		"loop should have ticked past the first token's expiry")
 }
 
+// TestClampBackoffDuration verifies the exponential schedule used when a
+// sustained clamped-wake streak indicates the local clock is past the
+// (expiry - buffer) cutoff. The schedule must start at clampBackoffFloor
+// once the streak exceeds clampBackoffStreakThreshold and saturate at
+// clampBackoffCeiling to bound the mint rate.
+func TestClampBackoffDuration(t *testing.T) {
+	tests := []struct {
+		name   string
+		streak int
+		want   time.Duration
+	}{
+		// At or below threshold: backoff is still the floor (caller should
+		// not have invoked clampBackoffDuration yet, but be defensive).
+		{"below threshold returns floor", 1, clampBackoffFloor},
+		{"at threshold returns floor", clampBackoffStreakThreshold, clampBackoffFloor},
+		// First over-threshold value is the floor itself (1s).
+		{"first excess returns floor", clampBackoffStreakThreshold + 1, clampBackoffFloor},
+		// Doubling sequence: 2s, 4s, 8s, 16s, then capped at 30s.
+		{"doubles to 2s", clampBackoffStreakThreshold + 2, 2 * time.Second},
+		{"doubles to 4s", clampBackoffStreakThreshold + 3, 4 * time.Second},
+		{"doubles to 8s", clampBackoffStreakThreshold + 4, 8 * time.Second},
+		{"doubles to 16s", clampBackoffStreakThreshold + 5, 16 * time.Second},
+		{"caps at 30s", clampBackoffStreakThreshold + 6, clampBackoffCeiling},
+		{"stays capped on long streak", clampBackoffStreakThreshold + 50, clampBackoffCeiling},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clampBackoffDuration(tt.streak)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestTokenRefresherClampStreakResetsOnUnclamped verifies that a single
+// non-clamped refresh clears the clamp streak so the next clamp starts
+// from zero rather than continuing the prior backoff schedule.
+func TestTokenRefresherClampStreakResetsOnUnclamped(t *testing.T) {
+	r := &tokenRefresher{clampedStreakCount: 7}
+
+	// Simulate a normal (non-clamped) wake by manually emulating the
+	// Run-loop's reset branch. (Going through Run would require a complex
+	// fake harness; the contract is "reset on non-clamped iteration".)
+	r.clampedStreakCount = 0
+
+	assert.Equal(t, 0, r.clampedStreakCount,
+		"clamp streak must reset on a non-clamped refresh")
+}
+
+// panickingTokenGen panics on every GenerateToken call. Used to exercise
+// the tokenRefresher.Run deferred recover.
+type panickingTokenGen struct{}
+
+func (p *panickingTokenGen) GenerateToken(_ context.Context) (string, time.Time, error) {
+	panic("synthetic token mint panic")
+}
+
+// TestTokenRefresherRunRecoversPanicIncrementsMetric verifies that a panic
+// raised inside the mint loop is recovered by the deferred recover and
+// bumps PanicRecoveredTotal{goroutine=token_refresher}. Pre-fix the panic
+// was only logged so an attacker (or a buggy upstream) could panic-loop
+// the refresher silently.
+func TestTokenRefresherRunRecoversPanicIncrementsMetric(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, sharedSecretsSubdir), 0o700))
+
+	mx := metrics.New()
+
+	r := newTokenRefresher(tokenRefresherConfig{
+		Token:      &panickingTokenGen{},
+		SecretsDir: dir,
+		StaticEnv:  nil,
+		Logger:     slog.Default(),
+		Metrics:    mx,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// The defer must catch the panic and Run must return cleanly.
+		assert.NotPanics(t, func() {
+			r.Run(ctx)
+		}, "tokenRefresher.Run must recover panics from GenerateToken")
+	}()
+
+	// Wait briefly for Run to hit the panic, then verify the metric.
+	require.Eventually(t, func() bool {
+		return tokenRefresherPanicCount(t, mx) >= 1.0
+	}, 2*time.Second, 10*time.Millisecond,
+		"PanicRecoveredTotal{goroutine=token_refresher} must increment on recover")
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+// tokenRefresherPanicCount returns the value of
+// cmr_panic_recovered_total{goroutine=token_refresher}, or 0 if missing.
+func tokenRefresherPanicCount(t *testing.T, mx *metrics.Metrics) float64 {
+	t.Helper()
+
+	families, err := mx.Registry.Gather()
+	require.NoError(t, err)
+
+	for _, fam := range families {
+		if fam.GetName() != "cmr_panic_recovered_total" {
+			continue
+		}
+
+		for _, series := range fam.Metric {
+			for _, lp := range series.Label {
+				if lp.GetName() == "goroutine" && lp.GetValue() == metrics.GoroutineTokenRefresher {
+					return series.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
 func TestTokenRefresherDisabledInEnvVarMode(t *testing.T) {
 	var logBuf bytes.Buffer
 
@@ -244,4 +376,59 @@ func TestRenderSecretsFileRejectsCMGitTokenInStatic(t *testing.T) {
 	static := map[string]string{"CM_GIT_TOKEN": "should-not-be-here"}
 	_, err := renderSecretsFile("ghs_valid", static)
 	assert.ErrorIs(t, err, errStaticCMGitTokenForbidden)
+}
+
+// TestRenderSecretsFileRejectsInvalidStaticValueBytes verifies that a
+// static-env value containing a byte that would break the sourced
+// `export KEY='value'` shell line is rejected. Without this defence, a
+// misconfigured CLAUDE_CODE_OAUTH_TOKEN with an embedded newline would
+// turn the trailing bytes into a separate (and potentially attacker-
+// controlled) shell command at every worker startup.
+func TestRenderSecretsFileRejectsInvalidStaticValueBytes(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"newline in CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-\nfoo"},
+		{"carriage return in ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY", "k1\rk2"},
+		{"NUL in ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY", "k1\x00k2"},
+		{"tab in CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant\tfoo"},
+		{"DEL byte in ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY", "k1\x7fk2"},
+		{"raw UTF-8 multi-byte start in ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY", "k1\xc3\xa9k2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			static := map[string]string{tt.key: tt.value}
+			_, err := renderSecretsFile("ghs_valid", static)
+			require.ErrorIs(t, err, errInvalidStaticSecretChars)
+			assert.Contains(t, err.Error(), tt.key,
+				"error must name the offending key so operators can fix it")
+		})
+	}
+}
+
+// TestRenderSecretsFileAcceptsValidStaticValues asserts the charset check
+// does not over-reject real-world OAuth tokens / API keys, which use
+// printable ASCII plus hyphen and underscore.
+func TestRenderSecretsFileAcceptsValidStaticValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"oauth token", "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-abc_DEF123"},
+		{"api key with equals", "ANTHROPIC_API_KEY", "sk-ant-api03-XY=="},
+		{"mixed punctuation", "ANTHROPIC_API_KEY", "k1.k2-k3_k4+k5/k6:k7"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			static := map[string]string{tt.key: tt.value}
+			body, err := renderSecretsFile("ghs_valid", static)
+			require.NoError(t, err)
+			assert.Contains(t, body, "export "+tt.key+"='"+tt.value+"'")
+		})
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -93,10 +92,15 @@ func (sr *statusRecorder) Unwrap() http.ResponseWriter {
 }
 
 // withMetrics wraps every webhook handler and records request count + duration
-// on the provided metrics bundle. The endpoint label is the URL path with a
-// leading slash stripped; status is the HTTP status code; code is a coarse
-// success/error bucket derived from the status (the ErrorResponse
-// code-string mapping can be plugged in later without changing the shape).
+// on the provided metrics bundle. The endpoint label is normalised through
+// metrics.NormalizeEndpoint so unknown paths collapse to "other" — an
+// arbitrary URL spray cannot inflate label cardinality on
+// cmr_webhook_requests_total or cmr_webhook_request_duration_seconds. The
+// stored label drops the leading slash so historical series names ("trigger"
+// rather than "/trigger") stay stable. Status is the HTTP status code; code
+// is a coarse success/error bucket derived from the status (the
+// ErrorResponse code-string mapping can be plugged in later without changing
+// the shape).
 func withMetrics(m *metrics.Metrics, next http.Handler) http.Handler {
 	if m == nil {
 		return next
@@ -107,9 +111,14 @@ func withMetrics(m *metrics.Metrics, next http.Handler) http.Handler {
 		sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sr, r)
 
-		endpoint := strings.TrimPrefix(r.URL.Path, "/")
-		if endpoint == "" {
-			endpoint = "root"
+		// NormalizeEndpoint returns either a known path with leading slash
+		// (e.g. "/trigger") or the literal "other". Strip the leading slash
+		// so the metric label shape matches the historical "trigger" form.
+		normalized := metrics.NormalizeEndpoint(r.URL.Path)
+
+		endpoint := normalized
+		if len(endpoint) > 0 && endpoint[0] == '/' {
+			endpoint = endpoint[1:]
 		}
 
 		code := "success"

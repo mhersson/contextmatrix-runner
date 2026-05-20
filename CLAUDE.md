@@ -19,7 +19,14 @@ internal/hmac/                    → HMAC-SHA256 signing/verification (shared)
 internal/webhook/                 → HTTP handlers (/trigger, /kill, /stop-all, /message,
                                     /promote, /end-session, /chat/start, /chat/end,
                                     /logs, /containers, /health, /readyz)
-internal/container/               → Docker SDK abstraction, container lifecycle
+internal/container/               → Docker SDK abstraction, container lifecycle,
+                                    chat resume payload writer (prepareChatResume),
+                                    shared-secrets token refresher (secrets_refresher.go),
+                                    DNS LRU cache (dns_cache.go), host-skills git pull,
+                                    orphan cleanup / image-prune janitors,
+                                    container health monitor
+internal/chatproto/               → Shared chat-rehydration prompt-version constant
+internal/secretenv/               → Canonical list of runner-managed secret env var names
 internal/logparser/               → Parses Claude Code stream-json output, logs relevant events
 internal/logbroadcast/            → In-process LogEntry pub/sub for the /logs SSE stream
                                     (keyed by card_id OR session_id)
@@ -141,19 +148,25 @@ GETs to the same path with different query strings from colliding in the
 replay cache. Headers: `X-Signature-256: sha256=<hex>`,
 `X-Webhook-Timestamp: <unix-ts>`.
 
+Every incoming request carries an `X-Correlation-ID` (caller-supplied or
+generated as a UUID by the `withCorrelation` middleware in
+`internal/webhook/middleware.go`). The same value is echoed on every
+response — including error responses and SSE streams — so CM and external
+tools can stitch their traces to runner logs.
+
 ### Endpoints
 
 | Method | Path           | Auth | Description                                                                                                                                                                                                                                                          |
 | ------ | -------------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/trigger`     | HMAC | Start a container. Payload includes `card_id`, `project`, `repo_url`, and optional `interactive: bool`.                                                                                                                                                               |
+| POST   | `/trigger`     | HMAC | Start a container. Payload: `card_id`, `project`, `repo_url`, and optional `mcp_api_key`, `base_branch`, `runner_image`, `interactive: bool`, `model`, `task_skills` (a pointer to a string array — `null`/unset means "no constraint, copy the full host-skills set"; an empty array means "no extra skills"; a populated array names skill files to mount). |
 | POST   | `/kill`        | HMAC | Stop a specific container. Payload: `{card_id, project}`.                                                                                                                                                                                                            |
 | POST   | `/stop-all`    | HMAC | Stop all containers (optionally filtered by project).                                                                                                                                                                                                                |
 | POST   | `/message`     | HMAC | Send a user message to a running session. Card-mode payload: `{card_id, project, content, message_id}`. Chat-mode payload: `{session_id, content, message_id}` (mutually exclusive with `card_id`/`project`). `content` must be ≤8192 bytes (413 on overflow). Returns 404 if no container, 409 if not interactive, 202 `{ok:true, message_id}` on success. |
-| POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Returns 404/409 on error, 202 `{ok:true}` on success.                                                                                                                              |
-| POST   | `/end-session` | HMAC | Close the stdin of an interactive container so claude exits on EOF. Payload: `{card_id, project}`. Returns 404 if no container, 409 if not interactive (or stdin already closed), 202 `{ok:true}` on success. Safe to call more than once (second call returns 409). |
-| POST   | `/refresh-knowledge` | HMAC | Spawn a containerised knowledge-base refresh for the given repo. Synthetic tracker key `kb-refresh:<repo>`. |
-| POST   | `/chat/start`  | HMAC | Start a long-lived chat container for a global chat session. Payload: `{session_id, project?, repo_url?, mcp_api_key?, model, resume?}`. `model` is forwarded as `CM_ORCHESTRATOR_MODEL` (entrypoint passes it as `--model`). `resume` is an optional array of `{seq, role, content}` turns; when present, the runner writes `resume.jsonl` + `resume.meta.json` into a per-container host dir and bind-mounts it read-only at `/run/cm-chat/`, sets `CM_CHAT_RESUME=1`, and writes a stream-json user envelope to stdin priming the agent to read the resume file and call `chat_rehydration_complete`. File-prep failures are logged and the container starts without rehydration. Returns 202 `{ok:true, container_id}` on success, 409 if the session already has a container, 429 when the chat concurrency cap is reached. |
-| POST   | `/chat/end`    | HMAC | End a tracked chat container: closes stdin, force-stops, removes tracker entry. Payload: `{session_id}`. Returns 200 on success, 404 if no container is tracked. A second call returns 404.                                                                          |
+| POST   | `/promote`     | HMAC | Promote an interactive session to autonomous mode. Payload: `{card_id, project}`. Fail-closed: handler issues a read-only `VerifyAutonomous` GET to CM and refuses to write stdin unless CM confirms the autonomous flag is set. Returns 404 (no container tracked), 502 (upstream verification failed), 403 (CM reports `autonomous=false`), 409 (container not in interactive mode), 410 (stdin already closed), 503 (runner draining), 400 (invalid JSON / validation), 500 (internal error), or 202 `{ok:true}` on success. |
+| POST   | `/end-session` | HMAC | Close the stdin of an interactive container so claude exits on EOF. Payload: `{card_id, project}`. Returns 404 if no container, 409 if the container is non-interactive (stdin was never attached), 410 if stdin was attached and has since been closed (idempotent retry of a successful first call), 202 `{ok:true}` on success. Safe to call more than once. |
+| POST   | `/refresh-knowledge` | HMAC | Spawn a containerised knowledge-base refresh for the given repo. Payload: `{project, repo, repo_url, agent_id, base_branch?, overwrite_docs?, mcp_api_key?, runner_image?, model?}`. Synthetic card ID `kb-refresh:<repo>`; the tracker composes that with the project so the actual lookup key is `<project>/kb-refresh:<repo>`, preserving the one-container-per-key invariant alongside task jobs. |
+| POST   | `/chat/start`  | HMAC | Start a long-lived chat container for a global chat session. Payload: `{session_id, project?, repo_url?, mcp_api_key?, model, resume?, primer?}`. `model` is forwarded as `CM_ORCHESTRATOR_MODEL` (entrypoint passes it as `--model`). `resume` is an optional object `{turns:[{seq, role, content}], clipped, original_seq}`; when present, the runner writes `resume.jsonl` + `resume.meta.json` into a per-container host dir and bind-mounts it read-only at `/run/cm-chat/`, sets `CM_CHAT_RESUME=1`, and writes a stream-json user envelope to stdin priming the agent to read the resume file and call `chat_rehydration_complete`. File-prep failures are logged and the container starts without rehydration. `primer` is an optional orientation string (sourced from CM's `workflow-skills/chat-mode.md` on each cold open); when non-empty it is written to the container's stdin as a stream-json user envelope before any rehydration priming. Returns 202 `{ok:true, container_id}` on success, 409 if the session already has a container, 429 when the chat concurrency cap is reached. |
+| POST   | `/chat/end`    | HMAC | End a tracked chat container: closes stdin, force-stops, removes tracker entry. Payload: `{session_id}`. Returns 202 on success (matches `/end-session` — request accepted; container exits asynchronously through the WaitAndCleanupChat path), 404 if no container is tracked. A second call returns 404.                                                                          |
 | GET    | `/logs`        | HMAC | SSE stream of `LogEntry` events. Query: `?project=<name>` for card-mode / project-scoped, or `?session_id=<id>` for chat-mode. The two filters are mutually exclusive. Browser EventSource cannot send headers, so consumers must proxy through a server that attaches the HMAC signature. |
 | GET    | `/containers`  | HMAC | List currently-running worker containers (`ListContainersResponse`). Used by CM to age-cap runaway containers and detect tracker drift (`Tracked=false` while `State="running"`).                                                                                    |
 | GET    | `/health`      | none | Health probe; returns 200.                                                                                                                                                                                                                                           |
@@ -222,3 +235,18 @@ make test    # must pass before every commit
 make lint    # must be clean
 make build   # must compile
 ```
+
+## Known upstream CVEs
+
+`github.com/docker/docker v28.5.2+incompatible` is the latest published Moby
+module on the v28 line at the time of writing. `govulncheck` flags two open
+advisories against it:
+
+- **GO-2026-4887** — tracked upstream; no fixed version available yet.
+- **GO-2026-4883** — tracked upstream; no fixed version available yet.
+
+Both advisories live in code paths the runner mediates itself rather than
+calling directly: the runner never exposes the Docker SDK over the network and
+all SDK calls flow through the `container.Manager` allowlist + bounded
+contexts. Re-run `govulncheck ./...` after every Moby SDK upgrade and drop
+this note once an upstream fix lands.

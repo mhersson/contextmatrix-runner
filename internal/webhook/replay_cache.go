@@ -14,20 +14,41 @@ import (
 // Concurrency: all exported methods are safe for concurrent use.
 //
 // Lifecycle: Run starts a background eviction goroutine that sweeps
-// expired entries every 60s. Run returns when the supplied context is
-// cancelled — callers that construct a cache must wire it into the
-// shutdown context or the goroutine will leak.
+// expired entries on a derived interval (see defaultSweepInterval). Run
+// returns when the supplied context is cancelled — callers that construct
+// a cache must wire it into the shutdown context or the goroutine will leak.
 type ReplayCache struct {
-	mu       sync.Mutex
-	ttl      time.Duration
-	capacity int
-	now      func() time.Time
+	mu            sync.Mutex
+	ttl           time.Duration
+	capacity      int
+	now           func() time.Time
+	sweepInterval time.Duration
 
 	// entries is an LRU — the list is ordered oldest-first (front) to
 	// newest-last (back). index gives O(1) lookup into the list element
 	// holding that signature's entry.
 	entries *list.List
 	index   map[string]*list.Element
+}
+
+// defaultSweepInterval picks min(ttl/2, 60s) so that for runners with a
+// small TTL (e.g. a 30s skew window) expired entries linger at most ttl/2
+// before being swept rather than the worst-case 2×ttl produced by a flat
+// 60s tick. ttl <= 0 means time-based expiry is disabled; we still return
+// the 60s ceiling so the goroutine has a meaningful tick to honour context
+// cancellation against.
+func defaultSweepInterval(ttl time.Duration) time.Duration {
+	const maxInterval = 60 * time.Second
+	if ttl <= 0 {
+		return maxInterval
+	}
+
+	half := ttl / 2
+	if half < maxInterval {
+		return half
+	}
+
+	return maxInterval
 }
 
 type replayEntry struct {
@@ -47,16 +68,28 @@ func WithReplayCacheNow(now func() time.Time) ReplayCacheOption {
 	}
 }
 
+// WithReplayCacheSweepInterval overrides the background sweep interval used by
+// Run. Intended for tests that need a tighter tick than min(ttl/2, 60s);
+// production callers should rely on the default derivation.
+func WithReplayCacheSweepInterval(interval time.Duration) ReplayCacheOption {
+	return func(r *ReplayCache) {
+		if interval > 0 {
+			r.sweepInterval = interval
+		}
+	}
+}
+
 // NewReplayCache constructs a replay cache with the given TTL and
 // capacity. A capacity of <= 0 disables the hard cap; a TTL of <= 0
 // disables time-based expiry (entries live until evicted by capacity).
 func NewReplayCache(ttl time.Duration, capacity int, opts ...ReplayCacheOption) *ReplayCache {
 	r := &ReplayCache{
-		ttl:      ttl,
-		capacity: capacity,
-		now:      time.Now,
-		entries:  list.New(),
-		index:    make(map[string]*list.Element),
+		ttl:           ttl,
+		capacity:      capacity,
+		now:           time.Now,
+		sweepInterval: defaultSweepInterval(ttl),
+		entries:       list.New(),
+		index:         make(map[string]*list.Element),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -82,9 +115,14 @@ func (r *ReplayCache) Seen(sig string) bool {
 	if el, ok := r.index[sig]; ok {
 		entry := el.Value.(*replayEntry)
 		if r.ttl <= 0 || now.Sub(entry.seen) <= r.ttl {
-			// Refresh the entry's position so recent repeats stay warm.
-			entry.seen = now
-
+			// Keep entry.seen pinned to the original first-sight
+			// timestamp so the entry ages out predictably at ttl. Fix
+			// W7 in REVIEW.md: refreshing seen on hit let an attacker
+			// (or a buggy client) pin a hot signature in the cache
+			// indefinitely, defeating the TTL bound. MoveToBack is
+			// still fine here — it only affects LRU eviction order,
+			// not the seen-timestamp the sweep / expiry compares
+			// against.
 			r.entries.MoveToBack(el)
 
 			return true
@@ -150,12 +188,15 @@ func (r *ReplayCache) sweep() {
 	}
 }
 
-// Run sweeps expired entries every 60s until ctx is cancelled. It
-// blocks; callers typically run it in a goroutine. Calling Run on a
-// cache without time-based expiry (ttl <= 0) still honours context
-// cancellation but does no sweep work.
+// Run sweeps expired entries on the cache's derived interval until ctx is
+// cancelled. The interval defaults to min(ttl/2, 60s) so that small-TTL
+// configurations don't carry expired entries for up to 2×ttl before sweep,
+// and can be overridden via WithReplayCacheSweepInterval. Run blocks;
+// callers typically run it in a goroutine. Calling Run on a cache without
+// time-based expiry (ttl <= 0) still honours context cancellation but does
+// no sweep work.
 func (r *ReplayCache) Run(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(r.sweepInterval)
 	defer ticker.Stop()
 
 	for {

@@ -90,12 +90,16 @@ type ErrorResponse struct {
 }
 
 // CardKillResult is one entry in a StopAllResponse: whether the individual
-// Kill succeeded for that (project, card_id), and a short reason if not.
+// Kill succeeded for that (project, card_id) — or for chat-mode entries the
+// (session_id) — and a short reason if not. Exactly one of CardID or
+// SessionID is populated per entry; chat entries leave Project empty when
+// the chat container was global (no project binding).
 type CardKillResult struct {
-	CardID  string `json:"card_id"`
-	Project string `json:"project"`
-	OK      bool   `json:"ok"`
-	Error   string `json:"error,omitempty"`
+	CardID    string `json:"card_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	Project   string `json:"project,omitempty"`
+	OK        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
 }
 
 // ContainerListItem is one entry in a ListContainersResponse. StartedAt is an
@@ -184,19 +188,19 @@ type ChatEndPayload struct {
 	SessionID string `json:"session_id"`
 }
 
-// Response is the legacy polymorphic webhook response body.
-//
-// Deprecated: new handlers should emit SuccessResponse or ErrorResponse via
-// writeSuccess / writeError. This type is retained because existing tests
-// decode the shape directly (and a few external consumers may depend on the
-// `error` field). It is a union of Success + Error fields and no longer
-// produced by the runner — but a JSON unmarshal of a SuccessResponse or an
-// ErrorResponse into a Response still populates the matching subset of
-// fields so older callers keep working.
-type Response struct {
-	OK        bool   `json:"ok"`
-	Message   string `json:"message,omitempty"`
-	MessageID string `json:"message_id,omitempty"`
-	Error     string `json:"error,omitempty"`
-	Code      string `json:"code,omitempty"`
+// ChatStartResponse is the success body returned by POST /chat/start. ContainerID
+// is the Docker container ID assigned by the runtime; CM correlates against this
+// when reconciling chat sessions.
+type ChatStartResponse struct {
+	OK          bool   `json:"ok"`
+	ContainerID string `json:"container_id"`
+}
+
+// HealthResponse is the body returned by GET /health. RunningContainers and
+// MaxConcurrent give operators a one-glance snapshot of saturation without
+// having to call /containers.
+type HealthResponse struct {
+	OK                bool `json:"ok"`
+	RunningContainers int  `json:"running_containers"`
+	MaxConcurrent     int  `json:"max_concurrent"`
 }

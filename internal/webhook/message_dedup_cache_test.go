@@ -132,3 +132,38 @@ func TestMessageDedupCache_Run_StopsOnContextCancel(t *testing.T) {
 		t.Fatal("Run did not return after context cancel")
 	}
 }
+
+// TestMessageDedupCache_DefaultSweepInterval pins Fix W11 for the dedup
+// cache: a short TTL must produce a fast sweep tick (min(ttl/2, 60s))
+// rather than always defaulting to 60s.
+func TestMessageDedupCache_DefaultSweepInterval(t *testing.T) {
+	cases := []struct {
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{ttl: 0, want: 60 * time.Second},
+		{ttl: 10 * time.Second, want: 5 * time.Second},
+		{ttl: 60 * time.Second, want: 30 * time.Second},
+		{ttl: 5 * time.Minute, want: 60 * time.Second},
+		{ttl: time.Hour, want: 60 * time.Second},
+	}
+
+	for _, c := range cases {
+		got := defaultDedupSweepInterval(c.ttl)
+		assert.Equal(t, c.want, got, "ttl=%s", c.ttl)
+	}
+}
+
+// TestMessageDedupCache_SweepIntervalOverride pins that
+// WithMessageDedupSweepInterval injects a custom tick for tests.
+func TestMessageDedupCache_SweepIntervalOverride(t *testing.T) {
+	c := NewMessageDedupCache(time.Hour, 100, WithMessageDedupSweepInterval(7*time.Millisecond))
+
+	assert.Equal(t, 7*time.Millisecond, c.sweepInterval,
+		"WithMessageDedupSweepInterval must override the derived default")
+
+	// Negative / zero overrides are ignored.
+	c2 := NewMessageDedupCache(time.Hour, 100, WithMessageDedupSweepInterval(0))
+	assert.Equal(t, time.Minute, c2.sweepInterval,
+		"a zero override must fall back to the default")
+}

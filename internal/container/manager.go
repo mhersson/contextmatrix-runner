@@ -104,7 +104,13 @@ const (
 	LabelSessionID = "contextmatrix.session_id"
 
 	imagePullTimeout = 5 * time.Minute
-	stopGracePeriod  = 10 // seconds
+	// imageInspectTimeout bounds the synchronous ImageInspect call in
+	// pullImage's PullIfNotPresent fast-path. A wedged dockerd otherwise
+	// blocks the spawn indefinitely because the caller's parent ctx has no
+	// deadline at this point. 5s matches the preflight's image_inspect
+	// probe budget.
+	imageInspectTimeout = 5 * time.Second
+	stopGracePeriod     = 10 // seconds
 	// callbackTimeout bounds the detached context used to deliver a status
 	// callback after the parent ctx has already been cancelled (e.g. on a
 	// Kill or start failure race).
@@ -116,6 +122,21 @@ const (
 	// dockerd used to stall shutdown forever; now every such call has
 	// a hard cap.
 	dockerCleanupTimeout = 5 * time.Second
+
+	// runningStatusCallbackTimeout bounds the detached context used by
+	// runningCallbackAsync to deliver the "running" status callback. 30s
+	// is generous enough to absorb the full 3-attempt retry ladder
+	// (1s + 2s + 4s backoff + per-request 10s timeout each) while still
+	// bounding the goroutine's lifetime if CM is wedged.
+	runningStatusCallbackTimeout = 30 * time.Second
+
+	// taskSkillsPullTimeout bounds the synchronous `git pull` invoked by
+	// pullSkillsRepo on the spawn path. Without this, a slow or wedged
+	// GitHub remote could stall every spawn indefinitely because the
+	// caller's parent ctx has no deadline. 60s is generous for a small
+	// skills repo over a healthy network while still capping the worst
+	// case before workers visibly slow down.
+	taskSkillsPullTimeout = 60 * time.Second
 )
 
 // primingWriteTimeout bounds the priming WriteStdin call made right after
@@ -141,6 +162,11 @@ var logDrainTimeout = 5 * time.Second
 // HTTPS. Returns nil if dir is not a git repo (operator may have a non-tracked
 // local clone) or has no `origin` remote configured. Returns the git error
 // otherwise — caller should log and continue, not abort.
+//
+// The git invocation is bounded by taskSkillsPullTimeout so a slow or
+// wedged remote cannot stall the spawn path. Credential prompting is
+// suppressed via GIT_TERMINAL_PROMPT=0 and GIT_ASKPASS=true so a rejected
+// injected token does not leave git blocked waiting on /dev/tty.
 var pullSkillsRepo = func(ctx context.Context, dir, token string) error {
 	gitDir := filepath.Join(dir, ".git")
 	if _, err := os.Stat(gitDir); err != nil {
@@ -151,8 +177,11 @@ var pullSkillsRepo = func(ctx context.Context, dir, token string) error {
 		return fmt.Errorf("stat %s: %w", gitDir, err)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "pull", "--ff-only")
-	cmd.Env = pullSkillsEnv(ctx, dir, token)
+	pullCtx, cancel := context.WithTimeout(ctx, taskSkillsPullTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(pullCtx, "git", "-C", dir, "pull", "--ff-only")
+	cmd.Env = pullSkillsEnv(pullCtx, dir, token)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -169,8 +198,23 @@ var pullSkillsRepo = func(ctx context.Context, dir, token string) error {
 // so the token never appears in the process command line. For any other
 // remote, or if the URL cannot be read, the parent env is returned
 // unchanged and `git pull` runs with no injected auth.
+//
+// GIT_TERMINAL_PROMPT=0 and GIT_ASKPASS=true are appended in every case
+// so a rejected token (or any other auth failure) cannot leave git
+// blocked on /dev/tty waiting for credential input. taskSkillsPullTimeout
+// is the secondary bound, but suppressing the prompt converts the failure
+// into a fast error rather than a 60s timeout-and-retry.
 func pullSkillsEnv(ctx context.Context, dir, token string) []string {
 	parent := os.Environ()
+
+	// Suppress interactive credential prompting. GIT_TERMINAL_PROMPT=0
+	// makes git fail-fast on auth instead of blocking on /dev/tty;
+	// GIT_ASKPASS=true neutralises any system-installed askpass helper
+	// that would otherwise be invoked when the terminal prompt is off.
+	parent = append(parent,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=true",
+	)
 
 	out, err := exec.CommandContext(ctx, "git", "-C", dir, "config", "--get", "remote.origin.url").Output()
 	if err != nil {
@@ -268,6 +312,24 @@ type Manager struct {
 	// can race RemoveChat against AddChat.
 	chatCleanupMu sync.Mutex
 	chatCleanup   map[string]chatResumeDelivery
+
+	// chatSecrets stashes the per-container redaction inputs collected
+	// during StartChat so StreamChatLogs can build a Redactor without
+	// changing the webhook-facing interface. Populated under StartChat
+	// (keyed by container ID) and consumed by StreamChatLogs; cleared
+	// once consumed so a long-lived process does not accumulate entries.
+	chatSecretsMu sync.Mutex
+	chatSecrets   map[string][]string
+
+	// skillsPullMu serialises concurrent pullSkillsRepo calls against the
+	// shared TaskSkillsDir. `git pull` writes to .git/index.lock, which is
+	// not safe to share across concurrent invocations against the same
+	// working tree; without this two simultaneous spawns can fail with
+	// "Another git process seems to be running" or worse, leave a stale
+	// lock behind. The mutex is acquired around the synchronous pull only —
+	// it does not cover the mount-construction step, so a slow pull cannot
+	// stall a different consumer that has already cached the on-disk state.
+	skillsPullMu sync.Mutex
 }
 
 // WithMetrics attaches a metrics bundle to the manager. A nil bundle disables
@@ -279,6 +341,21 @@ func (m *Manager) WithMetrics(mx *metrics.Metrics) *Manager {
 }
 
 // NewManager creates a container manager.
+//
+// token (githubauth.TokenGenerator) is expected to be non-nil for any
+// deployment that actually spawns containers — every spawn-path branch
+// (card mode startContainer, chat mode StartChat / BuildChatAuthEnv, and the
+// background tokenRefresher) calls GenerateToken conditionally. Production
+// wiring in cmd/contextmatrix-runner/main.go always passes a real provider.
+//
+// A nil token is permitted here so that test code which only exercises
+// non-spawn methods (Kill, CleanupOrphans, ListManaged, PruneImages, etc.)
+// can construct a Manager without spinning up a fake GitHub token server.
+// The four spawn-path call sites (startContainer, buildSecretDelivery,
+// StartTokenRefresher, BuildChatAuthEnv) each guard with a nil-check or a
+// TaskSkillsDir-guard that skips the mint when the token has no consumer.
+//
+// cb and broadcaster may also be nil; the manager guards those at every call site.
 func NewManager(
 	docker DockerClient,
 	tracker *tracker.Tracker,
@@ -303,6 +380,7 @@ func NewManager(
 			return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL|os.O_TRUNC, 0o600)
 		},
 		chatCleanup: map[string]chatResumeDelivery{},
+		chatSecrets: map[string][]string{},
 	}
 }
 
@@ -347,7 +425,14 @@ func buildStaticAuthEnv(cfg *config.Config) map[string]string {
 // not propagate. In env-var fallback mode (cfg.SecretsDir empty),
 // InitSharedSecrets is a no-op, the initial mint is skipped, and the
 // spawned goroutine logs and returns immediately.
+//
+// Returns an error if m.token is nil (a deployment that bind-mounts a
+// shared secrets dir but has no token provider configured is a misconfig).
 func (m *Manager) StartTokenRefresher(ctx context.Context) error {
+	if m.token == nil {
+		return fmt.Errorf("StartTokenRefresher: token provider is required (m.token is nil)")
+	}
+
 	if err := m.InitSharedSecrets(); err != nil {
 		return err
 	}
@@ -357,6 +442,7 @@ func (m *Manager) StartTokenRefresher(ctx context.Context) error {
 		SecretsDir: m.cfg.SecretsDir,
 		StaticEnv:  buildStaticAuthEnv(m.cfg),
 		Logger:     m.logger,
+		Metrics:    m.metrics,
 	})
 
 	// Synchronous initial mint+write so the HTTP listener can't accept a
@@ -398,6 +484,51 @@ func withDockerCleanupTimeout(_ context.Context) (context.Context, context.Cance
 	return context.WithTimeout(context.Background(), dockerCleanupTimeout)
 }
 
+// handlePanic is the shared body of the panic-recovery defers attached to
+// every manager background goroutine. Must be called from inside the
+// deferred function — recover() is invoked by the caller and the value
+// passed through `r`.
+//
+// Steps:
+//  1. Increment metrics.PanicRecoveredTotal{goroutine=label} (if metrics set).
+//  2. slog.Error logMsg with fields + "panic" + "stack" (appended here so
+//     callers don't duplicate the boilerplate).
+//  3. If sysEntry is non-nil and the broadcaster is wired, publish a copy
+//     with a fresh Timestamp so /logs subscribers see the internal-error event.
+//
+// Centralising this lets each call site read like:
+//
+//	defer func() {
+//	    if r := recover(); r != nil {
+//	        m.handlePanic(r, metrics.GoroutineXxx, "foo panicked",
+//	            []any{"card_id", ..., "project", ...},
+//	            &logbroadcast.LogEntry{Type: "system", Content: "internal error: foo panicked"})
+//	    }
+//	}()
+//
+// Note: Go's recover() returns non-nil only when called directly inside a
+// deferred function, so the caller MUST invoke recover() — handlePanic does
+// not (and cannot) call it.
+func (m *Manager) handlePanic(r any, label, logMsg string, fields []any, sysEntry *logbroadcast.LogEntry) {
+	if m.metrics != nil {
+		m.metrics.PanicRecoveredTotal.WithLabelValues(label).Inc()
+	}
+
+	allFields := make([]any, 0, len(fields)+4)
+	allFields = append(allFields, fields...)
+	allFields = append(allFields, "panic", r, "stack", string(debug.Stack()))
+
+	if m.logger != nil {
+		m.logger.Error(logMsg, allFields...)
+	}
+
+	if sysEntry != nil && m.broadcaster != nil {
+		entry := *sysEntry
+		entry.Timestamp = time.Now()
+		m.broadcaster.Publish(entry)
+	}
+}
+
 // Run launches the full container lifecycle for a triggered task in a goroutine.
 // Use Wait to block until all launched goroutines have finished.
 func (m *Manager) Run(ctx context.Context, payload RunConfig) {
@@ -406,31 +537,42 @@ func (m *Manager) Run(ctx context.Context, payload RunConfig) {
 	m.wg.Go(func() {
 		outcome := metrics.OutcomeSuccess
 
+		// containerID is captured locally so the deferred panic recovery can
+		// see it even before tracker.UpdateContainerID has published it.
+		// Without this, a panic between startContainer's return and
+		// UpdateContainerID would leave snap.ContainerID == "" and the
+		// Force-remove path would silently no-op, leaking the container.
+		var containerID string
+
 		defer func() {
 			if r := recover(); r != nil {
 				outcome = metrics.OutcomeFailure
 
-				if m.metrics != nil {
-					m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineRun).Inc()
-				}
-
-				m.logger.Error("container run panicked",
-					"panic", r, "card_id", payload.CardID, "project", payload.Project,
-					"stack", string(debug.Stack()))
+				m.handlePanic(r, metrics.GoroutineRun, "container run panicked",
+					[]any{"card_id", payload.CardID, "project", payload.Project},
+					nil)
 
 				// H22: close the partial-failure window. If startContainer had
 				// already returned a container ID and then something downstream
 				// panicked before waitAndCleanup installed its defers, the
 				// Docker container would leak because tracker.Remove alone only
-				// clears the in-memory entry. Look up the ID from the tracker
-				// (UpdateContainerID was called between startContainer and
-				// waitAndCleanup) and Force-remove the container on a fresh,
-				// bounded ctx.
-				if snap, ok := m.tracker.Snapshot(payload.Project, payload.CardID); ok && snap.ContainerID != "" {
+				// clears the in-memory entry. Prefer the locally captured ID
+				// (set immediately after startContainer returns) over the
+				// tracker snapshot, which is only populated after
+				// UpdateContainerID has run — there is a window between the
+				// two where the snapshot reports ContainerID == "".
+				id := containerID
+				if id == "" {
+					if snap, ok := m.tracker.Snapshot(payload.Project, payload.CardID); ok {
+						id = snap.ContainerID
+					}
+				}
+
+				if id != "" {
 					rmCtx, rmCancel := withDockerCleanupTimeout(context.Background())
-					if rmErr := m.docker.ContainerRemove(rmCtx, snap.ContainerID, container.RemoveOptions{Force: true}); rmErr != nil {
+					if rmErr := m.docker.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true}); rmErr != nil {
 						m.logger.Warn("panic recovery: docker remove failed",
-							"container_id", snap.ContainerID,
+							"container_id", id,
 							"card_id", payload.CardID,
 							"error", rmErr)
 					}
@@ -450,7 +592,7 @@ func (m *Manager) Run(ctx context.Context, payload RunConfig) {
 			}
 		}()
 
-		outcome = m.run(ctx, payload)
+		outcome = m.run(ctx, payload, &containerID)
 	})
 }
 
@@ -459,7 +601,28 @@ func (m *Manager) Wait() {
 	m.wg.Wait()
 }
 
-func (m *Manager) run(ctx context.Context, payload RunConfig) string {
+// run is the inner body of Run. The containerIDOut pointer is populated as
+// soon as startContainer succeeds so the outer Run's deferred panic recovery
+// can see the ID even before tracker.UpdateContainerID has been called.
+func (m *Manager) run(ctx context.Context, payload RunConfig, containerIDOut *string) string {
+	// RunConfig.Mode is mandatory: with an empty Mode the entrypoint takes
+	// the wrong dispatch path and downstream Mode-switched code (reportFailure,
+	// onSkillEngaged, etc.) cannot distinguish task vs. knowledge-refresh.
+	// Reject early so a misconfigured caller fails loudly instead of spawning
+	// a half-configured container.
+	if payload.Mode == "" {
+		m.logger.Error("RunConfig.Mode is required",
+			"card_id", payload.CardID, "project", payload.Project)
+
+		cbCtx, cancel := withCleanupTimeout(ctx)
+		defer cancel()
+
+		m.reportFailure(cbCtx, payload, "internal error: RunConfig.Mode is required")
+		m.tracker.Remove(payload.Project, payload.CardID)
+
+		return metrics.OutcomeFailure
+	}
+
 	log := m.logger.With("card_id", payload.CardID, "project", payload.Project)
 
 	containerID, _, secretValues, err := m.startContainer(ctx, payload)
@@ -478,6 +641,10 @@ func (m *Manager) run(ctx context.Context, payload RunConfig) string {
 		m.tracker.Remove(payload.Project, payload.CardID)
 
 		return metrics.OutcomeFailure
+	}
+
+	if containerIDOut != nil {
+		*containerIDOut = containerID
 	}
 
 	m.tracker.UpdateContainerID(payload.Project, payload.CardID, containerID)
@@ -518,25 +685,19 @@ func (m *Manager) runningCallbackAsync(payload RunConfig, log *slog.Logger) {
 		return
 	}
 
+	m.wg.Add(1)
+
 	go func() {
+		defer m.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				if m.metrics != nil {
-					m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineRun).Inc()
-				}
-
-				m.logger.Error("running-status callback panicked",
-					"panic", r,
-					"card_id", payload.CardID,
-					"project", payload.Project,
-					"stack", string(debug.Stack()))
+				m.handlePanic(r, metrics.GoroutineRunningStatusCallback, "running-status callback panicked",
+					[]any{"card_id", payload.CardID, "project", payload.Project},
+					nil)
 			}
 		}()
 
-		// 30s is generous enough to absorb the full 3-attempt retry ladder
-		// (1s + 2s + 4s backoff + per-request 10s timeout each) while
-		// still bounding the goroutine's lifetime.
-		cbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cbCtx, cancel := context.WithTimeout(context.Background(), runningStatusCallbackTimeout)
 		defer cancel()
 
 		if err := m.callback.ReportStatus(cbCtx, payload.CardID, payload.Project, "running", "container started"); err != nil {
@@ -571,12 +732,29 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		return "", secretDelivery{}, nil, err
 	}
 
-	// Generate a GitHub token for the runner's own git pull of the skills repo.
-	// This token is NOT passed into the container — rotating credentials reach
-	// the container via the shared secrets dir that the tokenRefresher maintains.
-	gitToken, _, err := m.token.GenerateToken(ctx)
-	if err != nil {
-		return "", secretDelivery{}, nil, fmt.Errorf("generate git token: %w", err)
+	// Mint a GitHub token ONLY when we'll actually pass it to taskSkillsMount
+	// (i.e. a skills clone is configured). Without this guard, deployments that
+	// don't bind-mount a skills clone would fail card spawns whenever the
+	// GitHub API hiccups even though the token is never used. The token is NOT
+	// passed into the container — rotating credentials reach the container via
+	// the shared secrets dir that the tokenRefresher maintains.
+	//
+	// m.token may be nil in unit-test deployments that exercise non-spawn
+	// methods only; combine the nil-guard with the TaskSkillsDir guard so a
+	// missing provider is detected here instead of crashing inside GenerateToken.
+	var gitToken string
+
+	if m.cfg.TaskSkillsDir != "" {
+		if m.token == nil {
+			return "", secretDelivery{}, nil, fmt.Errorf("generate git token: token provider is required when task_skills_dir is set")
+		}
+
+		tok, _, err := m.token.GenerateToken(ctx)
+		if err != nil {
+			return "", secretDelivery{}, nil, fmt.Errorf("generate git token: %w", err)
+		}
+
+		gitToken = tok
 	}
 
 	// Build environment variables. CM_MCP_API_KEY is per-card and doesn't
@@ -637,26 +815,10 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 		return "", secretDelivery{}, nil, fmt.Errorf("build secret delivery: %w", err)
 	}
 
-	// Collect secret values for the per-container Redactor so log output
-	// redacts literal credential values in addition to the static KEY=... patterns.
-	// In file mode the actual values are unknown here; we only redact MCPAPIKey.
-	// CM_GIT_TOKEN is intentionally absent: the runner doesn't know the live value
-	// at spawn time (only the refresher does). Threat model: worker logs leaking a
-	// token are an unlikely and low-impact path on a single-tenant host. If future
-	// redaction is needed, the refresher should publish via a thread-safe accessor.
-	var secretValues []string
-
-	if payload.MCPAPIKey != "" {
-		secretValues = append(secretValues, payload.MCPAPIKey)
-	}
-
-	if delivery.Mode == secretModeEnvVar {
-		for _, e := range delivery.EnvVars {
-			if idx := strings.IndexByte(e, '='); idx >= 0 {
-				secretValues = append(secretValues, e[idx+1:])
-			}
-		}
-	}
+	// Collect secret values for the per-container Redactor. See
+	// collectSecretValues for the threat-model and CM_GIT_TOKEN-absent
+	// rationale.
+	secretValues := collectSecretValues(payload.MCPAPIKey, delivery)
 
 	// Wire the delivery into the container configuration.
 	env, mounts = applySecretsDelivery(env, mounts, delivery)
@@ -688,10 +850,16 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 	}
 
 	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		// Clean up the created-but-not-started container.
-		if rmErr := m.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); rmErr != nil {
+		// Clean up the created-but-not-started container. The caller's ctx may
+		// already be cancelled (e.g. Kill raced the start goroutine), so use a
+		// fresh detached ctx for the removal — otherwise ContainerRemove turns
+		// into a no-op and the container leaks until the 2h container_timeout.
+		rmCtx, rmCancel := withDockerCleanupTimeout(ctx)
+		if rmErr := m.docker.ContainerRemove(rmCtx, resp.ID, container.RemoveOptions{Force: true}); rmErr != nil {
 			m.logger.Warn("failed to remove container after start failure", "container_id", resp.ID, "error", rmErr)
 		}
+
+		rmCancel()
 
 		return "", delivery, nil, fmt.Errorf("start container: %w", err)
 	}
@@ -704,37 +872,57 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			Stderr: false,
 		})
 		if err != nil {
-			m.logger.Warn("failed to attach stdin to container", "container_id", resp.ID, "error", err)
-		} else {
-			m.tracker.SetStdin(payload.Project, payload.CardID, attached.Conn, attached.Close)
+			// The container is already running with CM_INTERACTIVE=1 and
+			// entrypoint.sh blocks forever on stdin. Without an attached
+			// writer, tracker.SetStdin is never called, so /message,
+			// /promote, and /end-session all reject the session and the
+			// container leaks for up to container_timeout (default 2h).
+			// Force-remove it via a fresh ctx so a race with parent
+			// cancellation can't turn the cleanup into a no-op, then
+			// propagate the original attach error so the failure-callback
+			// path runs.
+			m.logger.Warn("failed to attach stdin to container; removing to avoid leak",
+				"container_id", resp.ID, "error", err)
 
-			// Write the priming stream-json user message so Claude begins work
-			// immediately without waiting for a human to type something first.
-			content := buildPrimingContent(payload)
-
-			b, buildErr := streammsg.BuildUserMessage(content)
-			if buildErr != nil {
-				m.logger.Warn("failed to build priming message",
-					"container_id", truncateID(resp.ID),
-					"card_id", payload.CardID,
-					"project", payload.Project,
-					"error", buildErr)
-			} else {
-				// Wrap the priming WriteStdin with a deadline. The
-				// hijacked net.Conn can wedge on kernel buffer pressure,
-				// a slow container, or a misbehaving proxy, and a
-				// synchronous write used to block the Run goroutine
-				// forever. We can't reach through
-				// tracker.WriteStdin to set a net.Conn write deadline (the
-				// writer is behind an io.WriteCloser interface and mocks
-				// in tests wouldn't honour it anyway). Instead: spawn the
-				// write, time out after primingWriteTimeout, and on
-				// timeout close the underlying writer directly — this
-				// unblocks the wedged Write inside tracker.WriteStdin so
-				// stdin.mu gets released and the normal cleanup path can
-				// make progress.
-				m.writePrimingWithTimeout(payload, resp.ID, b, attached.Conn)
+			rmCtx, rmCancel := withDockerCleanupTimeout(ctx)
+			if rmErr := m.docker.ContainerRemove(rmCtx, resp.ID, container.RemoveOptions{Force: true}); rmErr != nil {
+				m.logger.Warn("failed to remove container after attach failure",
+					"container_id", resp.ID, "error", rmErr)
 			}
+
+			rmCancel()
+
+			return "", delivery, nil, fmt.Errorf("attach stdin: %w", err)
+		}
+
+		m.tracker.SetStdin(payload.Project, payload.CardID, attached.Conn, attached.Close)
+
+		// Write the priming stream-json user message so Claude begins work
+		// immediately without waiting for a human to type something first.
+		content := buildPrimingContent(payload)
+
+		b, buildErr := streammsg.BuildUserMessage(content)
+		if buildErr != nil {
+			m.logger.Warn("failed to build priming message",
+				"container_id", truncateID(resp.ID),
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"error", buildErr)
+		} else {
+			// Wrap the priming WriteStdin with a deadline. The
+			// hijacked net.Conn can wedge on kernel buffer pressure,
+			// a slow container, or a misbehaving proxy, and a
+			// synchronous write used to block the Run goroutine
+			// forever. We can't reach through
+			// tracker.WriteStdin to set a net.Conn write deadline (the
+			// writer is behind an io.WriteCloser interface and mocks
+			// in tests wouldn't honour it anyway). Instead: spawn the
+			// write, time out after primingWriteTimeout, and on
+			// timeout close the underlying writer directly — this
+			// unblocks the wedged Write inside tracker.WriteStdin so
+			// stdin.mu gets released and the normal cleanup path can
+			// make progress.
+			m.writePrimingWithTimeout(payload, resp.ID, b, attached.Conn)
 		}
 	}
 
@@ -755,6 +943,10 @@ func isPermissionDenied(err error) bool {
 // minted inline and all secrets are folded into Container.Env (env-var mode).
 func (m *Manager) buildSecretDelivery(ctx context.Context) (secretDelivery, error) {
 	if m.cfg.SecretsDir == "" {
+		if m.token == nil {
+			return secretDelivery{}, fmt.Errorf("mint github token: token provider is required in env-var delivery mode")
+		}
+
 		token, _, err := m.token.GenerateToken(ctx)
 		if err != nil {
 			return secretDelivery{}, fmt.Errorf("mint github token: %w", err)
@@ -775,10 +967,35 @@ func (m *Manager) buildSecretDelivery(ctx context.Context) (secretDelivery, erro
 	}, nil
 }
 
-// shellSingleQuoteEscape returns s with every `'` replaced by `'\”` so the
-// result can be safely embedded inside a single-quoted shell string.
-func shellSingleQuoteEscape(s string) string {
-	return strings.ReplaceAll(s, `'`, `'\''`)
+// collectSecretValues builds the list of literal credential values that the
+// per-container Redactor should mask in log output. MCPAPIKey rides directly
+// in Env and is always known at spawn time; in env-var delivery mode the
+// CM_GIT_TOKEN + Claude auth values are folded into delivery.EnvVars and
+// pulled out one KEY=VALUE pair at a time.
+//
+// CM_GIT_TOKEN is intentionally absent in file mode because the runner
+// doesn't know the live value at spawn time — the refresher owns it. Threat
+// model: worker logs leaking a token are an unlikely and low-impact path on
+// a single-tenant host. If future redaction is needed, the refresher should
+// publish via a thread-safe accessor.
+//
+// Shared by startContainer and StartChat so the two spawn paths stay in lockstep.
+func collectSecretValues(mcpAPIKey string, delivery secretDelivery) []string {
+	var values []string
+
+	if mcpAPIKey != "" {
+		values = append(values, mcpAPIKey)
+	}
+
+	if delivery.Mode == secretModeEnvVar {
+		for _, e := range delivery.EnvVars {
+			if idx := strings.IndexByte(e, '='); idx >= 0 {
+				values = append(values, e[idx+1:])
+			}
+		}
+	}
+
+	return values
 }
 
 // applySecretsDelivery wires the secret-delivery decision into the container
@@ -1016,7 +1233,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 
 	select {
 	case result := <-waitCh:
-		<-logDone // drain remaining log output
+		m.drainLogs(logDone, containerID, payload, log)
 
 		if result.StatusCode != 0 {
 			msg := fmt.Sprintf("container exited with code %d", result.StatusCode)
@@ -1040,88 +1257,120 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 		return metrics.OutcomeSuccess
 
 	case err := <-errCh:
-		if waitCtx.Err() != nil {
-			// Timeout.
-			msg := fmt.Sprintf("container timed out after %s", timeout)
-			log.Warn(msg)
-
-			killCtx, killCancel := withDockerCleanupTimeout(ctx)
-			m.killContainer(killCtx, containerID, log)
-			killCancel()
-
-			select {
-			case <-logDone:
-			case <-time.After(logDrainTimeout):
-				log.Warn("log drain timed out during cleanup",
-					"container_id", truncateID(containerID),
-					"card_id", payload.CardID,
-					"project", payload.Project,
-					"timeout", logDrainTimeout)
-			}
-
-			m.emitSystem(payload, "container failed: "+msg)
-
-			cbCtx, cbCancel := withCleanupTimeout(ctx)
-			m.reportFailure(cbCtx, payload, msg)
-			cbCancel()
-
-			return metrics.OutcomeTimeout
+		// Disambiguate three race-prone outcomes that all manifest as a write
+		// to errCh:
+		//   1. waitCtx exceeded its deadline (real container timeout) — parent
+		//      ctx is still alive. Classify as OutcomeTimeout.
+		//   2. parent ctx is already canceled (operator /kill or shutdown).
+		//      The Docker SDK writes a context-canceled error into errCh, and
+		//      Go's select picks pseudo-randomly between errCh and ctx.Done(),
+		//      so we cannot rely on the ctx.Done() branch winning. Treat this
+		//      identically to the ctx.Done() branch: OutcomeKilled.
+		//   3. Genuine SDK error (dockerd vanished, container weirdness).
+		//      Classify as OutcomeFailure.
+		//
+		// Before this disambiguation, `waitCtx.Err() != nil` was true for both
+		// (1) and (2) and the killed-by-operator case was being silently
+		// reported to CM and the metrics histogram as a timeout.
+		switch {
+		case errors.Is(waitCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil:
+			return m.handleWaitTimeout(ctx, containerID, payload, logDone, timeout, log)
+		case ctx.Err() != nil:
+			return m.handleCanceled(ctx, containerID, payload, logDone, log)
+		default:
+			return m.handleWaitError(ctx, containerID, payload, logDone, err, log)
 		}
-
-		msg := fmt.Sprintf("wait error: %v", err)
-		log.Error(msg)
-
-		killCtx, killCancel := withDockerCleanupTimeout(ctx)
-		m.killContainer(killCtx, containerID, log)
-		killCancel()
-
-		select {
-		case <-logDone:
-		case <-time.After(logDrainTimeout):
-			log.Warn("log drain timed out during cleanup",
-				"container_id", truncateID(containerID),
-				"card_id", payload.CardID,
-				"project", payload.Project,
-				"timeout", logDrainTimeout)
-		}
-
-		m.emitSystem(payload, "container failed: "+msg)
-
-		cbCtx, cbCancel := withCleanupTimeout(ctx)
-		m.reportFailure(cbCtx, payload, msg)
-		cbCancel()
-
-		return metrics.OutcomeFailure
 
 	case <-ctx.Done():
-		// Parent context canceled (e.g., kill or shutdown).
-		log.Info("container canceled")
+		return m.handleCanceled(ctx, containerID, payload, logDone, log)
+	}
+}
 
-		killCtx, killCancel := withDockerCleanupTimeout(ctx)
-		m.killContainer(killCtx, containerID, log)
-		killCancel()
+// handleWaitTimeout is the cleanup path for OutcomeTimeout: kill the container
+// (best-effort), drain the log stream under logDrainTimeout, then report
+// failure to CM via a detached context so the parent's cancellation does not
+// turn the callback into a no-op.
+func (m *Manager) handleWaitTimeout(ctx context.Context, containerID string, payload RunConfig, logDone <-chan struct{}, timeout time.Duration, log *slog.Logger) string {
+	msg := fmt.Sprintf("container timed out after %s", timeout)
+	log.Warn(msg)
 
-		select {
-		case <-logDone:
-		case <-time.After(logDrainTimeout):
-			log.Warn("log drain timed out during cleanup",
-				"container_id", truncateID(containerID),
-				"card_id", payload.CardID,
-				"project", payload.Project,
-				"timeout", logDrainTimeout)
-		}
+	killCtx, killCancel := withDockerCleanupTimeout(ctx)
+	m.killContainer(killCtx, containerID, log)
+	killCancel()
 
-		m.emitSystem(payload, "container canceled")
+	m.drainLogs(logDone, containerID, payload, log)
 
-		// Report failure to CM via a detached context: the parent ctx is
-		// already cancelled, so passing it to ReportStatus would turn the
-		// callback into a no-op and CM would see the card stuck in
-		// `running` forever.
-		cbCtx, cbCancel := withCleanupTimeout(ctx)
-		m.reportFailure(cbCtx, payload, "killed by operator")
-		cbCancel()
+	m.emitSystem(payload, "container failed: "+msg)
 
-		return metrics.OutcomeKilled
+	cbCtx, cbCancel := withCleanupTimeout(ctx)
+	m.reportFailure(cbCtx, payload, msg)
+	cbCancel()
+
+	return metrics.OutcomeTimeout
+}
+
+// handleWaitError is the cleanup path for an unexpected ContainerWait error
+// (dockerd vanished, malformed response, etc.) that is NOT a timeout and NOT
+// a parent-ctx cancellation. Mirrors handleWaitTimeout's structure but
+// classifies as OutcomeFailure and surfaces the underlying error in the
+// failure message.
+func (m *Manager) handleWaitError(ctx context.Context, containerID string, payload RunConfig, logDone <-chan struct{}, err error, log *slog.Logger) string {
+	msg := fmt.Sprintf("wait error: %v", err)
+	log.Error(msg)
+
+	killCtx, killCancel := withDockerCleanupTimeout(ctx)
+	m.killContainer(killCtx, containerID, log)
+	killCancel()
+
+	m.drainLogs(logDone, containerID, payload, log)
+
+	m.emitSystem(payload, "container failed: "+msg)
+
+	cbCtx, cbCancel := withCleanupTimeout(ctx)
+	m.reportFailure(cbCtx, payload, msg)
+	cbCancel()
+
+	return metrics.OutcomeFailure
+}
+
+// handleCanceled is the cleanup path for OutcomeKilled. Reached both via the
+// ctx.Done() select branch AND via the errCh branch when the parent ctx is
+// already canceled (Docker SDK's ContainerWait writes a context-canceled
+// error into errCh and Go's select picks pseudo-randomly between them).
+func (m *Manager) handleCanceled(ctx context.Context, containerID string, payload RunConfig, logDone <-chan struct{}, log *slog.Logger) string {
+	log.Info("container canceled")
+
+	killCtx, killCancel := withDockerCleanupTimeout(ctx)
+	m.killContainer(killCtx, containerID, log)
+	killCancel()
+
+	m.drainLogs(logDone, containerID, payload, log)
+
+	m.emitSystem(payload, "container canceled")
+
+	// Report failure to CM via a detached context: the parent ctx is
+	// already cancelled, so passing it to ReportStatus would turn the
+	// callback into a no-op and CM would see the card stuck in
+	// `running` forever.
+	cbCtx, cbCancel := withCleanupTimeout(ctx)
+	m.reportFailure(cbCtx, payload, "killed by operator")
+	cbCancel()
+
+	return metrics.OutcomeKilled
+}
+
+// drainLogs blocks until logDone fires or logDrainTimeout elapses, whichever
+// comes first. Identical body across the three cleanup branches — extracted
+// so they share exact semantics.
+func (m *Manager) drainLogs(logDone <-chan struct{}, containerID string, payload RunConfig, log *slog.Logger) {
+	select {
+	case <-logDone:
+	case <-time.After(logDrainTimeout):
+		log.Warn("log drain timed out during cleanup",
+			"container_id", truncateID(containerID),
+			"card_id", payload.CardID,
+			"project", payload.Project,
+			"timeout", logDrainTimeout)
 	}
 }
 
@@ -1166,6 +1415,16 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 
 	// Start the watchdog if idle-kill is enabled. It closes itself on
 	// ctx.Done() or when done is closed (below via `defer close(done)`).
+	//
+	// NOTE: this child is intentionally NOT tracked by m.wg. card-mode
+	// streamLogs lifecycles are self-bounded by waitAndCleanup's logDrainTimeout
+	// (so they cannot stall the caller's Wait), and the stdcopy child below
+	// can legitimately block forever on a wedged Docker reader that ignores
+	// Close — the hung-reader test relies on Wait() returning so the
+	// removeContainer + tracker.Remove defers can fire even when streamLogs
+	// has not finished. Chat-mode uses a different lifecycle (external ctx
+	// cancellation) and DOES track the equivalents on m.wg; the asymmetry is
+	// deliberate.
 	if idle := m.cfg.IdleOutputTimeout; idle > 0 {
 		go m.runIdleWatchdog(ctx, done, containerID, payload, log, &lastOutputAt, idle)
 	}
@@ -1185,58 +1444,47 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 		// there too.
 		defer func() {
 			if r := recover(); r != nil {
-				if m.metrics != nil {
-					m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineLogparser).Inc()
-				}
-
-				m.logger.Error("streamLogs child panicked",
-					"goroutine", "logparser",
-					"container_id", containerID,
-					"card_id", payload.CardID,
-					"project", payload.Project,
-					"panic", r,
-					"stack", string(debug.Stack()))
-
-				if m.broadcaster != nil {
-					m.broadcaster.Publish(logbroadcast.LogEntry{
-						Timestamp: time.Now(),
-						CardID:    payload.CardID,
-						Project:   payload.Project,
-						Type:      "system",
-						Content:   "internal error: logparser panicked",
+				m.handlePanic(r, metrics.GoroutineLogparser, "streamLogs child panicked",
+					[]any{
+						"goroutine", "logparser",
+						"container_id", containerID,
+						"card_id", payload.CardID,
+						"project", payload.Project,
+					},
+					&logbroadcast.LogEntry{
+						CardID:  payload.CardID,
+						Project: payload.Project,
+						Type:    "system",
+						Content: "internal error: logparser panicked",
 					})
-				}
 			}
 		}()
 
 		stdoutPr, stdoutPw := io.Pipe()
 		stderrPr, stderrPw := io.Pipe()
 
+		// stdcopy and the stderr scanner are intentionally NOT tracked by
+		// m.wg — see the runIdleWatchdog comment above. A wedged Docker
+		// reader can block stdcopy forever, and waitAndCleanup's log-drain
+		// timeout is the bound that lets removeContainer / tracker.Remove
+		// run regardless.
 		go func() {
 			defer func() { _ = stdoutPw.Close(); _ = stderrPw.Close() }()
 			defer func() {
 				if r := recover(); r != nil {
-					if m.metrics != nil {
-						m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineStreamStdout).Inc()
-					}
-
-					m.logger.Error("streamLogs child panicked",
-						"goroutine", "stdcopy",
-						"container_id", containerID,
-						"card_id", payload.CardID,
-						"project", payload.Project,
-						"panic", r,
-						"stack", string(debug.Stack()))
-
-					if m.broadcaster != nil {
-						m.broadcaster.Publish(logbroadcast.LogEntry{
-							Timestamp: time.Now(),
-							CardID:    payload.CardID,
-							Project:   payload.Project,
-							Type:      "system",
-							Content:   "internal error: stdcopy panicked",
+					m.handlePanic(r, metrics.GoroutineStreamStdout, "streamLogs child panicked",
+						[]any{
+							"goroutine", "stdcopy",
+							"container_id", containerID,
+							"card_id", payload.CardID,
+							"project", payload.Project,
+						},
+						&logbroadcast.LogEntry{
+							CardID:  payload.CardID,
+							Project: payload.Project,
+							Type:    "system",
+							Content: "internal error: stdcopy panicked",
 						})
-					}
 				}
 			}()
 
@@ -1245,29 +1493,28 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 
 		// Log stderr lines as warnings and emit to broadcaster.
 		go func() {
+			// Always close the stderr pipe reader on exit so the writer side
+			// (stdcopy) cannot wedge on a synchronous Write into a buffered
+			// io.Pipe that no one is draining. Without this, a bufio.Scanner
+			// failure (e.g. bufio.ErrTooLong) would leave stdcopy blocked
+			// forever, and the outer streamLogs goroutine would never close
+			// its `done` channel — wedging tracker.Remove + removeContainer.
+			defer func() { _ = stderrPr.Close() }()
 			defer func() {
 				if r := recover(); r != nil {
-					if m.metrics != nil {
-						m.metrics.PanicRecoveredTotal.WithLabelValues(metrics.GoroutineStreamStderr).Inc()
-					}
-
-					m.logger.Error("streamLogs child panicked",
-						"goroutine", "stderr_scanner",
-						"container_id", containerID,
-						"card_id", payload.CardID,
-						"project", payload.Project,
-						"panic", r,
-						"stack", string(debug.Stack()))
-
-					if m.broadcaster != nil {
-						m.broadcaster.Publish(logbroadcast.LogEntry{
-							Timestamp: time.Now(),
-							CardID:    payload.CardID,
-							Project:   payload.Project,
-							Type:      "system",
-							Content:   "internal error: stderr_scanner panicked",
+					m.handlePanic(r, metrics.GoroutineStreamStderr, "streamLogs child panicked",
+						[]any{
+							"goroutine", "stderr_scanner",
+							"container_id", containerID,
+							"card_id", payload.CardID,
+							"project", payload.Project,
+						},
+						&logbroadcast.LogEntry{
+							CardID:  payload.CardID,
+							Project: payload.Project,
+							Type:    "system",
+							Content: "internal error: stderr_scanner panicked",
 						})
-					}
 				}
 			}()
 
@@ -1303,6 +1550,21 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 					})
 				}
 			}
+
+			// If the scanner aborted (e.g. bufio.ErrTooLong on a stderr line
+			// > 1 MiB) the writer side of stderrPr would otherwise block
+			// forever on its next Write. Drain to discard so stdcopy makes
+			// forward progress; the defer above also closes stderrPr so any
+			// already-blocked Write returns io.ErrClosedPipe.
+			if err := scanner.Err(); err != nil {
+				log.Warn("container stderr scanner aborted; draining pipe to unblock writer",
+					"container_id", truncateID(containerID),
+					"card_id", payload.CardID,
+					"project", payload.Project,
+					"error", err)
+
+				_, _ = io.Copy(io.Discard, stderrPr)
+			}
 		}()
 
 		// emit is invoked by the logparser for every published assistant
@@ -1332,8 +1594,28 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 				return
 			}
 
+			m.wg.Add(1)
+
 			go func() {
-				cbCtx, cancel := context.WithTimeout(context.Background(), callbackTimeout)
+				defer m.wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						m.handlePanic(r, metrics.GoroutineSkillEngagedCallback, "skill-engaged callback panicked",
+							[]any{
+								"card_id", payload.CardID,
+								"project", payload.Project,
+								"skill", evt.SkillName,
+							},
+							&logbroadcast.LogEntry{
+								CardID:  payload.CardID,
+								Project: payload.Project,
+								Type:    "system",
+								Content: "internal error: skill-engaged callback panicked",
+							})
+					}
+				}()
+
+				cbCtx, cancel := withCleanupTimeout(context.Background())
 				defer cancel()
 
 				if err := m.callback.ReportSkillEngaged(cbCtx, payload.CardID, payload.Project, evt.SkillName); err != nil {
@@ -1367,6 +1649,23 @@ func (m *Manager) runIdleWatchdog(
 	lastOutputAt *atomic.Pointer[time.Time],
 	idleTimeout time.Duration,
 ) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.handlePanic(r, metrics.GoroutineIdleWatchdog, "idle watchdog panicked",
+				[]any{
+					"container_id", containerID,
+					"card_id", payload.CardID,
+					"project", payload.Project,
+				},
+				&logbroadcast.LogEntry{
+					CardID:  payload.CardID,
+					Project: payload.Project,
+					Type:    "system",
+					Content: "internal error: idle watchdog panicked",
+				})
+		}
+	}()
+
 	tick := m.cfg.IdleWatchdogInterval
 	if tick <= 0 {
 		tick = 30 * time.Second
@@ -1492,10 +1791,39 @@ func (m *Manager) ForceKillContainer(ctx context.Context, containerID string) er
 // stdin.mu, which would deadlock against the in-flight Write. Closing the
 // writer directly is safe: tracker.Remove's Close is a no-op on an
 // already-closed WriteCloser.
+//
+// On the timeout branch we also call tracker.MarkStdinClosed so the
+// tracker's view of stdin matches reality. Without this, subsequent
+// /message webhooks see info.stdin.stdin non-nil and surface the I/O
+// error from the closed writer as a generic 500; the mark flips
+// info.stdin.stdin to nil so WriteStdin returns ErrStdinClosed (410 Gone)
+// instead.
 func (m *Manager) writePrimingWithTimeout(payload RunConfig, containerID string, b []byte, writer io.Closer) {
 	done := make(chan error, 1)
 
+	m.wg.Add(1)
+
 	go func() {
+		defer m.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				m.handlePanic(r, metrics.GoroutinePrimingWrite, "priming stdin write panicked",
+					[]any{
+						"container_id", truncateID(containerID),
+						"card_id", payload.CardID,
+						"project", payload.Project,
+					},
+					nil)
+
+				// Surface the panic as an error so the outer select sees a
+				// completion instead of hanging until primingWriteTimeout.
+				select {
+				case done <- fmt.Errorf("priming stdin write panicked: %v", r):
+				default:
+				}
+			}
+		}()
+
 		done <- m.tracker.WriteStdin(payload.Project, payload.CardID, b)
 	}()
 
@@ -1517,6 +1845,22 @@ func (m *Manager) writePrimingWithTimeout(payload RunConfig, containerID string,
 
 		if writer != nil {
 			_ = writer.Close()
+		}
+
+		// Reflect the close in the tracker so subsequent WriteStdin calls
+		// return ErrStdinClosed (mapped to 410 Gone by the webhook layer)
+		// instead of failing the in-flight Write with a generic I/O error
+		// (mapped to 500). The Mark is unconditional: if the tracker entry
+		// has already been Removed by a racing cleanup, MarkStdinClosed
+		// returns ErrNotTracked and we log-and-continue.
+		if err := m.tracker.MarkStdinClosed(payload.Project, payload.CardID); err != nil &&
+			!errors.Is(err, tracker.ErrNotTracked) &&
+			!errors.Is(err, tracker.ErrNoStdinAttached) {
+			m.logger.Warn("priming timeout: failed to mark stdin closed in tracker",
+				"container_id", truncateID(containerID),
+				"card_id", payload.CardID,
+				"project", payload.Project,
+				"error", err)
 		}
 	}
 }
@@ -1775,10 +2119,12 @@ func (m *Manager) ForceRemoveByLabels(ctx context.Context, project, cardID strin
 // tracked (a card is assigned, the runner is still managing them) are
 // skipped so the periodic maintenance sweep does not kill live work.
 //
-// Per-container Stop/Remove failures are logged individually and collected
-// into the returned error via errors.Join so that callers can see which
-// containers failed without aborting cleanup of the rest. A nil return means
-// every orphan was successfully stopped and removed.
+// Only Remove failures are returned as errors. A Stop failure that ended
+// in a successful Remove is logged as a warning but not surfaced to the
+// caller — the container is gone, which is the only outcome that matters.
+// Returning a Stop failure as a hard error would mislead callers into
+// thinking cleanup did not complete, even when every orphan was
+// ultimately destroyed.
 func (m *Manager) CleanupOrphans(ctx context.Context) error {
 	containers, err := m.docker.ContainerList(ctx, container.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("label", LabelRunner+"=true")),
@@ -1815,7 +2161,15 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 		orphans = append(orphans, ctr)
 	}
 
-	var errs []error
+	// removeErrs collects only the failures that left a container behind.
+	// Stop failures are surfaced through the per-container warning log;
+	// they don't go into removeErrs because the subsequent force-Remove
+	// is the authoritative "did it actually go away?" check.
+	var (
+		removeErrs   []error
+		stopFailures int
+		removed      int
+	)
 
 	for _, ctr := range orphans {
 		idShort := truncateID(ctr.ID)
@@ -1836,14 +2190,18 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 
 		stopTimeout := 5
 		if stopErr := m.docker.ContainerStop(stopCtx, ctr.ID, container.StopOptions{Timeout: &stopTimeout}); stopErr != nil {
-			m.logger.Warn("orphan stop failed",
+			// Stop failure is a warning, not an error: the force-Remove
+			// below is the authoritative cleanup. If Remove succeeds the
+			// container is gone regardless of what Stop reported.
+			m.logger.Warn("orphan stop failed (will still attempt force-remove)",
 				"container_id", idShort,
 				"card_id", ctr.Labels[LabelCardID],
 				"session_id", ctr.Labels[LabelSessionID],
 				"project", ctr.Labels[LabelProject],
 				"error", stopErr,
 			)
-			errs = append(errs, fmt.Errorf("stop orphan %s: %w", idShort, stopErr))
+
+			stopFailures++
 		}
 
 		stopCancel()
@@ -1858,7 +2216,9 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 				"project", ctr.Labels[LabelProject],
 				"error", rmErr,
 			)
-			errs = append(errs, fmt.Errorf("remove orphan %s: %w", idShort, rmErr))
+			removeErrs = append(removeErrs, fmt.Errorf("remove orphan %s: %w", idShort, rmErr))
+		} else {
+			removed++
 		}
 
 		rmCancel()
@@ -1866,14 +2226,15 @@ func (m *Manager) CleanupOrphans(ctx context.Context) error {
 
 	if len(orphans) > 0 || skipped > 0 {
 		m.logger.Info("orphan cleanup complete",
-			"removed", len(orphans)-len(errs),
+			"removed", removed,
 			"attempted", len(orphans),
 			"tracked_skipped", skipped,
-			"errors", len(errs),
+			"stop_warnings", stopFailures,
+			"remove_errors", len(removeErrs),
 		)
 	}
 
-	return errors.Join(errs...)
+	return errors.Join(removeErrs...)
 }
 
 // SweepStaleChatResumeDirs removes cmr-chat-resume-* host directories that are
@@ -1903,7 +2264,16 @@ func (m *Manager) SweepStaleChatResumeDirs(maxAge time.Duration) {
 			}
 
 			info, err := e.Info()
-			if err != nil || time.Since(info.ModTime()) <= maxAge {
+			if err != nil {
+				// A persistent stat failure would leak the dir forever
+				// silently; surface it so an operator can intervene.
+				m.logger.Warn("sweep: failed to stat candidate chat resume dir",
+					"path", filepath.Join(parent, e.Name()), "error", err)
+
+				continue
+			}
+
+			if time.Since(info.ModTime()) <= maxAge {
 				continue
 			}
 
@@ -1919,6 +2289,26 @@ func (m *Manager) SweepStaleChatResumeDirs(maxAge time.Duration) {
 	}
 }
 
+// imagePullProgressLineMax caps how many NDJSON status lines pullImage will
+// decode from the ImagePull stream. The Docker daemon emits one line per
+// pulled layer plus periodic progress updates, so a generous bound of 10000
+// covers every realistic registry response while preventing a malicious or
+// runaway registry from exhausting the goroutine via an unbounded stream.
+const imagePullProgressLineMax = 10_000
+
+// imagePullProgress is the subset of the ImagePull NDJSON status frames we
+// care about. The Docker daemon multiplexes layer-progress events with
+// terminal error events; both share the same envelope, with the error
+// communicated in either the top-level `error` field or
+// `errorDetail.message` (depending on daemon version). Other fields are
+// ignored.
+type imagePullProgress struct {
+	Error       string `json:"error"`
+	ErrorDetail struct {
+		Message string `json:"message"`
+	} `json:"errorDetail"`
+}
+
 func (m *Manager) pullImage(ctx context.Context, img string) error {
 	policy := m.cfg.ImagePullPolicy
 	if policy == "" {
@@ -1930,7 +2320,16 @@ func (m *Manager) pullImage(ctx context.Context, img string) error {
 	}
 
 	if policy == config.PullIfNotPresent {
-		if _, err := m.docker.ImageInspect(ctx, img); err == nil {
+		// Bound the inspect so a wedged dockerd cannot stall the spawn
+		// path indefinitely. On timeout we fall through to the pull
+		// branch — that path has its own (longer) imagePullTimeout cap.
+		inspectCtx, cancel := context.WithTimeout(ctx, imageInspectTimeout)
+
+		_, err := m.docker.ImageInspect(inspectCtx, img)
+
+		cancel()
+
+		if err == nil {
 			m.logger.Debug("image already present locally, skipping pull", "image", img)
 
 			return nil
@@ -1945,15 +2344,55 @@ func (m *Manager) pullImage(ctx context.Context, img string) error {
 		return fmt.Errorf("pull image %s: %w", img, err)
 	}
 
-	if _, err := io.Copy(io.Discard, reader); err != nil {
-		m.logger.Warn("failed to drain image pull output", "error", err)
+	// Decode the NDJSON progress stream rather than discarding it. Without
+	// this, registry-side errors (manifest unknown, unauthorised, etc.)
+	// were silently swallowed and only surfaced later as the much less
+	// actionable `ContainerCreate: no such image`. Decoding here lets us
+	// fail the pull at the source so the caller's structured error
+	// includes the registry's actual reason.
+	dec := json.NewDecoder(reader)
+
+	var pullErr error
+
+	for i := 0; i < imagePullProgressLineMax; i++ {
+		var msg imagePullProgress
+
+		decErr := dec.Decode(&msg)
+		if errors.Is(decErr, io.EOF) {
+			break
+		}
+
+		if decErr != nil {
+			// Malformed or truncated stream. Log and stop reading; rely on
+			// any later error from ImageInspect / ContainerCreate to
+			// surface a downstream symptom. We do not return this error
+			// because a partial valid prefix may have completed the pull
+			// successfully on older daemons.
+			m.logger.Warn("failed to decode image pull progress",
+				"image", img, "error", decErr)
+
+			break
+		}
+
+		// Pin the first registry-reported error. Continuing to drain the
+		// stream lets the daemon close it cleanly; returning early without
+		// draining can leak the underlying HTTP connection on some SDK
+		// versions.
+		if pullErr == nil {
+			switch {
+			case msg.Error != "":
+				pullErr = fmt.Errorf("pull image %s: registry error: %s", img, msg.Error)
+			case msg.ErrorDetail.Message != "":
+				pullErr = fmt.Errorf("pull image %s: registry error: %s", img, msg.ErrorDetail.Message)
+			}
+		}
 	}
 
 	if err := reader.Close(); err != nil {
 		m.logger.Warn("failed to close image pull reader", "error", err)
 	}
 
-	return nil
+	return pullErr
 }
 
 var containerNameRe = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
@@ -2047,18 +2486,27 @@ func (m *Manager) buildExtraHosts(_ context.Context, mcpURL string) []string {
 
 	addrs, err := resolver.LookupHost(lookupCtx, hostname)
 	if err != nil || len(addrs) == 0 {
-		// Distinguish timeout from other failures so operators know when
-		// to look at DNS latency versus a misconfigured hostname.
-		if errors.Is(err, context.DeadlineExceeded) || lookupCtx.Err() != nil {
+		// Distinguish three failure modes so operators know which knob to
+		// turn: deadline (DNS latency), lookup error (e.g. NXDOMAIN), and
+		// zero-result-no-error (resolver returned an empty slice without
+		// reporting an error — surface as a dedicated log line rather than
+		// emitting `error=<nil>`, which is misleading).
+		switch {
+		case errors.Is(err, context.DeadlineExceeded) || lookupCtx.Err() != nil:
 			if m.metrics != nil {
 				m.metrics.DNSLookupTimeoutsTotal.Inc()
 			}
 
 			m.logger.Warn("MCP hostname lookup timed out; container will run without ExtraHosts mapping",
 				"hostname", hostname, "timeout", dnsLookupTimeout)
-		} else {
+		case err != nil:
 			m.logger.Warn("could not resolve MCP hostname for container",
 				"hostname", hostname, "error", err)
+		default:
+			// LookupHost returned (nil, nil): resolver-specific quirk where
+			// the hostname has no A/AAAA records but the query did not fail.
+			m.logger.Warn("MCP hostname resolved to zero addresses; container will run without ExtraHosts mapping",
+				"hostname", hostname)
 		}
 
 		return hosts
@@ -2235,6 +2683,12 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 		mounts = append(mounts, skillsMount)
 	}
 
+	// Collect secret values for the per-container Redactor. See
+	// collectSecretValues for the threat-model and CM_GIT_TOKEN-absent
+	// rationale. Shared with card-mode startContainer so both modes redact
+	// the same set of values.
+	secretValues := collectSecretValues(opts.MCPAPIKey, delivery)
+
 	env, mounts = applySecretsDelivery(env, mounts, delivery)
 
 	if resumeDelivery.DirPath != "" {
@@ -2286,6 +2740,15 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 	m.chatCleanup[resp.ID] = resumeDelivery
 	m.chatCleanupMu.Unlock()
 
+	// Stash the per-container secret values so StreamChatLogs can build a
+	// Redactor without modifying the webhook-facing interface. The map is
+	// keyed by container ID; StreamChatLogs pops the entry once it has
+	// constructed its redactor so an idle long-running runner doesn't
+	// retain dead entries.
+	m.chatSecretsMu.Lock()
+	m.chatSecrets[resp.ID] = secretValues
+	m.chatSecretsMu.Unlock()
+
 	return resp.ID, nil
 }
 
@@ -2300,6 +2763,12 @@ func (m *Manager) DeleteChatCleanup(containerID string) {
 	rd, ok := m.chatCleanup[containerID]
 	delete(m.chatCleanup, containerID)
 	m.chatCleanupMu.Unlock()
+
+	// Also drop the stashed redaction inputs so a rollback path doesn't
+	// leak entries when StreamChatLogs never gets called to consume them.
+	m.chatSecretsMu.Lock()
+	delete(m.chatSecrets, containerID)
+	m.chatSecretsMu.Unlock()
 
 	if !ok {
 		return
@@ -2336,6 +2805,13 @@ func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 
 	go func() {
 		defer m.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				m.handlePanic(r, metrics.GoroutineWaitAndCleanupChat, "chat wait-and-cleanup panicked",
+					[]any{"session_id", sessionID, "container_id", containerID, "project", project},
+					nil)
+			}
+		}()
 
 		m.chatCleanupMu.Lock()
 		rd, hasResume := m.chatCleanup[containerID]
@@ -2368,6 +2844,16 @@ func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 		if hasResume {
 			m.removeChatResume(rd, log)
 		}
+
+		// Drop the stashed secret values regardless of whether
+		// StreamChatLogs ever consumed them. The /chat/start rollback path
+		// that calls AttachChatStdin and fails routes through
+		// RemoveChat + Stop + WaitAndCleanupChat without touching
+		// DeleteChatCleanup, which used to leak the entry forever. Idempotent
+		// on a key that was already consumed by StreamChatLogs.
+		m.chatSecretsMu.Lock()
+		delete(m.chatSecrets, containerID)
+		m.chatSecretsMu.Unlock()
 	}()
 }
 
@@ -2397,15 +2883,33 @@ func (m *Manager) AttachChatStdin(ctx context.Context, sessionID, containerID st
 // goroutine and republishes claude stream-json events as LogEntry values on
 // the broadcaster, keyed by sessionID. The goroutine exits when ctx is
 // cancelled or the log reader EOFs (container exit). Caller must hold a
-// reference to ctx and cancel it on session end or shutdown; the goroutine is
-// tracked by m.wg so Wait() drains it.
+// reference to ctx and cancel it on session end or shutdown; the outer
+// goroutine plus each of its three children (stdcopy, stderr scanner, and
+// logparser) are tracked by m.wg so Wait() drains them.
+//
+// Secrets stashed by StartChat under containerID are popped here and used
+// to construct a per-container Redactor. Without redaction, CM_MCP_API_KEY
+// and any env-var-mode secrets could leak into the /logs SSE stream and
+// slog output via container stdout/stderr. Each inner goroutine is wrapped
+// in a recover() so a malformed stream-json or stdcopy frame in one chat
+// container does not crash the whole runner.
 func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, project string) {
+	// Pop the redaction inputs stashed by StartChat under containerID. Empty
+	// when StartChat wasn't called (tests that exercise StreamChatLogs in
+	// isolation) — NewRedactor handles a nil slice safely.
+	m.chatSecretsMu.Lock()
+	secrets := m.chatSecrets[containerID]
+	delete(m.chatSecrets, containerID)
+	m.chatSecretsMu.Unlock()
+
 	m.wg.Add(1)
 
 	go func() {
 		defer m.wg.Done()
 
 		log := m.logger.With("session_id", sessionID, "container_id", containerID)
+
+		redactor := logparser.NewRedactor(secrets)
 
 		reader, err := m.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
 			ShowStdout: true,
@@ -2420,22 +2924,96 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 
 		defer func() { _ = reader.Close() }()
 
+		// The three child goroutines spawned below can each take a panic
+		// from third-party input — stdcopy on a malformed docker multiplex
+		// frame, bufio.Scanner on bogus UTF-8, the logparser on a bad
+		// stream-json line. Mirror the card-mode streamLogs structure
+		// (lines ~1141-1349) so a panic in any of them is recovered with
+		// metric + slog + system LogEntry, and so Wait() drains all three.
+		defer func() {
+			if r := recover(); r != nil {
+				m.handlePanic(r, metrics.GoroutineLogparser, "chat streamLogs child panicked",
+					[]any{
+						"goroutine", "logparser",
+						"container_id", containerID,
+						"session_id", sessionID,
+						"project", project,
+					},
+					&logbroadcast.LogEntry{
+						SessionID: sessionID,
+						Project:   project,
+						Type:      "system",
+						Content:   "internal error: logparser panicked",
+					})
+			}
+		}()
+
 		stdoutPr, stdoutPw := io.Pipe()
 		stderrPr, stderrPw := io.Pipe()
 
+		m.wg.Add(1)
+
 		go func() {
+			defer m.wg.Done()
 			defer func() { _ = stdoutPw.Close(); _ = stderrPw.Close() }()
+			defer func() {
+				if r := recover(); r != nil {
+					m.handlePanic(r, metrics.GoroutineStreamStdout, "chat streamLogs child panicked",
+						[]any{
+							"goroutine", "stdcopy",
+							"container_id", containerID,
+							"session_id", sessionID,
+							"project", project,
+						},
+						&logbroadcast.LogEntry{
+							SessionID: sessionID,
+							Project:   project,
+							Type:      "system",
+							Content:   "internal error: stdcopy panicked",
+						})
+				}
+			}()
 
 			_, _ = stdcopy.StdCopy(stdoutPw, stderrPw, reader)
 		}()
 
+		m.wg.Add(1)
+
 		go func() {
+			defer m.wg.Done()
+			// Mirror card-mode: always close the stderr pipe reader so the
+			// writer side (stdcopy) cannot wedge on a Write that no one is
+			// draining. Without this, a bufio.Scanner failure (e.g.
+			// bufio.ErrTooLong) would block stdcopy forever and the outer
+			// chat log-stream goroutine would never see EOF.
+			defer func() { _ = stderrPr.Close() }()
+			defer func() {
+				if r := recover(); r != nil {
+					m.handlePanic(r, metrics.GoroutineStreamStderr, "chat streamLogs child panicked",
+						[]any{
+							"goroutine", "stderr_scanner",
+							"container_id", containerID,
+							"session_id", sessionID,
+							"project", project,
+						},
+						&logbroadcast.LogEntry{
+							SessionID: sessionID,
+							Project:   project,
+							Type:      "system",
+							Content:   "internal error: stderr_scanner panicked",
+						})
+				}
+			}()
+
 			scanner := bufio.NewScanner(stderrPr)
 			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 			for scanner.Scan() {
 				line := scanner.Text()
-				log.Warn("chat container stderr", "line", line)
+				// Redact before slog too: a rogue child process echoing the
+				// container env through /proc can easily end up on stderr.
+				redacted := redactor.Redact(line)
+				log.Warn("chat container stderr", "line", redacted)
 
 				if m.broadcaster != nil {
 					m.broadcaster.Publish(logbroadcast.LogEntry{
@@ -2443,9 +3021,23 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 						SessionID: sessionID,
 						Project:   project,
 						Type:      "stderr",
-						Content:   line,
+						Content:   redacted,
 					})
 				}
+			}
+
+			// If the scanner aborted (e.g. bufio.ErrTooLong on a stderr line
+			// > 1 MiB) drain to discard so stdcopy makes forward progress;
+			// the defer above also closes stderrPr so an already-blocked
+			// Write returns io.ErrClosedPipe.
+			if err := scanner.Err(); err != nil {
+				log.Warn("chat container stderr scanner aborted; draining pipe to unblock writer",
+					"container_id", containerID,
+					"session_id", sessionID,
+					"project", project,
+					"error", err)
+
+				_, _ = io.Copy(io.Discard, stderrPr)
 			}
 		}()
 
@@ -2461,7 +3053,7 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 			m.broadcaster.Publish(e)
 		}
 
-		logparser.ProcessStream(stdoutPr, log, emit)
+		logparser.ProcessStreamWithRedactor(stdoutPr, log, redactor, emit, nil)
 
 		log.Info("chat container: log stream ended")
 	}()
@@ -2548,12 +3140,23 @@ func (m *Manager) appendCommonEnv(env []string, taskSkills *[]string) []string {
 // pull failure is logged and the mount is still returned so the container
 // starts with the existing on-disk state. Mirrors the claudeAuthMount call
 // pattern so card-mode and chat-mode stay symmetric.
+//
+// Concurrent spawns share the same on-disk TaskSkillsDir, so the pull is
+// serialised under m.skillsPullMu. `git pull` writes .git/index.lock and is
+// not safe to interleave against itself; without the mutex two simultaneous
+// spawns can fail with "Another git process seems to be running" and leave
+// a stale lock file behind. The mutex is acquired inside the function (after
+// the empty-dir guard) so callers don't need to know about it.
 func (m *Manager) taskSkillsMount(ctx context.Context, gitToken string) (mount.Mount, bool) {
 	if m.cfg.TaskSkillsDir == "" {
 		return mount.Mount{}, false
 	}
 
-	if err := pullSkillsRepo(ctx, m.cfg.TaskSkillsDir, gitToken); err != nil {
+	m.skillsPullMu.Lock()
+	err := pullSkillsRepo(ctx, m.cfg.TaskSkillsDir, gitToken)
+	m.skillsPullMu.Unlock()
+
+	if err != nil {
 		m.logger.Warn("task skills pull failed; using existing local clone",
 			"task_skills_dir", m.cfg.TaskSkillsDir,
 			"error", err,
@@ -2573,7 +3176,17 @@ func (m *Manager) taskSkillsMount(ctx context.Context, gitToken string) (mount.M
 // (host.docker.internal + the resolved MCP host), and the caller-supplied
 // mount set. Card-mode and chat-mode both call this so future changes to
 // the security/resource posture land in one place.
+//
+// PidsLimit is copied to a local before taking its address so concurrent
+// spawns each get an independent pointer. Sharing &m.cfg.ContainerPidsLimit
+// across containers used to expose a field-address: any code path that
+// mutated m.cfg.ContainerPidsLimit would retroactively change the limit
+// observed by every running container's HostConfig snapshot, and the
+// Docker SDK can keep a reference to that pointer for the lifetime of the
+// create request.
 func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mount.Mount) *container.HostConfig {
+	pidsLimit := m.cfg.ContainerPidsLimit
+
 	return &container.HostConfig{
 		Mounts:      mounts,
 		ExtraHosts:  m.buildExtraHosts(ctx, mcpURL),
@@ -2581,7 +3194,7 @@ func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mo
 		SecurityOpt: []string{"no-new-privileges"},
 		Resources: container.Resources{
 			Memory:    m.cfg.ContainerMemoryLimit,
-			PidsLimit: &m.cfg.ContainerPidsLimit,
+			PidsLimit: &pidsLimit,
 		},
 	}
 }
@@ -2590,7 +3203,17 @@ func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mo
 // taskSkillsMount git pull. Claude auth and CM_GIT_TOKEN for the container
 // are owned by the tokenRefresher and reach the worker via the shared secrets
 // dir — this token must not be forwarded to the container.
+//
+// When cfg.TaskSkillsDir is empty the token has no consumer (the skills mount
+// is the only caller that uses it), so we skip the GitHub round-trip entirely.
+// Card-mode startContainer skips the mint in the same case; this guard keeps
+// the two modes symmetric so a deployment without a skills dir pays zero
+// GitHub API calls on /chat/start.
 func (m *Manager) BuildChatAuthEnv(ctx context.Context) string {
+	if m.cfg.TaskSkillsDir == "" {
+		return ""
+	}
+
 	if m.token == nil {
 		return ""
 	}

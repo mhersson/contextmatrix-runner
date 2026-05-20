@@ -85,6 +85,33 @@ func TestAdminPort_DefaultsAnd_ValidationRange(t *testing.T) {
 	assert.Contains(t, err.Error(), "admin_port")
 }
 
+// TestAdminPort_RejectsCollisionWithPort verifies that admin_port == port is
+// rejected at config-load time. Two HTTP listeners cannot share the same
+// TCP port; without this guard the second ListenAndServe would fail with
+// "address already in use" and the runner would crash via os.Exit(1) deep in
+// startup instead of surfacing the typo before bind.
+func TestAdminPort_RejectsCollisionWithPort(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	claudeDir := dir
+
+	// Explicit collision: both ports set to 9090 (the default port).
+	yaml := validConfig(pemPath, claudeDir) + "\nport: 9090\nadmin_port: 9090\n"
+	path := writeConfig(t, dir, yaml)
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "admin_port")
+	assert.Contains(t, err.Error(), "port")
+
+	// admin_port == 0 (disabled) must not trigger the collision check even
+	// if port also happens to be 0 in a malformed Config{} literal.
+	cfg := &Config{Port: 0, AdminPort: 0}
+	ApplyDefaults(cfg)
+	// After defaults Port=9090, AdminPort=0 — no collision.
+	assert.NotEqual(t, cfg.Port, cfg.AdminPort)
+}
+
 func writeConfig(t *testing.T, dir, content string) string {
 	t.Helper()
 
@@ -249,6 +276,8 @@ func TestValidate_ServiceURLValidation(t *testing.T) {
 		{"file scheme", "file:///etc/passwd", "scheme must be http or https"},
 		{"empty host", "http://", "host is required"},
 		{"unparseable", "://bad", "invalid URL"},
+		{"embedded userinfo", "http://user:pass@cm.example.com", "must not embed userinfo credentials"},
+		{"embedded user only", "http://user@cm.example.com", "must not embed userinfo credentials"},
 	}
 
 	for _, tt := range tests {
@@ -855,11 +884,14 @@ func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
 }
 
 func TestValidate_ReplayCacheDefaultsWhenUnset(t *testing.T) {
-	// A Config literal that leaves the webhook replay-protection tunables
-	// at zero must validate and receive the documented defaults.
+	// A Config literal that calls ApplyDefaults before Validate must
+	// receive the documented defaults. Validate no longer injects
+	// defaults on its own (that lived duplicated in Load() and here);
+	// ApplyDefaults is the single source of truth.
 	cfg := baseValidConfigNoGitHub(t)
 	cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 
+	ApplyDefaults(cfg)
 	require.NoError(t, cfg.Validate())
 
 	assert.Equal(t, 10000, cfg.WebhookReplayCacheSize)
@@ -879,28 +911,28 @@ func TestValidate_ReplayCacheRejectsNegative(t *testing.T) {
 			mutate: func(c *Config) {
 				c.WebhookReplayCacheSize = -1
 			},
-			want: "webhook_replay_cache_size must be positive",
+			want: "webhook_replay_cache_size must not be negative",
 		},
 		{
 			name: "negative skew seconds",
 			mutate: func(c *Config) {
 				c.WebhookReplaySkewSeconds = -1
 			},
-			want: "webhook_replay_skew_seconds must be positive",
+			want: "webhook_replay_skew_seconds must not be negative",
 		},
 		{
 			name: "negative dedup cache size",
 			mutate: func(c *Config) {
 				c.MessageDedupCacheSize = -1
 			},
-			want: "message_dedup_cache_size must be positive",
+			want: "message_dedup_cache_size must not be negative",
 		},
 		{
 			name: "negative dedup ttl",
 			mutate: func(c *Config) {
 				c.MessageDedupTTLSeconds = -1
 			},
-			want: "message_dedup_ttl_seconds must be positive",
+			want: "message_dedup_ttl_seconds must not be negative",
 		},
 	}
 
@@ -1631,6 +1663,7 @@ func TestValidate_WorkerExtraEnv_RejectsDangerousKeys(t *testing.T) {
 		"PATH",
 		"GOPROXY",
 		"GOSUMDB",
+		"GOFLAGS",
 		"PYTHONPATH",
 	}
 
@@ -1653,4 +1686,772 @@ func TestValidate_WorkerExtraEnv_AllowsBenignKeys(t *testing.T) {
 		"CI":                  "false",
 	}
 	require.NoError(t, c.Validate())
+}
+
+// TestLoad_UnknownYAMLField verifies that yaml.NewDecoder().KnownFields(true)
+// surfaces typos in security-relevant fields instead of silently accepting
+// them. A misspelled `webhook_replay_skew_secods` (without the "n") would
+// quietly disable replay protection without KnownFields.
+func TestLoad_UnknownYAMLField(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfig(pemPath, dir) + "\nwebhook_replay_skew_secods: 60\n"
+	path := writeConfig(t, dir, yaml)
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "webhook_replay_skew_secods")
+}
+
+// TestLoad_EnvParseError_Surfaces verifies that a malformed integer env var
+// causes Load to fail loudly instead of silently falling back to the YAML
+// default. Operators typo CMR_PORT=70x0 once and lose ten hours debugging
+// without this check.
+func TestLoad_EnvParseError_Surfaces(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	t.Setenv("CMR_PORT", "not-a-number")
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CMR_PORT")
+}
+
+// TestLoad_EnvOverrides_ExtraFields covers the new CMR_* overrides added in
+// Fix 3. Each override is exercised through Load() so the env wiring stays
+// in lockstep with the documented YAML fields.
+func TestLoad_EnvOverrides_ExtraFields(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	t.Setenv("CMR_WEBHOOK_REPLAY_CACHE_SIZE", "999")
+	t.Setenv("CMR_WEBHOOK_REPLAY_SKEW_SECONDS", "111")
+	t.Setenv("CMR_MESSAGE_DEDUP_CACHE_SIZE", "888")
+	t.Setenv("CMR_MESSAGE_DEDUP_TTL_SECONDS", "222")
+	t.Setenv("CMR_IDLE_OUTPUT_TIMEOUT", "5m")
+	t.Setenv("CMR_IDLE_WATCHDOG_INTERVAL", "10s")
+	t.Setenv("CMR_MAINTENANCE_INTERVAL", "20m")
+	t.Setenv("CMR_USE_HMAC_FOR_VERIFY_AUTONOMOUS", "false")
+	t.Setenv("CMR_CONTAINER_MEMORY_LIMIT", "12345")
+	t.Setenv("CMR_CONTAINER_PIDS_LIMIT", "256")
+	t.Setenv("CMR_TASK_SKILLS_DIR", "/srv/skills")
+	t.Setenv("CMR_WORKER_EXTRA_ENV", "MY_FLAG=on,CI=true")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 999, cfg.WebhookReplayCacheSize)
+	assert.Equal(t, 111, cfg.WebhookReplaySkewSeconds)
+	assert.Equal(t, 888, cfg.MessageDedupCacheSize)
+	assert.Equal(t, 222, cfg.MessageDedupTTLSeconds)
+	assert.Equal(t, 5*time.Minute, cfg.IdleOutputTimeout)
+	assert.Equal(t, 10*time.Second, cfg.IdleWatchdogInterval)
+	assert.Equal(t, 20*time.Minute, cfg.MaintenanceInterval)
+	assert.False(t, cfg.UseHMACForVerifyAutonomous)
+	assert.Equal(t, int64(12345), cfg.ContainerMemoryLimit)
+	assert.Equal(t, int64(256), cfg.ContainerPidsLimit)
+	assert.Equal(t, "/srv/skills", cfg.TaskSkillsDir)
+	assert.Equal(t, "on", cfg.WorkerExtraEnv["MY_FLAG"])
+	assert.Equal(t, "true", cfg.WorkerExtraEnv["CI"])
+}
+
+// TestLoad_EnvOverrides_WorkerExtraEnv_MalformedEntry asserts that a
+// missing '=' in CMR_WORKER_EXTRA_ENV surfaces as an error rather than
+// being silently ignored.
+func TestLoad_EnvOverrides_WorkerExtraEnv_MalformedEntry(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	t.Setenv("CMR_WORKER_EXTRA_ENV", "NO_EQUALS_HERE")
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CMR_WORKER_EXTRA_ENV")
+}
+
+// TestValidate_GitHubURLValidation verifies Fix 6: GitHub.APIBaseURL and
+// GitHub.Host are URL-validated when set. Malformed overrides flow into
+// the shared githubauth module today and only surface as opaque connect
+// errors at runtime; we want them to fail Validate() instead.
+func TestValidate_GitHubURLValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiBaseURL string
+		host       string
+		wantErr    string
+	}{
+		{
+			name:       "valid api_base_url is accepted",
+			apiBaseURL: "https://api.github.example",
+		},
+		{
+			name:       "ftp scheme rejected on api_base_url",
+			apiBaseURL: "ftp://api.github.example",
+			wantErr:    "github.api_base_url",
+		},
+		{
+			name:       "empty host on api_base_url rejected",
+			apiBaseURL: "https://",
+			wantErr:    "github.api_base_url",
+		},
+		{
+			name: "bare hostname on github.host accepted",
+			host: "ghe.example.com",
+		},
+		{
+			name: "url with scheme on github.host accepted",
+			host: "https://ghe.example.com",
+		},
+		{
+			name:    "ftp scheme on github.host rejected",
+			host:    "ftp://ghe.example.com",
+			wantErr: "github.host",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := minimalValidConfig(t)
+			cfg.GitHub.APIBaseURL = tt.apiBaseURL
+			cfg.GitHub.Host = tt.host
+
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidate_ContainerLimitsRejectNegative covers Fix 10: negative
+// container_memory_limit / container_pids_limit values must fail Validate
+// instead of being passed through to Docker.
+func TestValidate_ContainerLimitsRejectNegative(t *testing.T) {
+	t.Run("negative memory limit rejected", func(t *testing.T) {
+		cfg := minimalValidConfig(t)
+		cfg.ContainerMemoryLimit = -1
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "container_memory_limit")
+	})
+
+	t.Run("negative pids limit rejected", func(t *testing.T) {
+		cfg := minimalValidConfig(t)
+		cfg.ContainerPidsLimit = -1
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "container_pids_limit")
+	})
+}
+
+// TestApplyDefaults_FillsZeroFields exercises ApplyDefaults directly so the
+// behaviour is pinned for test-only callers that build Config{} literals.
+func TestApplyDefaults_FillsZeroFields(t *testing.T) {
+	cfg := &Config{}
+	ApplyDefaults(cfg)
+
+	assert.Equal(t, 9090, cfg.Port)
+	assert.Equal(t, 3, cfg.MaxConcurrent)
+	assert.Equal(t, "2h", cfg.ContainerTimeout)
+	assert.Equal(t, 30*time.Minute, cfg.IdleOutputTimeout)
+	assert.Equal(t, 30*time.Second, cfg.IdleWatchdogInterval)
+	assert.Equal(t, 10*time.Minute, cfg.MaintenanceInterval)
+	assert.Equal(t, 10000, cfg.WebhookReplayCacheSize)
+	assert.Equal(t, 330, cfg.WebhookReplaySkewSeconds)
+	assert.Equal(t, ProfileProduction, cfg.DeploymentProfile)
+}
+
+// TestApplyDefaults_PreservesExplicitValues verifies that fields already set
+// in the input Config are not overwritten by ApplyDefaults.
+func TestApplyDefaults_PreservesExplicitValues(t *testing.T) {
+	cfg := &Config{
+		Port:                   1234,
+		MaxConcurrent:          7,
+		ContainerTimeout:       "5h",
+		WebhookReplayCacheSize: 555,
+		IdleOutputTimeout:      99 * time.Second,
+	}
+	ApplyDefaults(cfg)
+
+	assert.Equal(t, 1234, cfg.Port)
+	assert.Equal(t, 7, cfg.MaxConcurrent)
+	assert.Equal(t, "5h", cfg.ContainerTimeout)
+	assert.Equal(t, 555, cfg.WebhookReplayCacheSize)
+	assert.Equal(t, 99*time.Second, cfg.IdleOutputTimeout)
+}
+
+// TestLoad_IdleOutputTimeout_ExplicitZeroDisables verifies that
+// `idle_output_timeout: 0s` in YAML survives Load() without being clobbered
+// by ApplyDefaults' default of 30m. The "zero disables the watchdog"
+// contract is load-bearing for operators that explicitly want long-running
+// containers to never be killed by the idle watchdog.
+func TestLoad_IdleOutputTimeout_ExplicitZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfig(pemPath, dir) + "\nidle_output_timeout: 0s\n"
+	path := writeConfig(t, dir, yaml)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, time.Duration(0), cfg.IdleOutputTimeout,
+		"explicit `idle_output_timeout: 0s` must survive Load and disable the watchdog")
+}
+
+// TestLoad_IdleOutputTimeout_AbsentKeyApplyDefault verifies that an absent
+// idle_output_timeout in YAML still receives the documented default. This is
+// the counterpart to TestLoad_IdleOutputTimeout_ExplicitZeroDisables: only
+// the explicit zero case must survive Load.
+func TestLoad_IdleOutputTimeout_AbsentKeyAppliesDefault(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	// validConfig() does not set idle_output_timeout.
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 30*time.Minute, cfg.IdleOutputTimeout,
+		"absent idle_output_timeout must default to 30m")
+}
+
+// TestLoad_MaintenanceInterval_ExplicitZeroDisables verifies the parallel
+// behaviour for maintenance_interval. The runMaintenanceLoop function in
+// main.go treats non-positive intervals as a no-op, so an explicit 0s in
+// YAML must propagate through Load instead of being silently replaced with
+// the 10-minute default.
+func TestLoad_MaintenanceInterval_ExplicitZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfig(pemPath, dir) + "\nmaintenance_interval: 0s\n"
+	path := writeConfig(t, dir, yaml)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, time.Duration(0), cfg.MaintenanceInterval,
+		"explicit `maintenance_interval: 0s` must survive Load and disable the loop")
+}
+
+// TestLoad_MaintenanceInterval_AbsentKeyAppliesDefault verifies that an
+// absent maintenance_interval gets the documented 10m default.
+func TestLoad_MaintenanceInterval_AbsentKeyAppliesDefault(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 10*time.Minute, cfg.MaintenanceInterval,
+		"absent maintenance_interval must default to 10m")
+}
+
+// TestLoad_IdleOutputTimeout_EnvOverrideZeroDisables verifies that an
+// operator setting CMR_IDLE_OUTPUT_TIMEOUT=0s also disables the watchdog,
+// even when the YAML has the default 30m value. This matches the
+// "explicit zero disables" contract regardless of whether the explicit
+// value came from YAML or the environment.
+func TestLoad_IdleOutputTimeout_EnvOverrideZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	// YAML sets a positive value; env should override to 0s.
+	yaml := validConfig(pemPath, dir) + "\nidle_output_timeout: 30m\n"
+	path := writeConfig(t, dir, yaml)
+
+	t.Setenv("CMR_IDLE_OUTPUT_TIMEOUT", "0s")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, time.Duration(0), cfg.IdleOutputTimeout,
+		"explicit CMR_IDLE_OUTPUT_TIMEOUT=0s must disable the watchdog")
+}
+
+// TestLoad_MaintenanceInterval_EnvOverrideZeroDisables is the counterpart
+// for the maintenance loop.
+func TestLoad_MaintenanceInterval_EnvOverrideZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfig(pemPath, dir) + "\nmaintenance_interval: 10m\n"
+	path := writeConfig(t, dir, yaml)
+
+	t.Setenv("CMR_MAINTENANCE_INTERVAL", "0s")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, time.Duration(0), cfg.MaintenanceInterval,
+		"explicit CMR_MAINTENANCE_INTERVAL=0s must disable the loop")
+}
+
+// TestLoad_IdleWatchdogInterval_ExplicitZeroPreserved verifies that an
+// explicit `idle_watchdog_interval: 0s` in YAML survives Load and is not
+// silently replaced with the documented 30s default. Mirrors the
+// idle_output_timeout / maintenance_interval semantics so all three knobs
+// behave consistently.
+func TestLoad_IdleWatchdogInterval_ExplicitZeroPreserved(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfig(pemPath, dir) + "\nidle_watchdog_interval: 0s\n"
+	path := writeConfig(t, dir, yaml)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, time.Duration(0), cfg.IdleWatchdogInterval,
+		"explicit `idle_watchdog_interval: 0s` must survive Load (mirrors idle_output_timeout / maintenance_interval)")
+}
+
+// TestLoad_IdleWatchdogInterval_AbsentKeyAppliesDefault verifies that an
+// absent key still gets the 30s default. The explicit-zero handling must
+// not regress the default-injection path.
+func TestLoad_IdleWatchdogInterval_AbsentKeyAppliesDefault(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 30*time.Second, cfg.IdleWatchdogInterval,
+		"absent idle_watchdog_interval must default to 30s")
+}
+
+// TestLoad_IdleWatchdogInterval_EnvOverrideZeroPreserved checks the env
+// override path: CMR_IDLE_WATCHDOG_INTERVAL=0s must disable the watchdog
+// even when YAML carries a positive value.
+func TestLoad_IdleWatchdogInterval_EnvOverrideZeroPreserved(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	yaml := validConfig(pemPath, dir) + "\nidle_watchdog_interval: 30s\n"
+	path := writeConfig(t, dir, yaml)
+
+	t.Setenv("CMR_IDLE_WATCHDOG_INTERVAL", "0s")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, time.Duration(0), cfg.IdleWatchdogInterval,
+		"explicit CMR_IDLE_WATCHDOG_INTERVAL=0s must preserve zero")
+}
+
+// TestValidate_Port_RangeCheck verifies that out-of-range port values are
+// rejected at Validate time. Zero is tolerated (the same "zero means apply
+// default" convention used by the replay-cache tunables).
+func TestValidate_Port_RangeCheck(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	tests := []struct {
+		name    string
+		port    int
+		wantErr bool
+	}{
+		{"valid", 9090, false},
+		{"min in range", 1, false},
+		{"max in range", 65535, false},
+		{"zero accepted (apply default)", 0, false},
+		{"negative rejected", -1, true},
+		{"above 65535 rejected", 70000, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfigNoGitHub(t)
+			cfg.GitHub = GitHubConfig{
+				AuthMode: "app",
+				App: GitHubAppConfig{
+					AppID:          1,
+					InstallationID: 1,
+					PrivateKeyPath: pemPath,
+				},
+			}
+			cfg.Port = tt.port
+
+			err := cfg.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, "port")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestLoad_Port_EnvOverrideRejectsOutOfRange verifies that an out-of-range
+// env-supplied port reaches Validate (i.e. the override is wired) and
+// is rejected. Surfaces operator typos at config-load time.
+func TestLoad_Port_EnvOverrideRejectsOutOfRange(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	path := writeConfig(t, dir, validConfig(pemPath, dir))
+
+	t.Setenv("CMR_PORT", "70000")
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "port")
+}
+
+// TestValidate_APIKey_CharacterClass verifies that APIKey values containing
+// non-printable / non-ASCII characters are rejected. The deprecated
+// VerifyAutonomous Bearer fallback ships the key in an Authorization header,
+// so a stray CR/LF or control byte must surface as a config error, not as a
+// silent header-injection vector.
+func TestValidate_APIKey_CharacterClass(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	base := func() *Config {
+		cfg := baseValidConfigNoGitHub(t)
+		cfg.GitHub = GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
+		}
+
+		return cfg
+	}
+
+	tests := []struct {
+		name    string
+		apiKey  string
+		wantErr bool
+	}{
+		{"all ASCII printable accepted", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false},
+		{"contains CR rejected", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r", true},
+		{"contains LF rejected", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", true},
+		{"contains tab rejected", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t", true},
+		{"contains DEL rejected", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x7f", true},
+		{"contains space rejected", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ", true},
+		{"contains non-ASCII rejected", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaá", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base()
+			cfg.APIKey = tt.apiKey
+
+			err := cfg.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "api_key")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestValidate_NumericCeilings verifies that the upper bounds on each
+// numeric tunable surface as Validate errors. A typo like
+// `max_concurrent: 1000000` should be caught at config-load time instead of
+// OOM-ing the host at /trigger time.
+func TestValidate_NumericCeilings(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	base := func() *Config {
+		cfg := baseValidConfigNoGitHub(t)
+		cfg.GitHub = GitHubConfig{
+			AuthMode: "app",
+			App: GitHubAppConfig{
+				AppID:          1,
+				InstallationID: 1,
+				PrivateKeyPath: pemPath,
+			},
+		}
+
+		return cfg
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "max_concurrent over ceiling",
+			mutate: func(c *Config) { c.MaxConcurrent = maxMaxConcurrent + 1 },
+			want:   "max_concurrent must not exceed",
+		},
+		{
+			name:   "webhook_replay_cache_size over ceiling",
+			mutate: func(c *Config) { c.WebhookReplayCacheSize = maxWebhookReplayCacheSize + 1 },
+			want:   "webhook_replay_cache_size must not exceed",
+		},
+		{
+			name:   "webhook_replay_skew_seconds over ceiling",
+			mutate: func(c *Config) { c.WebhookReplaySkewSeconds = maxWebhookReplaySkewSec + 1 },
+			want:   "webhook_replay_skew_seconds must not exceed",
+		},
+		{
+			name:   "message_dedup_cache_size over ceiling",
+			mutate: func(c *Config) { c.MessageDedupCacheSize = maxMessageDedupCacheSize + 1 },
+			want:   "message_dedup_cache_size must not exceed",
+		},
+		{
+			name:   "message_dedup_ttl_seconds over ceiling",
+			mutate: func(c *Config) { c.MessageDedupTTLSeconds = maxMessageDedupTTLSec + 1 },
+			want:   "message_dedup_ttl_seconds must not exceed",
+		},
+		{
+			name:   "container_memory_limit over ceiling",
+			mutate: func(c *Config) { c.ContainerMemoryLimit = maxContainerMemoryLimit + 1 },
+			want:   "container_memory_limit must not exceed",
+		},
+		{
+			name:   "container_pids_limit over ceiling",
+			mutate: func(c *Config) { c.ContainerPidsLimit = maxContainerPidsLimit + 1 },
+			want:   "container_pids_limit must not exceed",
+		},
+		{
+			name:   "idle_output_timeout over ceiling",
+			mutate: func(c *Config) { c.IdleOutputTimeout = maxIdleOutputTimeout + time.Second },
+			want:   "idle_output_timeout must not exceed",
+		},
+		{
+			name:   "idle_watchdog_interval over ceiling",
+			mutate: func(c *Config) { c.IdleWatchdogInterval = maxIdleWatchdogInterval + time.Second },
+			want:   "idle_watchdog_interval must not exceed",
+		},
+		{
+			name:   "maintenance_interval over ceiling",
+			mutate: func(c *Config) { c.MaintenanceInterval = maxMaintenanceInterval + time.Second },
+			want:   "maintenance_interval must not exceed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mutate(cfg)
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
+// TestValidate_NumericCeilings_AtCeilingPasses verifies the boundary value
+// itself is accepted — only "above the ceiling" should fail.
+func TestValidate_NumericCeilings_AtCeilingPasses(t *testing.T) {
+	dir := t.TempDir()
+	pemPath := writePEM(t, dir)
+
+	cfg := baseValidConfigNoGitHub(t)
+	cfg.GitHub = GitHubConfig{
+		AuthMode: "app",
+		App: GitHubAppConfig{
+			AppID:          1,
+			InstallationID: 1,
+			PrivateKeyPath: pemPath,
+		},
+	}
+	cfg.MaxConcurrent = maxMaxConcurrent
+	cfg.WebhookReplayCacheSize = maxWebhookReplayCacheSize
+	cfg.WebhookReplaySkewSeconds = maxWebhookReplaySkewSec
+	cfg.MessageDedupCacheSize = maxMessageDedupCacheSize
+	cfg.MessageDedupTTLSeconds = maxMessageDedupTTLSec
+	cfg.ContainerMemoryLimit = maxContainerMemoryLimit
+	cfg.ContainerPidsLimit = maxContainerPidsLimit
+	cfg.IdleOutputTimeout = maxIdleOutputTimeout
+	cfg.IdleWatchdogInterval = maxIdleWatchdogInterval
+	cfg.MaintenanceInterval = maxMaintenanceInterval
+
+	assert.NoError(t, cfg.Validate())
+}
+
+// TestApplyDefaults_DerivesAPIBaseURLFromHost verifies that the GitHub
+// auth-block "host" field is no longer dead config: when only host is set,
+// the runner derives a sensible api_base_url so the value flows through to
+// the githubauth consumer. Previously operators following README guidance
+// could set github.host and see the runner accept it while it was a no-op.
+func TestApplyDefaults_DerivesAPIBaseURLFromHost(t *testing.T) {
+	cases := []struct {
+		name           string
+		host           string
+		apiBaseURL     string
+		wantAPIBaseURL string
+	}{
+		{
+			name:           "bare hostname is wrapped in https",
+			host:           "ghe.example.com",
+			wantAPIBaseURL: "https://ghe.example.com/api/v3",
+		},
+		{
+			name:           "host with scheme has scheme stripped",
+			host:           "https://ghe.example.com",
+			wantAPIBaseURL: "https://ghe.example.com/api/v3",
+		},
+		{
+			name:           "host with http scheme still emits https-derived URL",
+			host:           "http://ghe.example.com",
+			wantAPIBaseURL: "https://ghe.example.com/api/v3",
+		},
+		{
+			name:           "explicit api_base_url is preserved when host also set",
+			host:           "ghe.example.com",
+			apiBaseURL:     "https://api.acme.ghe.com",
+			wantAPIBaseURL: "https://api.acme.ghe.com",
+		},
+		{
+			name:           "host empty leaves api_base_url empty",
+			host:           "",
+			wantAPIBaseURL: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				GitHub: GitHubConfig{
+					Host:       tc.host,
+					APIBaseURL: tc.apiBaseURL,
+				},
+			}
+			ApplyDefaults(cfg)
+			assert.Equal(t, tc.wantAPIBaseURL, cfg.GitHub.APIBaseURL)
+		})
+	}
+}
+
+// TestValidate_ClaudeOAuthToken_RejectsControlBytes verifies that
+// static-env Claude OAuth values containing control bytes / NUL / non-
+// printable ASCII are rejected by Validate. These values flow into the
+// worker env file as `export KEY='<value>'` — a stray newline would
+// terminate the shell-quoted string and inject a second command. Literal
+// spaces are intentionally accepted to keep the boot-time check aligned
+// with container.IsValidStaticSecretByte's runtime gate (0x20..0x7E);
+// space inside single-quoted shell is harmless.
+func TestValidate_ClaudeOAuthToken_RejectsControlBytes(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{"NUL byte", "valid-prefix\x00trailing"},
+		{"newline", "abcdef\nghi"},
+		{"carriage return", "abc\rdef"},
+		{"tab", "abc\tdef"},
+		{"DEL", "abc\x7fdef"},
+		{"high bit", "abc\xffdef"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := minimalValidConfig(t)
+			c.AnthropicAPIKey = "" // exercise the OAuth-token path
+			c.ClaudeOAuthToken = tc.token
+
+			err := c.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "claude_oauth_token")
+		})
+	}
+}
+
+// TestValidate_ClaudeOAuthToken_AcceptsSpace anchors the alignment with
+// container.IsValidStaticSecretByte. The config-side check used to reject
+// 0x20 (space) while the container-side gate accepted it, producing a
+// boot-time / refresh-time mismatch. Both now accept the full 0x20..0x7E
+// range; this test pins that contract so a future tightening of either
+// side surfaces here.
+func TestValidate_ClaudeOAuthToken_AcceptsSpace(t *testing.T) {
+	c := minimalValidConfig(t)
+	c.AnthropicAPIKey = ""
+	c.ClaudeOAuthToken = "abc def"
+
+	require.NoError(t, c.Validate(),
+		"space (0x20) must be accepted to match container.IsValidStaticSecretByte")
+}
+
+// TestValidate_AnthropicAPIKey_RejectsControlBytes mirrors the OAuth-token
+// charset check on the api-key path.
+func TestValidate_AnthropicAPIKey_RejectsControlBytes(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{"NUL byte", "sk-ant-prefix\x00trailing"},
+		{"newline", "sk-ant\nfoo"},
+		{"carriage return", "sk-ant\rfoo"},
+		{"tab", "sk-ant\tfoo"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := minimalValidConfig(t)
+			c.AnthropicAPIKey = tc.key
+
+			err := c.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "anthropic_api_key")
+		})
+	}
+}
+
+// TestValidate_AnthropicAPIKey_AcceptsValid verifies that the charset
+// check leaves normal printable-ASCII tokens unchanged.
+func TestValidate_AnthropicAPIKey_AcceptsValid(t *testing.T) {
+	c := minimalValidConfig(t)
+	c.AnthropicAPIKey = "sk-ant-api03-AaBbCc0123_-456789"
+
+	require.NoError(t, c.Validate())
+}
+
+// TestValidate_LogLevel_AllowlistRejectsInvalid verifies that a typo in
+// log_level surfaces at Validate-time instead of silently defaulting to
+// Info via slog.Level.UnmarshalText's error-swallowing fallback.
+func TestValidate_LogLevel_AllowlistRejectsInvalid(t *testing.T) {
+	cases := []string{"DEBUG-typo", "trace", "verbose", "fatal", "9"}
+	for _, lvl := range cases {
+		t.Run(lvl, func(t *testing.T) {
+			c := minimalValidConfig(t)
+			c.LogLevel = lvl
+
+			err := c.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "log_level")
+		})
+	}
+}
+
+// TestValidate_LogLevel_AllowlistAcceptsValid verifies the allowlist
+// accepts the canonical slog level names (case-insensitive) and the
+// default-applying empty string.
+func TestValidate_LogLevel_AllowlistAcceptsValid(t *testing.T) {
+	cases := []string{"", "debug", "info", "warn", "error", "Debug", "INFO", "WARN", "Error"}
+	for _, lvl := range cases {
+		t.Run(lvl, func(t *testing.T) {
+			c := minimalValidConfig(t)
+			c.LogLevel = lvl
+
+			require.NoError(t, c.Validate())
+		})
+	}
 }

@@ -153,6 +153,42 @@ func TestReplayCache_Run_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// TestReplayCache_DefaultSweepInterval pins Fix W11: a short TTL must
+// produce a proportionally fast sweep tick. min(ttl/2, 60s) means a 10s
+// TTL sweeps every 5s, not every 60s — without the fix, expired entries
+// would linger up to 2×ttl rather than 1.5×ttl in the worst case.
+func TestReplayCache_DefaultSweepInterval(t *testing.T) {
+	cases := []struct {
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{ttl: 0, want: 60 * time.Second},                // disabled → 60s cap (legal)
+		{ttl: 10 * time.Second, want: 5 * time.Second},  // short TTL → ttl/2
+		{ttl: 60 * time.Second, want: 30 * time.Second}, // edge case
+		{ttl: 5 * time.Minute, want: 60 * time.Second},  // long TTL → 60s cap
+		{ttl: time.Hour, want: 60 * time.Second},        // very long → 60s cap
+	}
+
+	for _, c := range cases {
+		got := defaultSweepInterval(c.ttl)
+		assert.Equal(t, c.want, got, "ttl=%s", c.ttl)
+	}
+}
+
+// TestReplayCache_SweepIntervalOverride pins that
+// WithReplayCacheSweepInterval injects a custom tick for tests.
+func TestReplayCache_SweepIntervalOverride(t *testing.T) {
+	c := NewReplayCache(time.Hour, 100, WithReplayCacheSweepInterval(7*time.Millisecond))
+
+	assert.Equal(t, 7*time.Millisecond, c.sweepInterval,
+		"WithReplayCacheSweepInterval must override the derived default")
+
+	// Negative / zero overrides are ignored.
+	c2 := NewReplayCache(time.Hour, 100, WithReplayCacheSweepInterval(0))
+	assert.Equal(t, time.Minute, c2.sweepInterval,
+		"a zero override must fall back to the default")
+}
+
 // --- helpers ---
 
 type mockClock struct {
