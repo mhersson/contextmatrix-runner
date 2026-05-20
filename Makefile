@@ -8,9 +8,9 @@
 GO_VERSION              ?= 1.26.3
 GO_SHA256_AMD64         ?= 2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556
 GO_SHA256_ARM64         ?= 9d89a3ea57d141c2b22d70083f2c8459ba3890f2d9e818e7e933b75614936565
-GOPLS_VERSION           ?= v0.21.1
+GOPLS_VERSION           ?= v0.22.0
 GOLANGCI_LINT_VERSION   ?= v2.12.2
-CLAUDE_CODE_VERSION     ?= 2.1.131
+CLAUDE_CODE_VERSION     ?= 2.1.145
 
 # Image tag components. SHORT_SHA defaults to the current HEAD short hash but
 # CI can pin it explicitly (e.g. to the commit that produced the build).

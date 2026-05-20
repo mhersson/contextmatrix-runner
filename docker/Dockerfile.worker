@@ -29,9 +29,9 @@ FROM debian@sha256:4ae67669760b807c19f23902a3fd7c121a6a70cf2ae709035674b23e712e4
 ARG GO_VERSION=1.26.3
 ARG GO_SHA256_AMD64=2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556
 ARG GO_SHA256_ARM64=9d89a3ea57d141c2b22d70083f2c8459ba3890f2d9e818e7e933b75614936565
-ARG GOPLS_VERSION=v0.21.1
-ARG GOLANGCI_LINT_VERSION=v2.11.4
-ARG CLAUDE_CODE_VERSION=2.1.131
+ARG GOPLS_VERSION=v0.22.0
+ARG GOLANGCI_LINT_VERSION=v2.12.2
+ARG CLAUDE_CODE_VERSION=2.1.145
 # NodeSource publishes rolling "setup_25.x" packages, so nodejs itself is
 # pinned via the NodeSource apt repo; the installed package version tracks
 # NodeSource's latest 25.x release. TODO(H27/H29): add an exact nodejs apt
