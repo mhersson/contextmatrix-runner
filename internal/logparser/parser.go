@@ -507,6 +507,10 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 				}
 			case "thinking":
 				content := redact(block.Thinking)
+				if content == "" {
+					continue
+				}
+
 				logger.Info("claude", "claude_thinking", content)
 
 				if emit != nil {
