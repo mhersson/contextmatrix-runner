@@ -140,6 +140,38 @@ func TestProcessStream(t *testing.T) {
 			wantRecords:   0,
 			wantEmitCount: 0,
 		},
+		{
+			// Signature-only thinking blocks have an empty thinking field.
+			// The guard must drop them silently: 0 emits, 0 log records.
+			name:          "empty thinking with signature is skipped",
+			input:         `{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"abc"}]}}`,
+			wantRecords:   0,
+			wantEmitCount: 0,
+		},
+		{
+			// A thinking block with actual content alongside a signature must
+			// still emit exactly one thinking entry.
+			name:          "non-empty thinking with signature is emitted",
+			input:         `{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"deep thoughts","signature":"abc"}]}}`,
+			wantLevel:     slog.LevelInfo,
+			wantKey:       "claude_thinking",
+			wantValue:     "deep thoughts",
+			wantRecords:   1,
+			wantEmitType:  "thinking",
+			wantEmitCount: 1,
+		},
+		{
+			// A thinking block whose content matches a redact pattern must emit
+			// once with the value replaced by [REDACTED].
+			name:          "thinking matching redact pattern emits redacted content",
+			input:         `{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"}]}}`,
+			wantLevel:     slog.LevelInfo,
+			wantKey:       "claude_thinking",
+			wantValue:     "[REDACTED]",
+			wantRecords:   1,
+			wantEmitType:  "thinking",
+			wantEmitCount: 1,
+		},
 	}
 
 	for _, tc := range tests {
@@ -959,4 +991,32 @@ func TestProcessStream_ScannerError_NilEmit(t *testing.T) {
 	}
 
 	assert.True(t, sawError, "scanner failure must surface even when emit is nil")
+}
+
+// TestProcessStream_EmptyThinkingWithSiblingText verifies that an empty
+// thinking block followed by a text block in the same content[] array emits
+// only the text entry. This guards against using `break` instead of
+// `continue` in the thinking handler — `break` would also skip the text.
+func TestProcessStream_EmptyThinkingWithSiblingText(t *testing.T) {
+	input := `{"type":"assistant","message":{"content":[` +
+		`{"type":"thinking","thinking":"","signature":"sig123"},` +
+		`{"type":"text","text":"visible answer"}` +
+		`]}}`
+
+	logger, records := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	// Only the text record must be logged — the empty thinking must not appear.
+	assert.Len(t, *records, 1)
+	assert.Equal(t, "visible answer", attr((*records)[0], "claude_text"))
+
+	// Only one emit: the text entry.
+	assert.Len(t, emitted, 1)
+	assert.Equal(t, "text", emitted[0].Type)
+	assert.Equal(t, "visible answer", emitted[0].Content)
 }
