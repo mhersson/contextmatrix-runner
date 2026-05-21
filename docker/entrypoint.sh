@@ -485,7 +485,9 @@ if [ -n "${CM_CHAT_SESSION:-}" ]; then
     fi
 
     echo "Starting Claude Code in chat mode (session ${CM_CHAT_SESSION})..."
-    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
+    exec claude -p \
+        --thinking adaptive --thinking-display summarized \
+        --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
         --input-format stream-json \
         --output-format stream-json \
         --verbose --allowed-tools "${ALLOWED_TOOLS_CHAT[*]}" \
@@ -499,7 +501,9 @@ elif [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
         "mcp__contextmatrix__update_refresh_progress")
 
     echo "Starting Claude Code in knowledge-refresh mode for ${CM_PROJECT}/${CM_KB_REPO}..."
-    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
+    exec claude -p \
+        --thinking adaptive --thinking-display summarized \
+        --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
         --output-format stream-json --verbose \
         --allowed-tools "${ALLOWED_TOOLS_KB[*]}" \
         -- \
@@ -524,7 +528,9 @@ elif [ "${CM_INTERACTIVE:-}" = "1" ]; then
     # `--allowed-tools <tools...>` greedily consumes the following positional
     # prompt as yet another allowed-tool entry and exits with
     # "Input must be provided either through stdin or as a prompt argument".
-    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
+    exec claude -p \
+        --thinking adaptive --thinking-display summarized \
+        --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
         --input-format stream-json \
         --output-format stream-json \
         --verbose --allowed-tools "${ALLOWED_TOOLS_HITL[*]}" \
@@ -543,7 +549,9 @@ else
     ALLOWED_TOOLS_AUTO=("${ALLOWED_TOOLS_COMMON[@]}" "${ALLOWED_TOOLS_AUTO_EXTRAS[@]}")
     echo "Starting Claude Code for card ${CM_CARD_ID}..."
     # See HITL branch above for why `--` is required before the prompt.
-    exec claude -p --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" --output-format stream-json --verbose --allowed-tools "${ALLOWED_TOOLS_AUTO[*]}" \
+    exec claude -p \
+        --thinking adaptive --thinking-display summarized \
+        --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" --output-format stream-json --verbose --allowed-tools "${ALLOWED_TOOLS_AUTO[*]}" \
         -- \
         "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.
