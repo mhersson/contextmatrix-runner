@@ -79,6 +79,7 @@ ALLOWED_TOOLS_COMMON=(
     "Bash(go mod:*)"
     "Bash(go run:*)"
     "Bash(go install:*)"
+    "Bash(golangci-lint run:*)"
     "Bash(make:*)"
     # Node.js / frontend workflow (npm install/test/build, node scripts).
     "Bash(npm:*)"
