@@ -527,6 +527,21 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 					continue
 				}
 
+				if block.Name == "AskUserQuestion" {
+					if payload, ok := formatAskUserQuestion(block.Input); ok {
+						content := redact(payload)
+						logger.Info("claude", "claude_user_question", content)
+
+						if emit != nil {
+							emit(logbroadcast.LogEntry{Type: "user_question", Content: content})
+						}
+
+						continue
+					}
+					// Malformed AskUserQuestion input falls through to the generic
+					// tool_call path so the event is still visible.
+				}
+
 				content := redact(formatToolCall(block.Name, block.Input))
 				logger.Info("claude", "claude_tool", content)
 
@@ -536,6 +551,53 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 			}
 		}
 	}
+}
+
+// askUserQuestionOption mirrors a single option in Claude Code's
+// AskUserQuestion tool input.
+type askUserQuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// askUserQuestionItem mirrors a single question in Claude Code's
+// AskUserQuestion tool input.
+type askUserQuestionItem struct {
+	Question    string                  `json:"question"`
+	Header      string                  `json:"header,omitempty"`
+	MultiSelect bool                    `json:"multiSelect,omitempty"`
+	Options     []askUserQuestionOption `json:"options"`
+}
+
+// askUserQuestionPayload is the wire shape CM consumes.
+type askUserQuestionPayload struct {
+	Questions []askUserQuestionItem `json:"questions"`
+}
+
+// formatAskUserQuestion parses an AskUserQuestion tool_use input and
+// re-marshals it as compact JSON for downstream consumers. Returns
+// ok=false when the input cannot be parsed or contains no questions,
+// so the caller can fall back to the generic tool_call path.
+func formatAskUserQuestion(input json.RawMessage) (string, bool) {
+	if len(bytes.TrimSpace(input)) == 0 {
+		return "", false
+	}
+
+	var payload askUserQuestionPayload
+	if err := json.Unmarshal(input, &payload); err != nil {
+		return "", false
+	}
+
+	if len(payload.Questions) == 0 {
+		return "", false
+	}
+
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return "", false
+	}
+
+	return string(out), true
 }
 
 // handleSkillToolUse parses a Skill tool_use block and calls onSkillEngaged

@@ -1020,3 +1020,163 @@ func TestProcessStream_EmptyThinkingWithSiblingText(t *testing.T) {
 	assert.Equal(t, "text", emitted[0].Type)
 	assert.Equal(t, "visible answer", emitted[0].Content)
 }
+
+// TestProcessStream_AskUserQuestion_SingleQuestion verifies that an
+// AskUserQuestion tool_use is emitted as a "user_question" LogEntry with
+// the structured payload preserved as compact JSON — not routed through
+// formatToolCall's 200-rune-truncated path.
+func TestProcessStream_AskUserQuestion_SingleQuestion(t *testing.T) {
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+		`"questions":[{"question":"Which library should we use?","header":"Library","multiSelect":false,` +
+		`"options":[{"label":"date-fns","description":"Functional, tree-shakeable"},` +
+		`{"label":"luxon","description":"Object-oriented with timezone support"}]}]}}]}}`
+
+	logger, records := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, *records, 1)
+	assert.Equal(t, slog.LevelInfo, (*records)[0].Level)
+	assert.NotEmpty(t, attr((*records)[0], "claude_user_question"))
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "user_question", emitted[0].Type)
+
+	var got askUserQuestionPayload
+
+	require.NoError(t, json.Unmarshal([]byte(emitted[0].Content), &got))
+	require.Len(t, got.Questions, 1)
+	assert.Equal(t, "Which library should we use?", got.Questions[0].Question)
+	assert.Equal(t, "Library", got.Questions[0].Header)
+	assert.False(t, got.Questions[0].MultiSelect)
+	require.Len(t, got.Questions[0].Options, 2)
+	assert.Equal(t, "date-fns", got.Questions[0].Options[0].Label)
+	assert.Equal(t, "luxon", got.Questions[0].Options[1].Label)
+}
+
+// TestProcessStream_AskUserQuestion_MultiQuestion verifies that multiple
+// questions in one AskUserQuestion call are preserved in order, and that
+// multiSelect=true round-trips.
+func TestProcessStream_AskUserQuestion_MultiQuestion(t *testing.T) {
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+		`"questions":[` +
+		`{"question":"Q1?","header":"H1","multiSelect":false,"options":[{"label":"a"},{"label":"b"}]},` +
+		`{"question":"Q2?","header":"H2","multiSelect":true,"options":[{"label":"x"},{"label":"y"},{"label":"z"}]}` +
+		`]}}]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "user_question", emitted[0].Type)
+
+	var got askUserQuestionPayload
+
+	require.NoError(t, json.Unmarshal([]byte(emitted[0].Content), &got))
+	require.Len(t, got.Questions, 2)
+	assert.Equal(t, "Q1?", got.Questions[0].Question)
+	assert.False(t, got.Questions[0].MultiSelect)
+	assert.Equal(t, "Q2?", got.Questions[1].Question)
+	assert.True(t, got.Questions[1].MultiSelect)
+	assert.Len(t, got.Questions[1].Options, 3)
+}
+
+// TestProcessStream_AskUserQuestion_MalformedFallsBackToToolCall verifies
+// that an AskUserQuestion payload that fails to parse still surfaces — via
+// the generic tool_call path — rather than being silently dropped.
+func TestProcessStream_AskUserQuestion_MalformedFallsBackToToolCall(t *testing.T) {
+	// "questions" is a string instead of an array — Unmarshal will fail.
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":"oops"}}]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "tool_call", emitted[0].Type,
+		"malformed AskUserQuestion must fall back to the generic tool_call path")
+	assert.Contains(t, emitted[0].Content, "AskUserQuestion")
+}
+
+// TestProcessStream_AskUserQuestion_EmptyQuestionsFallsBack verifies that
+// a payload with an empty questions array falls back to tool_call so the
+// event still appears in the stream.
+func TestProcessStream_AskUserQuestion_EmptyQuestionsFallsBack(t *testing.T) {
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[]}}]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "tool_call", emitted[0].Type)
+}
+
+// TestProcessStream_AskUserQuestion_RedactsSecrets verifies that secret
+// strings inside an AskUserQuestion question survive the JSON re-marshal
+// and then get redacted via the standard pipeline before emission.
+func TestProcessStream_AskUserQuestion_RedactsSecrets(t *testing.T) {
+	secret := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+		`"questions":[{"question":"Use this token: ` + secret + `?","options":[{"label":"yes"},{"label":"no"}]}]}}]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "user_question", emitted[0].Type)
+	assert.NotContains(t, emitted[0].Content, secret, "secret must be redacted from the user_question content")
+	assert.Contains(t, emitted[0].Content, "[REDACTED]")
+}
+
+// TestFormatAskUserQuestion_FallbackContract pins the contract used by
+// ProcessStream: nil/empty/invalid inputs must return ok=false so the
+// caller routes to the generic tool_call path.
+func TestFormatAskUserQuestion_FallbackContract(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		wantOK bool
+	}{
+		{name: "empty input", input: ``, wantOK: false},
+		{name: "whitespace only", input: `   `, wantOK: false},
+		{name: "invalid JSON", input: `{not json`, wantOK: false},
+		{name: "missing questions key", input: `{}`, wantOK: false},
+		{name: "empty questions array", input: `{"questions":[]}`, wantOK: false},
+		{name: "wrong type for questions", input: `{"questions":"oops"}`, wantOK: false},
+		{
+			name:   "valid single question",
+			input:  `{"questions":[{"question":"hi","options":[{"label":"a"}]}]}`,
+			wantOK: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := formatAskUserQuestion(json.RawMessage(tc.input))
+			assert.Equal(t, tc.wantOK, ok)
+		})
+	}
+}
