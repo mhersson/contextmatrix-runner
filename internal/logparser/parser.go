@@ -528,8 +528,12 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 				}
 
 				if block.Name == "AskUserQuestion" {
-					if payload, ok := formatAskUserQuestion(block.Input); ok {
-						content := redact(payload)
+					if validateAskUserQuestion(block.Input) {
+						// Emit the original input bytes (after redaction) so
+						// unknown future fields survive on the wire. The
+						// typed struct in validateAskUserQuestion is used
+						// for validation only.
+						content := redact(string(block.Input))
 						logger.Info("claude", "claude_user_question", content)
 
 						if emit != nil {
@@ -538,8 +542,14 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 
 						continue
 					}
-					// Malformed AskUserQuestion input falls through to the generic
-					// tool_call path so the event is still visible.
+
+					// Malformed AskUserQuestion input falls through to the
+					// generic tool_call path so the event is still visible.
+					// Surface this on the slog channel so operators can grep
+					// for the failed-prompt symptom — the info-level
+					// claude_tool emit below by itself looks like any other
+					// tool call.
+					logger.Warn("claude", "claude_user_question_malformed", string(block.Input))
 				}
 
 				content := redact(formatToolCall(block.Name, block.Input))
@@ -574,30 +584,40 @@ type askUserQuestionPayload struct {
 	Questions []askUserQuestionItem `json:"questions"`
 }
 
-// formatAskUserQuestion parses an AskUserQuestion tool_use input and
-// re-marshals it as compact JSON for downstream consumers. Returns
-// ok=false when the input cannot be parsed or contains no questions,
-// so the caller can fall back to the generic tool_call path.
-func formatAskUserQuestion(input json.RawMessage) (string, bool) {
+// validateAskUserQuestion shape-checks an AskUserQuestion tool_use input.
+// The shape contract is: a non-empty `questions` array whose entries each
+// carry a non-nil `options` field (an empty options slice is valid; nil
+// is not, because nil marshals back to `null` in JSON and crashes the
+// frontend's `options.map(...)`).
+//
+// Returns true when the input is safe to emit downstream as a
+// `user_question` LogEntry. The caller emits the original input bytes,
+// not a re-marshalled form, so unknown future fields added by Claude Code
+// survive on the wire for forward compatibility.
+func validateAskUserQuestion(input json.RawMessage) bool {
 	if len(bytes.TrimSpace(input)) == 0 {
-		return "", false
+		return false
 	}
 
 	var payload askUserQuestionPayload
 	if err := json.Unmarshal(input, &payload); err != nil {
-		return "", false
+		return false
 	}
 
 	if len(payload.Questions) == 0 {
-		return "", false
+		return false
 	}
 
-	out, err := json.Marshal(payload)
-	if err != nil {
-		return "", false
+	for _, q := range payload.Questions {
+		// Nil options would marshal to `"options":null`, which the frontend
+		// cannot iterate. Empty `[]` is fine — it just renders a question
+		// with no options (the user types a free-text answer).
+		if q.Options == nil {
+			return false
+		}
 	}
 
-	return string(out), true
+	return true
 }
 
 // handleSkillToolUse parses a Skill tool_use block and calls onSkillEngaged

@@ -1130,12 +1130,140 @@ func TestProcessStream_AskUserQuestion_EmptyQuestionsFallsBack(t *testing.T) {
 }
 
 // TestProcessStream_AskUserQuestion_RedactsSecrets verifies that secret
-// strings inside an AskUserQuestion question survive the JSON re-marshal
-// and then get redacted via the standard pipeline before emission.
+// strings embedded inside an AskUserQuestion question survive on the wire
+// and then get redacted via the standard pipeline before emission. The
+// table covers each secretPatterns family that has non-trivial
+// JSON-encoding interaction (Bearer/JWT/AWS keys use character classes
+// that JSON-string encoding preserves byte-for-byte; env-var-shaped
+// secrets are the one path with non-obvious encoding behaviour).
 func TestProcessStream_AskUserQuestion_RedactsSecrets(t *testing.T) {
-	secret := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"
+	tests := []struct {
+		name   string
+		secret string
+	}{
+		{name: "github personal access token", secret: "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"},
+		{name: "bearer token", secret: "Bearer abc123XYZabc123XYZabc123XYZ"},
+		{name: "JWT", secret: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"},
+		{name: "AWS access key id", secret: "AKIAIOSFODNN7EXAMPLE"},
+		{name: "CM env-var secret", secret: "CM_MCP_API_KEY=abc123XYZsecretvalue"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+				`"questions":[{"question":"Use this token: ` + tc.secret + `?","options":[{"label":"yes"},{"label":"no"}]}]}}]}}`
+
+			logger, _ := newTestLogger()
+
+			var emitted []logbroadcast.LogEntry
+
+			ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+				emitted = append(emitted, e)
+			})
+
+			require.Len(t, emitted, 1)
+			assert.Equal(t, "user_question", emitted[0].Type)
+			assert.NotContains(t, emitted[0].Content, tc.secret,
+				"raw secret must not appear in the emitted user_question content")
+			assert.Contains(t, emitted[0].Content, "[REDACTED]",
+				"redactor must replace the secret with [REDACTED]")
+		})
+	}
+}
+
+// TestValidateAskUserQuestion_FallbackContract pins the contract used by
+// ProcessStream: nil/empty/invalid inputs must return false so the
+// caller routes to the generic tool_call path.
+func TestValidateAskUserQuestion_FallbackContract(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{name: "empty input", input: ``, want: false},
+		{name: "whitespace only", input: `   `, want: false},
+		{name: "invalid JSON", input: `{not json`, want: false},
+		{name: "missing questions key", input: `{}`, want: false},
+		{name: "empty questions array", input: `{"questions":[]}`, want: false},
+		{name: "wrong type for questions", input: `{"questions":"oops"}`, want: false},
+		{
+			// Per-question shape check: nil/missing options crashes the
+			// frontend's options.map(...). Reject upstream so the event
+			// surfaces via the tool_call fallback path instead.
+			name:  "question with missing options field",
+			input: `{"questions":[{"question":"hi"}]}`,
+			want:  false,
+		},
+		{
+			// Same shape with an explicit null options — equivalent to missing.
+			name:  "question with null options",
+			input: `{"questions":[{"question":"hi","options":null}]}`,
+			want:  false,
+		},
+		{
+			// Empty options array is intentionally allowed — the model can
+			// ask an open question and let the user type free-text.
+			name:  "question with empty options array",
+			input: `{"questions":[{"question":"hi","options":[]}]}`,
+			want:  true,
+		},
+		{
+			name:  "valid single question",
+			input: `{"questions":[{"question":"hi","options":[{"label":"a"}]}]}`,
+			want:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, validateAskUserQuestion(json.RawMessage(tc.input)))
+		})
+	}
+}
+
+// TestProcessStream_AskUserQuestion_MissingOptionsFallsBack is the
+// integration-side counterpart to the contract table above — when a
+// payload arrives with a question missing its options field, the runner
+// emits the generic tool_call entry rather than dropping or crashing.
+func TestProcessStream_AskUserQuestion_MissingOptionsFallsBack(t *testing.T) {
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"hi"}]}}]}}`
+
+	logger, records := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "tool_call", emitted[0].Type,
+		"missing options must fall back to the generic tool_call path")
+
+	// The slog channel records both the Warn (claude_user_question_malformed)
+	// and the Info (claude_tool) so operators can grep for malformed events.
+	var sawMalformedWarn bool
+
+	for _, r := range *records {
+		if r.Level == slog.LevelWarn && attr(r, "claude_user_question_malformed") != "" {
+			sawMalformedWarn = true
+
+			break
+		}
+	}
+
+	assert.True(t, sawMalformedWarn,
+		"malformed AskUserQuestion must surface on the slog channel as a Warn")
+}
+
+// TestProcessStream_AskUserQuestion_PreservesUnknownFields verifies that
+// unknown fields on the wire survive the runner. We validate via the typed
+// struct but emit the original input bytes, so a future Claude Code field
+// like `priority` does not get silently dropped.
+func TestProcessStream_AskUserQuestion_PreservesUnknownFields(t *testing.T) {
 	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
-		`"questions":[{"question":"Use this token: ` + secret + `?","options":[{"label":"yes"},{"label":"no"}]}]}}]}}`
+		`"questions":[{"question":"Q?","priority":"high","options":[{"label":"a","style":"primary"}]}],` +
+		`"meta":"experimental"}}]}}`
 
 	logger, _ := newTestLogger()
 
@@ -1147,36 +1275,10 @@ func TestProcessStream_AskUserQuestion_RedactsSecrets(t *testing.T) {
 
 	require.Len(t, emitted, 1)
 	assert.Equal(t, "user_question", emitted[0].Type)
-	assert.NotContains(t, emitted[0].Content, secret, "secret must be redacted from the user_question content")
-	assert.Contains(t, emitted[0].Content, "[REDACTED]")
-}
-
-// TestFormatAskUserQuestion_FallbackContract pins the contract used by
-// ProcessStream: nil/empty/invalid inputs must return ok=false so the
-// caller routes to the generic tool_call path.
-func TestFormatAskUserQuestion_FallbackContract(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		wantOK bool
-	}{
-		{name: "empty input", input: ``, wantOK: false},
-		{name: "whitespace only", input: `   `, wantOK: false},
-		{name: "invalid JSON", input: `{not json`, wantOK: false},
-		{name: "missing questions key", input: `{}`, wantOK: false},
-		{name: "empty questions array", input: `{"questions":[]}`, wantOK: false},
-		{name: "wrong type for questions", input: `{"questions":"oops"}`, wantOK: false},
-		{
-			name:   "valid single question",
-			input:  `{"questions":[{"question":"hi","options":[{"label":"a"}]}]}`,
-			wantOK: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, ok := formatAskUserQuestion(json.RawMessage(tc.input))
-			assert.Equal(t, tc.wantOK, ok)
-		})
-	}
+	assert.Contains(t, emitted[0].Content, `"priority":"high"`,
+		"unknown per-question field must survive on the wire")
+	assert.Contains(t, emitted[0].Content, `"style":"primary"`,
+		"unknown per-option field must survive on the wire")
+	assert.Contains(t, emitted[0].Content, `"meta":"experimental"`,
+		"unknown top-level field must survive on the wire")
 }

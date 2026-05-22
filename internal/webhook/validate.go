@@ -462,9 +462,11 @@ func validateEndSession(p *EndSessionPayload) error {
 // model string never reaches docker.ContainerCreate as an env value.
 var chatModelPattern = regexp.MustCompile(`^claude-[a-z0-9.-]{1,64}$`)
 
-// chatResumeRolePattern restricts ResumeTurn.Role to the four shapes the
-// transcript builder emits.
-var chatResumeRolePattern = regexp.MustCompile(`^(user|assistant_text|tool_call|tool_result_summary)$`)
+// chatResumeRolePattern restricts ResumeTurn.Role to the shapes the
+// transcript builder emits. `user_question` is included so an
+// AskUserQuestion turn carries its native role across rehydration
+// rather than being lossy-remapped on the CM side.
+var chatResumeRolePattern = regexp.MustCompile(`^(user|assistant_text|tool_call|tool_result_summary|user_question)$`)
 
 const (
 	// chatResumeMaxTurns caps the resume payload at 600 turns, matching CM's
