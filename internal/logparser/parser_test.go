@@ -1228,7 +1228,7 @@ func TestValidateAskUserQuestion_FallbackContract(t *testing.T) {
 func TestProcessStream_AskUserQuestion_MissingOptionsFallsBack(t *testing.T) {
 	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"hi"}]}}]}}`
 
-	logger, records := newTestLogger()
+	logger, _ := newTestLogger()
 
 	var emitted []logbroadcast.LogEntry
 
@@ -1239,21 +1239,6 @@ func TestProcessStream_AskUserQuestion_MissingOptionsFallsBack(t *testing.T) {
 	require.Len(t, emitted, 1)
 	assert.Equal(t, "tool_call", emitted[0].Type,
 		"missing options must fall back to the generic tool_call path")
-
-	// The slog channel records both the Warn (claude_user_question_malformed)
-	// and the Info (claude_tool) so operators can grep for malformed events.
-	var sawMalformedWarn bool
-
-	for _, r := range *records {
-		if r.Level == slog.LevelWarn && attr(r, "claude_user_question_malformed") != "" {
-			sawMalformedWarn = true
-
-			break
-		}
-	}
-
-	assert.True(t, sawMalformedWarn,
-		"malformed AskUserQuestion must surface on the slog channel as a Warn")
 }
 
 // TestProcessStream_AskUserQuestion_PreservesUnknownFields verifies that

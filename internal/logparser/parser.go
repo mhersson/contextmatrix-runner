@@ -544,12 +544,9 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 					}
 
 					// Malformed AskUserQuestion input falls through to the
-					// generic tool_call path so the event is still visible.
-					// Surface this on the slog channel so operators can grep
-					// for the failed-prompt symptom — the info-level
-					// claude_tool emit below by itself looks like any other
-					// tool call.
-					logger.Warn("claude", "claude_user_question_malformed", string(block.Input))
+					// generic tool_call path below, where the existing
+					// redact + claude_tool Info emit gives operators the same
+					// signal they have for any other tool call.
 				}
 
 				content := redact(formatToolCall(block.Name, block.Input))
