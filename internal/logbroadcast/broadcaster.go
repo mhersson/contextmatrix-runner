@@ -43,11 +43,14 @@ type LogEntry struct {
 	CardID    string    `json:"card_id,omitempty"`
 	Project   string    `json:"project,omitempty"`
 	SessionID string    `json:"session_id,omitempty"`
-	// Type is one of: text, thinking, tool_call, stderr, system, user, usage.
+	// Type is one of: text, thinking, tool_call, user_question, stderr,
+	// system, user, usage.
 	// "user" is a message submitted via the HITL chat input — published
 	// directly by the /message webhook handler, bypassing logparser.Redact.
 	// "usage" carries Claude's stream-json usage block (Usage field) and
 	// the responding model (Model field); Content is empty for these.
+	// "user_question" carries the structured payload of an AskUserQuestion
+	// tool_use; Content is compact JSON matching CM's UserQuestionCard.
 	Type    string      `json:"type"`
 	Content string      `json:"content,omitempty"`
 	Usage   *TokenUsage `json:"usage,omitempty"`
