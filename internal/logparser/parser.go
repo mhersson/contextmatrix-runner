@@ -221,6 +221,7 @@ type usageBlock struct {
 // contentBlock represents a single block within a message.
 type contentBlock struct {
 	Type     string          `json:"type"`
+	ID       string          `json:"id"`
 	Text     string          `json:"text"`
 	Thinking string          `json:"thinking"`
 	Name     string          `json:"name"`
@@ -528,7 +529,14 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 				}
 
 				if block.Name == "AskUserQuestion" {
-					if validateAskUserQuestion(block.Input) {
+					// An empty tool_use id makes the reply path lossy: the
+					// runner cannot emit a tool_result frame, so the
+					// operator's eventual answer arrives as plain user text
+					// against an open tool_use and Claude rationalises
+					// "the tool isn't available". Fall through to the
+					// generic tool_call path so the chat UI never renders
+					// an unanswerable question card.
+					if block.ID != "" && validateAskUserQuestion(block.Input) {
 						// Emit the original input bytes (after redaction) so
 						// unknown future fields survive on the wire. The
 						// typed struct in validateAskUserQuestion is used
@@ -537,16 +545,21 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 						logger.Info("claude", "claude_user_question", content)
 
 						if emit != nil {
-							emit(logbroadcast.LogEntry{Type: "user_question", Content: content})
+							emit(logbroadcast.LogEntry{Type: "user_question", Content: content, ToolUseID: block.ID})
 						}
 
 						continue
 					}
 
-					// Malformed AskUserQuestion input falls through to the
-					// generic tool_call path below, where the existing
-					// redact + claude_tool Info emit gives operators the same
-					// signal they have for any other tool call.
+					if block.ID == "" {
+						logger.Warn("logparser: AskUserQuestion missing tool_use id, falling back to tool_call")
+					}
+
+					// Malformed (or id-less) AskUserQuestion input falls
+					// through to the generic tool_call path below, where
+					// the existing redact + claude_tool Info emit gives
+					// operators the same signal they have for any other
+					// tool call.
 				}
 
 				content := redact(formatToolCall(block.Name, block.Input))

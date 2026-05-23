@@ -51,10 +51,15 @@ type LogEntry struct {
 	// the responding model (Model field); Content is empty for these.
 	// "user_question" carries the structured payload of an AskUserQuestion
 	// tool_use; Content is compact JSON matching CM's UserQuestionCard.
-	Type    string      `json:"type"`
-	Content string      `json:"content,omitempty"`
-	Usage   *TokenUsage `json:"usage,omitempty"`
-	Model   string      `json:"model,omitempty"`
+	// ToolUseID is set only on "user_question" entries and carries the
+	// stream-json tool_use id (e.g. "toolu_01ABC..."). The chat layer
+	// stores it per-session and forwards it on the next /message POST so
+	// the runner can emit a tool_result frame back to Claude.
+	Type      string      `json:"type"`
+	Content   string      `json:"content,omitempty"`
+	ToolUseID string      `json:"tool_use_id,omitempty"`
+	Usage     *TokenUsage `json:"usage,omitempty"`
+	Model     string      `json:"model,omitempty"`
 }
 
 // TokenUsage carries the per-turn context window accounting reported by

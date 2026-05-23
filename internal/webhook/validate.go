@@ -28,7 +28,9 @@ var (
 	branchRE = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,200}$`)
 	// host component: ASCII alphanumerics, dot, hyphen.
 	hostRE = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
-	// message_id: UUIDs, prefixed ids, etc. 1..128 runes.
+	// message_id: UUIDs, prefixed ids, etc. 1..128 runes. Also used for
+	// tool_use_id — Anthropic's `toolu_…` token shape fits comfortably and
+	// sharing the regex keeps the two id surfaces aligned.
 	messageIDRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 	// task_skill_name: restricts skill names to a safe charset that cannot
 	// reach outside the /host-skills mount via path traversal. Must start with
@@ -212,6 +214,28 @@ func validateMessageID(v string) error {
 
 	if !messageIDRE.MatchString(v) {
 		return &ValidationError{Field: "message_id", Reason: "must match [A-Za-z0-9_.-]{1,128}"}
+	}
+
+	return nil
+}
+
+// validateToolUseID allows empty (optional field — absence means the
+// /message body is a plain user-text turn) but restricts charset and length
+// when present. The value is rendered into the JSON envelope written to
+// the chat container's stdin; a control byte or oversize blob there would
+// derail Claude's per-line stream-json reader or expand the structured-log
+// surface with attacker-controlled content.
+func validateToolUseID(v string) error {
+	if v == "" {
+		return nil
+	}
+
+	if containsCtlBytes(v) {
+		return &ValidationError{Field: "tool_use_id", Reason: "control bytes not allowed"}
+	}
+
+	if !messageIDRE.MatchString(v) {
+		return &ValidationError{Field: "tool_use_id", Reason: "must match [A-Za-z0-9_.-]{1,128}"}
 	}
 
 	return nil
@@ -437,7 +461,11 @@ func validateMessage(p *MessagePayload) error {
 		return err
 	}
 
-	return validateMessageID(p.MessageID)
+	if err := validateMessageID(p.MessageID); err != nil {
+		return err
+	}
+
+	return validateToolUseID(p.ToolUseID)
 }
 
 func validatePromote(p *PromotePayload) error {

@@ -26,12 +26,20 @@ type StopAllPayload struct {
 
 // MessagePayload is the body for POST /message. Exactly one of (card_id +
 // project) for card-bound HITL or session_id for chat must be set.
+//
+// ToolUseID is set when the message is a reply to a prior AskUserQuestion
+// tool_use emitted by Claude inside the container. When non-empty, the
+// handler writes a stream-json tool_result frame to stdin (referencing this
+// id) instead of the default user-text frame, so Claude sees the tool call
+// loop close cleanly. Empty (or absent) preserves today's plain-user-text
+// behavior for follow-up chat messages.
 type MessagePayload struct {
 	CardID    string `json:"card_id,omitempty"`
 	Project   string `json:"project,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
 	Content   string `json:"content"`
 	MessageID string `json:"message_id,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
 }
 
 // IsChat reports whether the payload targets a chat session.

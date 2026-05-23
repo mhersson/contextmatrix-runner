@@ -562,6 +562,32 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// buildStdinFrame selects the stream-json frame to write to the container's
+// stdin for a /message payload. A non-empty ToolUseID produces a tool_result
+// frame (closing an open AskUserQuestion tool_use loop); otherwise the
+// default plain user-text frame is produced. Centralising the branch keeps
+// the chat and card paths of handleMessage in sync — adding the toggle in
+// only one place would silently let one mode drift.
+func buildStdinFrame(payload MessagePayload) ([]byte, error) {
+	if payload.ToolUseID != "" {
+		return streammsg.BuildToolResultMessage(payload.ToolUseID, payload.Content)
+	}
+
+	return streammsg.BuildUserMessage(payload.Content)
+}
+
+// messagePath returns the structured-log label identifying which builder
+// buildStdinFrame chose for the given payload. Used in the /message success
+// log lines so operators can confirm tool_result injection from production
+// logs.
+func messagePath(payload MessagePayload) string {
+	if payload.ToolUseID != "" {
+		return "tool_result"
+	}
+
+	return "user_text"
+}
+
 // handleMessage accepts a user chat message and writes it to the target
 // container's stdin as a Claude Code stream-json user turn.
 func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
@@ -619,9 +645,10 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		b, err := streammsg.BuildUserMessage(payload.Content)
+		b, err := buildStdinFrame(payload)
 		if err != nil {
-			h.logWarn("message: BuildUserMessage failed", "error", err.Error(),
+			h.logWarn("message: build stdin frame failed", "error", err.Error(),
+				"path", messagePath(payload),
 				"correlation_id", correlationIDFromContext(r.Context()))
 			writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 
@@ -656,6 +683,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 		h.logInfo("message: chat stdin written",
 			"session_id", payload.SessionID, "message_id", payload.MessageID, "content_len", len(payload.Content),
+			"path", messagePath(payload), "tool_use_id", payload.ToolUseID,
 			"correlation_id", correlationIDFromContext(r.Context()))
 
 		// Marshal the success ack once so retries see byte-identical bytes
@@ -701,10 +729,13 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build the Claude Code stream-json user message.
-	b, err := streammsg.BuildUserMessage(payload.Content)
+	// Build the Claude Code stream-json frame: tool_result when a
+	// tool_use_id is set (closing an open AskUserQuestion loop) or a
+	// plain user-text turn otherwise.
+	b, err := buildStdinFrame(payload)
 	if err != nil {
-		h.logWarn("message: BuildUserMessage failed", "error", err.Error(),
+		h.logWarn("message: build stdin frame failed", "error", err.Error(),
+			"path", messagePath(payload),
 			"correlation_id", correlationIDFromContext(r.Context()))
 		writeError(w, http.StatusInternalServerError, CodeInternal, "internal error")
 
@@ -756,6 +787,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 	h.logInfo("message: card stdin written",
 		"card_id", payload.CardID, "project", payload.Project,
 		"message_id", payload.MessageID, "content_len", len(payload.Content),
+		"path", messagePath(payload), "tool_use_id", payload.ToolUseID,
 		"correlation_id", correlationIDFromContext(r.Context()))
 
 	// Marshal the success ack once so we can cache it byte-identically
