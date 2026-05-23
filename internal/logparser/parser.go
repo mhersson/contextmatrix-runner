@@ -221,6 +221,7 @@ type usageBlock struct {
 // contentBlock represents a single block within a message.
 type contentBlock struct {
 	Type     string          `json:"type"`
+	ID       string          `json:"id"`
 	Text     string          `json:"text"`
 	Thinking string          `json:"thinking"`
 	Name     string          `json:"name"`
@@ -537,7 +538,7 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 						logger.Info("claude", "claude_user_question", content)
 
 						if emit != nil {
-							emit(logbroadcast.LogEntry{Type: "user_question", Content: content})
+							emit(logbroadcast.LogEntry{Type: "user_question", Content: content, ToolUseID: block.ID})
 						}
 
 						continue

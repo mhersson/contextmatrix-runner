@@ -1090,6 +1090,32 @@ func TestProcessStream_AskUserQuestion_MultiQuestion(t *testing.T) {
 	assert.Len(t, got.Questions[1].Options, 3)
 }
 
+// TestProcessStream_AskUserQuestion_PropagatesToolUseID verifies that the
+// stream-json tool_use `id` is captured and surfaced on the emitted LogEntry's
+// ToolUseID, so the chat layer can later send a `tool_result` frame back to
+// Claude that closes the tool call loop. Without this, the answer would
+// arrive as plain user text against an open tool_use and Claude would
+// rationalise the situation as "the tool isn't available".
+func TestProcessStream_AskUserQuestion_PropagatesToolUseID(t *testing.T) {
+	const toolUseID = "toolu_01ABCDEFGHIJKLMNOPQRSTUV"
+
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"` + toolUseID + `","name":"AskUserQuestion","input":{` +
+		`"questions":[{"question":"Pick one","options":[{"label":"a"},{"label":"b"}]}]}}]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "user_question", emitted[0].Type)
+	assert.Equal(t, toolUseID, emitted[0].ToolUseID,
+		"AskUserQuestion tool_use id must propagate to the LogEntry's ToolUseID")
+}
+
 // TestProcessStream_AskUserQuestion_MalformedFallsBackToToolCall verifies
 // that an AskUserQuestion payload that fails to parse still surfaces — via
 // the generic tool_call path — rather than being silently dropped.
