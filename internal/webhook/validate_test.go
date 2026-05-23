@@ -255,6 +255,68 @@ func TestValidateMessageID(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// tool_use_id
+// -----------------------------------------------------------------------------
+
+func TestValidateToolUseID(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		wantErr bool
+	}{
+		{"empty allowed", "", false},
+		{"anthropic tool_use id", "toolu_01ABCDEFGHIJKLMNOPQRSTUV", false},
+		{"underscore + dot + hyphen", "toolu_abc.123-XYZ", false},
+		{"max length 128", strings.Repeat("a", 128), false},
+
+		{"length 129", strings.Repeat("a", 129), true},
+		{"newline", "toolu\nfoo", true},
+		{"carriage return", "toolu\rfoo", true},
+		{"NUL byte", "toolu\x00foo", true},
+		{"space", "toolu foo", true},
+		{"slash", "toolu/foo", true},
+		{"double quote", "toolu\"foo", true},
+		{"backslash", "toolu\\foo", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateToolUseID(tc.val)
+			if tc.wantErr {
+				require.Error(t, err)
+
+				var ve *ValidationError
+
+				require.ErrorAs(t, err, &ve)
+				assert.Equal(t, "tool_use_id", ve.Field)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestValidateMessage_RejectsBadToolUseID pins that validateMessage now runs
+// the tool_use_id field through validateToolUseID — empty is accepted (the
+// field is optional) but a control byte or oversize blob is rejected with
+// the field-name diagnostic so writeValidationError can surface
+// "invalid tool_use_id" rather than degrading to "invalid payload".
+func TestValidateMessage_RejectsBadToolUseID(t *testing.T) {
+	p := &MessagePayload{
+		SessionID: "sess-abc",
+		Content:   "hi",
+		ToolUseID: "toolu\nbad",
+	}
+
+	err := ValidatePayload(p)
+	require.Error(t, err)
+
+	var ve *ValidationError
+
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "tool_use_id", ve.Field)
+}
+
+// -----------------------------------------------------------------------------
 // ValidatePayload dispatch table
 // -----------------------------------------------------------------------------
 

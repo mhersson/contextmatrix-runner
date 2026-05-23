@@ -2913,6 +2913,43 @@ func TestMessage_ChatPath_ToolUseID_BuildsToolResultFrame(t *testing.T) {
 		"tool_result path must NOT emit a text content block")
 }
 
+// TestMessage_CardPath_ToolUseID_BuildsToolResultFrame mirrors the chat-path
+// test against the card-mode fixture. Both modes funnel through the shared
+// buildStdinFrame helper; this guards against a future change that branches
+// before that helper in only one of the two paths and silently breaks the
+// HITL AskUserQuestion loop in card-mode autonomous workflows.
+func TestMessage_CardPath_ToolUseID_BuildsToolResultFrame(t *testing.T) {
+	h, _, fw := setupMessageHandler(t, true)
+
+	const toolUseID = "toolu_card_xyz789"
+
+	payload := MessagePayload{
+		CardID:    "PROJ-001",
+		Project:   "my-project",
+		Content:   "the user's answer",
+		MessageID: "msg-card-tool-001",
+		ToolUseID: toolUseID,
+	}
+	w := httptest.NewRecorder()
+	req := signedRequest(t, "/message", payload)
+	h.hmacAuth(h.handleMessage)(w, req)
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	require.NotNil(t, fw)
+	require.NotEmpty(t, fw.buf)
+
+	got := string(fw.buf)
+	assert.Contains(t, got, `"type":"tool_result"`,
+		"card-mode stdin frame must contain a tool_result content block")
+	assert.Contains(t, got, `"tool_use_id":"`+toolUseID+`"`,
+		"card-mode stdin frame must reference the original tool_use_id")
+	assert.Contains(t, got, `"content":"the user's answer"`,
+		"card-mode stdin frame must carry the user-supplied content")
+	assert.NotContains(t, got, `"type":"text"`,
+		"tool_result path must NOT emit a text content block")
+}
+
 // TestMessage_ChatPath_EmptyToolUseID_BuildsUserTextFrame verifies that an
 // explicit empty-string tool_use_id in the JSON payload falls back to today's
 // plain user text frame. The omitempty contract on the field means an empty

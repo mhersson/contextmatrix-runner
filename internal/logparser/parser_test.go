@@ -1026,7 +1026,7 @@ func TestProcessStream_EmptyThinkingWithSiblingText(t *testing.T) {
 // the structured payload preserved as compact JSON — not routed through
 // formatToolCall's 200-rune-truncated path.
 func TestProcessStream_AskUserQuestion_SingleQuestion(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_single01","name":"AskUserQuestion","input":{` +
 		`"questions":[{"question":"Which library should we use?","header":"Library","multiSelect":false,` +
 		`"options":[{"label":"date-fns","description":"Functional, tree-shakeable"},` +
 		`{"label":"luxon","description":"Object-oriented with timezone support"}]}]}}]}}`
@@ -1062,7 +1062,7 @@ func TestProcessStream_AskUserQuestion_SingleQuestion(t *testing.T) {
 // questions in one AskUserQuestion call are preserved in order, and that
 // multiSelect=true round-trips.
 func TestProcessStream_AskUserQuestion_MultiQuestion(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_multi01","name":"AskUserQuestion","input":{` +
 		`"questions":[` +
 		`{"question":"Q1?","header":"H1","multiSelect":false,"options":[{"label":"a"},{"label":"b"}]},` +
 		`{"question":"Q2?","header":"H2","multiSelect":true,"options":[{"label":"x"},{"label":"y"},{"label":"z"}]}` +
@@ -1114,6 +1114,35 @@ func TestProcessStream_AskUserQuestion_PropagatesToolUseID(t *testing.T) {
 	assert.Equal(t, "user_question", emitted[0].Type)
 	assert.Equal(t, toolUseID, emitted[0].ToolUseID,
 		"AskUserQuestion tool_use id must propagate to the LogEntry's ToolUseID")
+}
+
+// TestProcessStream_AskUserQuestion_MissingToolUseIDFallsBack verifies that
+// a structurally valid AskUserQuestion tool_use without an "id" field falls
+// through to the generic tool_call path rather than being emitted as a
+// user_question. Emitting a user_question without an id would surface a
+// question card in the chat UI that the runner cannot answer (no tool_use_id
+// to reference in a tool_result frame), and the operator's eventual reply
+// would arrive as plain user text against an open tool_use — the exact
+// failure mode this feature was added to prevent.
+func TestProcessStream_AskUserQuestion_MissingToolUseIDFallsBack(t *testing.T) {
+	// Structurally valid input, but no "id" on the tool_use block.
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+		`"questions":[{"question":"Pick one","options":[{"label":"a"},{"label":"b"}]}]}}]}}`
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "tool_call", emitted[0].Type,
+		"AskUserQuestion without a tool_use id must fall back to the generic tool_call path")
+	assert.Empty(t, emitted[0].ToolUseID,
+		"fallback tool_call must not carry an empty-string ToolUseID either")
+	assert.Contains(t, emitted[0].Content, "AskUserQuestion")
 }
 
 // TestProcessStream_AskUserQuestion_MalformedFallsBackToToolCall verifies
@@ -1176,7 +1205,7 @@ func TestProcessStream_AskUserQuestion_RedactsSecrets(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+			input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_secret01","name":"AskUserQuestion","input":{` +
 				`"questions":[{"question":"Use this token: ` + tc.secret + `?","options":[{"label":"yes"},{"label":"no"}]}]}}]}}`
 
 			logger, _ := newTestLogger()
@@ -1272,7 +1301,7 @@ func TestProcessStream_AskUserQuestion_MissingOptionsFallsBack(t *testing.T) {
 // struct but emit the original input bytes, so a future Claude Code field
 // like `priority` does not get silently dropped.
 func TestProcessStream_AskUserQuestion_PreservesUnknownFields(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_unknown01","name":"AskUserQuestion","input":{` +
 		`"questions":[{"question":"Q?","priority":"high","options":[{"label":"a","style":"primary"}]}],` +
 		`"meta":"experimental"}}]}}`
 
