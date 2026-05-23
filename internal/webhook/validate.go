@@ -28,12 +28,10 @@ var (
 	branchRE = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,200}$`)
 	// host component: ASCII alphanumerics, dot, hyphen.
 	hostRE = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
-	// message_id: UUIDs, prefixed ids, etc. 1..128 runes.
+	// message_id: UUIDs, prefixed ids, etc. 1..128 runes. Also used for
+	// tool_use_id — Anthropic's `toolu_…` token shape fits comfortably and
+	// sharing the regex keeps the two id surfaces aligned.
 	messageIDRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
-	// tool_use_id: Anthropic's stream-json `toolu_…` token shape is
-	// alphanumeric after the prefix. Same charset / cap as message_id keeps
-	// the validator surface uniform — Claude's real ids comfortably fit.
-	toolUseIDRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 	// task_skill_name: restricts skill names to a safe charset that cannot
 	// reach outside the /host-skills mount via path traversal. Must start with
 	// alphanumeric (no leading dash to avoid argv injection, no leading dot to
@@ -236,7 +234,7 @@ func validateToolUseID(v string) error {
 		return &ValidationError{Field: "tool_use_id", Reason: "control bytes not allowed"}
 	}
 
-	if !toolUseIDRE.MatchString(v) {
+	if !messageIDRE.MatchString(v) {
 		return &ValidationError{Field: "tool_use_id", Reason: "must match [A-Za-z0-9_.-]{1,128}"}
 	}
 

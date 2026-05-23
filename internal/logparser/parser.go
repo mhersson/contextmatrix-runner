@@ -552,8 +552,7 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 					}
 
 					if block.ID == "" {
-						logger.Warn("claude", "claude_user_question_missing_id",
-							"AskUserQuestion tool_use missing id; reply path would be lossy, falling back to tool_call")
+						logger.Warn("logparser: AskUserQuestion missing tool_use id, falling back to tool_call")
 					}
 
 					// Malformed (or id-less) AskUserQuestion input falls
