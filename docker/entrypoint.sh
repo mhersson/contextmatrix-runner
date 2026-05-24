@@ -146,6 +146,11 @@ ALLOWED_TOOLS_COMMON=(
     "mcp__contextmatrix__transition_card"
     "mcp__contextmatrix__update_card"
     "mcp__contextmatrix__chat_rehydration_complete"
+    # Permission gate for tool calls whose checkPermissions returns
+    # behavior:"ask" (currently AskUserQuestion). Wired via
+    # --permission-prompt-tool below; without it Claude Code auto-denies
+    # AskUserQuestion in headless mode and the model improvises.
+    "mcp__contextmatrix__permission_prompt"
 )
 
 # Autonomous-mode-only additions. Task (sub-agent spawning) is allowed here
@@ -492,6 +497,7 @@ if [ -n "${CM_CHAT_SESSION:-}" ]; then
         --input-format stream-json \
         --output-format stream-json \
         --verbose --allowed-tools "${ALLOWED_TOOLS_CHAT[*]}" \
+        --permission-prompt-tool mcp__contextmatrix__permission_prompt \
         -- \
         "Chat session ${CM_CHAT_SESSION}. Wait for the operator's first message."
 elif [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
@@ -507,6 +513,7 @@ elif [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
         --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
         --output-format stream-json --verbose \
         --allowed-tools "${ALLOWED_TOOLS_KB[*]}" \
+        --permission-prompt-tool mcp__contextmatrix__permission_prompt \
         -- \
         "You are running inside a contextmatrix-runner container in knowledge-refresh mode.
 
@@ -535,6 +542,7 @@ elif [ "${CM_INTERACTIVE:-}" = "1" ]; then
         --input-format stream-json \
         --output-format stream-json \
         --verbose --allowed-tools "${ALLOWED_TOOLS_HITL[*]}" \
+        --permission-prompt-tool mcp__contextmatrix__permission_prompt \
         -- \
         "You are running inside a disposable container spawned by contextmatrix-runner for card ${CM_CARD_ID}.
 A human user may send you approval messages at interactive gates.
@@ -553,6 +561,7 @@ else
     exec claude -p \
         --thinking adaptive --thinking-display summarized \
         --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" --output-format stream-json --verbose --allowed-tools "${ALLOWED_TOOLS_AUTO[*]}" \
+        --permission-prompt-tool mcp__contextmatrix__permission_prompt \
         -- \
         "You are running inside a disposable container spawned by contextmatrix-runner.
 Use the contextmatrix MCP server to execute the run-autonomous workflow for card ${CM_CARD_ID}.

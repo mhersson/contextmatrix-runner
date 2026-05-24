@@ -52,9 +52,11 @@ type LogEntry struct {
 	// "user_question" carries the structured payload of an AskUserQuestion
 	// tool_use; Content is compact JSON matching CM's UserQuestionCard.
 	// ToolUseID is set only on "user_question" entries and carries the
-	// stream-json tool_use id (e.g. "toolu_01ABC..."). The chat layer
-	// stores it per-session and forwards it on the next /message POST so
-	// the runner can emit a tool_result frame back to Claude.
+	// stream-json tool_use id (e.g. "toolu_01ABC..."). CM stores it on
+	// pendingToolUseID for the session; Phase 1 of the permission_prompt
+	// MCP gate consumes-and-discards it (AskUserQuestion is denied
+	// before the model waits for an answer), Phase 2 will use it to
+	// key a blocked permission_prompt waiter on (sessionID, tool_use_id).
 	Type      string      `json:"type"`
 	Content   string      `json:"content,omitempty"`
 	ToolUseID string      `json:"tool_use_id,omitempty"`
