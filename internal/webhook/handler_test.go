@@ -2875,92 +2875,18 @@ func TestMessage_ChatPath_NoStdin(t *testing.T) {
 	}
 }
 
-// TestMessage_ChatPath_ToolUseID_BuildsToolResultFrame verifies that a
-// /message POST with a non-empty tool_use_id causes the runner to write a
-// stream-json `tool_result` frame to the chat container's stdin instead of
-// a plain user text frame. This is the runner side of the AskUserQuestion
-// reply path: without it, Claude sees the user's answer as an unrelated
-// text turn against an open tool_use and rationalises "the tool isn't
-// available".
-func TestMessage_ChatPath_ToolUseID_BuildsToolResultFrame(t *testing.T) {
+// TestMessage_ChatPath_UnknownToolUseIDFieldIgnored verifies that a /message
+// POST carrying a `tool_use_id` field (left over from older CM deployments)
+// is silently dropped — the field was removed when AskUserQuestion routing
+// moved to the MCP permission_prompt gate; payloads with it must still
+// produce a plain user-text stdin frame so a rolling upgrade does not break
+// chat. encoding/json ignores unknown object keys by default, so the
+// regression we guard against here is a future contributor re-adding the
+// field to MessagePayload without thinking through Phase 2.
+func TestMessage_ChatPath_UnknownToolUseIDFieldIgnored(t *testing.T) {
 	h, _, fw := setupChatMessageHandler(t, true)
 
-	const toolUseID = "toolu_abc123XYZ"
-
-	payload := MessagePayload{
-		SessionID: "sess-chat-001",
-		Content:   "the user's answer",
-		MessageID: "msg-tool-001",
-		ToolUseID: toolUseID,
-	}
-	w := httptest.NewRecorder()
-	req := signedRequest(t, "/message", payload)
-	h.hmacAuth(h.handleMessage)(w, req)
-
-	require.Equal(t, http.StatusAccepted, w.Code)
-
-	require.NotNil(t, fw)
-	require.NotEmpty(t, fw.buf)
-
-	got := string(fw.buf)
-	assert.Contains(t, got, `"type":"tool_result"`,
-		"stdin frame must contain a tool_result content block")
-	assert.Contains(t, got, `"tool_use_id":"`+toolUseID+`"`,
-		"stdin frame must reference the original tool_use_id")
-	assert.Contains(t, got, `"content":"the user's answer"`,
-		"stdin frame must carry the user-supplied content")
-	assert.NotContains(t, got, `"type":"text"`,
-		"tool_result path must NOT emit a text content block")
-}
-
-// TestMessage_CardPath_ToolUseID_BuildsToolResultFrame mirrors the chat-path
-// test against the card-mode fixture. Both modes funnel through the shared
-// buildStdinFrame helper; this guards against a future change that branches
-// before that helper in only one of the two paths and silently breaks the
-// HITL AskUserQuestion loop in card-mode autonomous workflows.
-func TestMessage_CardPath_ToolUseID_BuildsToolResultFrame(t *testing.T) {
-	h, _, fw := setupMessageHandler(t, true)
-
-	const toolUseID = "toolu_card_xyz789"
-
-	payload := MessagePayload{
-		CardID:    "PROJ-001",
-		Project:   "my-project",
-		Content:   "the user's answer",
-		MessageID: "msg-card-tool-001",
-		ToolUseID: toolUseID,
-	}
-	w := httptest.NewRecorder()
-	req := signedRequest(t, "/message", payload)
-	h.hmacAuth(h.handleMessage)(w, req)
-
-	require.Equal(t, http.StatusAccepted, w.Code)
-
-	require.NotNil(t, fw)
-	require.NotEmpty(t, fw.buf)
-
-	got := string(fw.buf)
-	assert.Contains(t, got, `"type":"tool_result"`,
-		"card-mode stdin frame must contain a tool_result content block")
-	assert.Contains(t, got, `"tool_use_id":"`+toolUseID+`"`,
-		"card-mode stdin frame must reference the original tool_use_id")
-	assert.Contains(t, got, `"content":"the user's answer"`,
-		"card-mode stdin frame must carry the user-supplied content")
-	assert.NotContains(t, got, `"type":"text"`,
-		"tool_result path must NOT emit a text content block")
-}
-
-// TestMessage_ChatPath_EmptyToolUseID_BuildsUserTextFrame verifies that an
-// explicit empty-string tool_use_id in the JSON payload falls back to today's
-// plain user text frame. The omitempty contract on the field means an empty
-// value is semantically equivalent to absence — only a non-empty tool_use_id
-// should trigger the tool_result branch.
-func TestMessage_ChatPath_EmptyToolUseID_BuildsUserTextFrame(t *testing.T) {
-	h, _, fw := setupChatMessageHandler(t, true)
-
-	// Hand-build the JSON body so tool_use_id appears as an explicit empty
-	// string, bypassing the Go-side omitempty that would otherwise drop it.
-	rawBody := []byte(`{"session_id":"sess-chat-001","content":"plain follow-up","message_id":"msg-empty-001","tool_use_id":""}`)
+	rawBody := []byte(`{"session_id":"sess-chat-001","content":"plain message","message_id":"msg-unknown-001","tool_use_id":"toolu_legacy"}`)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/message", rawBody, ts)
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/message", bytes.NewReader(rawBody))
@@ -2977,9 +2903,11 @@ func TestMessage_ChatPath_EmptyToolUseID_BuildsUserTextFrame(t *testing.T) {
 
 	got := string(fw.buf)
 	assert.Contains(t, got, `"type":"text"`,
-		"empty tool_use_id must fall back to a plain text content block")
+		"stale tool_use_id field must be ignored; stdin frame must be plain user text")
 	assert.NotContains(t, got, `"tool_result"`,
-		"empty tool_use_id must NOT trigger the tool_result path")
+		"stale tool_use_id field must NOT resurrect the deleted tool_result injection path")
+	assert.NotContains(t, got, `"tool_use_id"`,
+		"stdin frame must not echo any tool_use_id back to claude")
 }
 
 // TestLogs_SessionIDFilter verifies that a ?session_id= subscription only
