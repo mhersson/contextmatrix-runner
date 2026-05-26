@@ -1463,6 +1463,18 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 		stdoutPr, stdoutPw := io.Pipe()
 		stderrPr, stderrPw := io.Pipe()
 
+		// Wrap both pipe readers so the idle watchdog gets a tick on every
+		// raw byte arrival, not just on completed-line emission. With the
+		// 16 MiB soft cap a single long line could still take longer than
+		// IdleOutputTimeout to terminate; without this wrapper, the
+		// watchdog would Kill a healthy container mid-stream.
+		bumpProgress := func() {
+			nowT := time.Now()
+			lastOutputAt.Store(&nowT)
+		}
+		stdoutFeed := &progressReader{r: stdoutPr, onProgress: bumpProgress}
+		stderrFeed := &progressReader{r: stderrPr, onProgress: bumpProgress}
+
 		// stdcopy and the stderr scanner are intentionally NOT tracked by
 		// m.wg — see the runIdleWatchdog comment above. A wedged Docker
 		// reader can block stdcopy forever, and waitAndCleanup's log-drain
@@ -1518,20 +1530,27 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 				}
 			}()
 
-			// bufio.Reader has no per-line cap, so a stack trace or other
-			// long stderr line no longer aborts the goroutine with
-			// bufio.ErrTooLong. The 64 KiB initial buffer matches the old
-			// scanner sizing; bufio.Reader grows as needed.
-			br := bufio.NewReaderSize(stderrPr, 64*1024)
+			// bufio.Reader avoids the old bufio.Scanner 1 MiB cap;
+			// logparser.ReadBoundedLine adds a soft per-line cap so a
+			// runaway stderr stream can't pin the runner heap. Read
+			// from the progressReader wrapper so the idle watchdog
+			// gets fed on raw byte arrival.
+			br := bufio.NewReaderSize(stderrFeed, 64*1024)
 
 			var readErr error
 
 			for {
-				var line string
+				var (
+					raw       []byte
+					truncated bool
+				)
 
-				line, readErr = br.ReadString('\n')
-				if line != "" {
-					line = strings.TrimRight(line, "\r\n")
+				raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
+				if len(raw) > 0 || truncated {
+					line := strings.TrimRight(string(raw), "\r\n")
+					if truncated {
+						line += " [...truncated; line exceeded 16 MiB cap]"
+					}
 					// Redact before slog too: a rogue child process echoing the
 					// container env through /proc can easily end up on stderr.
 					redacted := redactor.Redact(line)
@@ -1632,7 +1651,7 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 			}()
 		}
 
-		logparser.ProcessStreamWithRedactor(stdoutPr, log, redactor, emit, onSkillEngaged)
+		logparser.ProcessStreamWithRedactor(stdoutFeed, log, redactor, emit, onSkillEngaged)
 	}()
 
 	return done
@@ -3013,19 +3032,25 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 				}
 			}()
 
-			// bufio.Reader has no per-line cap; mirrors the card-mode swap
-			// above so an oversized stderr line cannot wedge the goroutine
-			// with bufio.ErrTooLong.
+			// bufio.Reader avoids the old bufio.Scanner 1 MiB cap;
+			// logparser.ReadBoundedLine adds a soft per-line cap so a
+			// runaway stderr stream can't pin the runner heap.
 			br := bufio.NewReaderSize(stderrPr, 64*1024)
 
 			var readErr error
 
 			for {
-				var line string
+				var (
+					raw       []byte
+					truncated bool
+				)
 
-				line, readErr = br.ReadString('\n')
-				if line != "" {
-					line = strings.TrimRight(line, "\r\n")
+				raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
+				if len(raw) > 0 || truncated {
+					line := strings.TrimRight(string(raw), "\r\n")
+					if truncated {
+						line += " [...truncated; line exceeded 16 MiB cap]"
+					}
 					// Redact before slog too: a rogue child process echoing the
 					// container env through /proc can easily end up on stderr.
 					redacted := redactor.Redact(line)

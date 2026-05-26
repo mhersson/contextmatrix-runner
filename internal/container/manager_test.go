@@ -5846,26 +5846,28 @@ func TestStartTokenRefresherWritesSecretsFile(t *testing.T) {
 	assert.Contains(t, string(b), "ghs_init")
 }
 
-// TestStreamLogs_OversizedStderrLine_DoesNotWedge exercises Fix M2: when a
-// stderr line exceeds bufio.Scanner's 1 MiB cap, the scanner aborts with
-// bufio.ErrTooLong. The pipe writer (stdcopy) would otherwise block forever
-// on its next Write into the now-undrained pipe — wedging the outer
-// streamLogs goroutine and blocking tracker.Remove + removeContainer.
+// TestStreamLogs_OversizedStderrLine_DoesNotWedge feeds a multi-MiB stderr
+// line through the streamLogs pipeline and verifies the cleanup sequence
+// completes within a bounded deadline.
 //
-// The fix closes stderrPr on scanner exit AND drains any in-flight bytes, so
-// stdcopy completes and the outer goroutine sees EOF on the docker reader.
-//
-// We verify the cleanup sequence runs within a bounded deadline rather than
-// hanging until the test timeout, which is what the pre-fix behaviour would
-// look like.
+// History: this test originally guarded a wedge bug where bufio.Scanner's
+// 1 MiB cap caused ErrTooLong, leaving stdcopy's Write into an undrained
+// io.Pipe blocked forever. The current pipeline uses bufio.Reader plus
+// logparser.ReadBoundedLine (16 MiB soft cap) — a 1.5 MiB line is now an
+// ordinary long line that streams through cleanly. The test still exercises
+// the real production code path for an oversized-but-under-cap stderr line
+// and is the only end-to-end coverage we have for the io.Pipe + stdcopy +
+// scanner shutdown sequence, so it earns its keep as a regression guard.
 func TestStreamLogs_OversizedStderrLine_DoesNotWedge(t *testing.T) {
-	// Build a Docker multiplexed stream with a single stderr "line" larger
-	// than the 1 MiB scanner cap, followed by EOF on the underlying reader.
+	// Build a Docker multiplexed stream with a 1.5 MiB stderr "line"
+	// followed by EOF on the underlying reader. 1.5 MiB sits comfortably
+	// above the legacy 1 MiB scanner cap (proving the regression has
+	// not returned) but below the new 16 MiB ReadBoundedLine cap, so the
+	// line streams to the broadcaster as a normal stderr entry.
 	var buf bytes.Buffer
 
 	stderrW := stdcopy.NewStdWriter(&buf, stdcopy.Stderr)
-	// 1.5 MiB of 'a' followed by a single newline — well above the 1 MiB cap
-	// so scanner.Scan returns false with bufio.ErrTooLong.
+
 	huge := make([]byte, (3*1024*1024)/2)
 	for i := range huge {
 		huge[i] = 'a'
@@ -5877,9 +5879,7 @@ func TestStreamLogs_OversizedStderrLine_DoesNotWedge(t *testing.T) {
 	mock := successfulMock()
 	mock.ContainerLogsFn = func(_ context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
 		// io.NopCloser around the buffer EOFs at end-of-bytes, so stdcopy
-		// returns and the outer goroutine closes `done`. Without the fix
-		// the stdcopy Write into the stderr pipe would block forever
-		// because no one is reading after scanner aborts.
+		// returns and the outer goroutine closes `done`.
 		return io.NopCloser(&buf), nil
 	}
 
