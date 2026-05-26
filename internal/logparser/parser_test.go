@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -923,39 +924,73 @@ func TestProcessStream_UsageEntryWireJSONShape(t *testing.T) {
 	assert.NotContains(t, got, `"content":`)
 }
 
-// TestProcessStream_ScannerError_EmitsSystemEntry verifies that a
-// stream-json line exceeding maxScannerBuf surfaces as a system LogEntry
-// instead of being silently swallowed. Previously bufio.ErrTooLong
-// terminated the for-loop as if EOF; operators had no signal explaining
-// why the rest of Claude's output went missing.
-func TestProcessStream_ScannerError_EmitsSystemEntry(t *testing.T) {
-	// Build a line larger than maxScannerBuf (1 MiB) so bufio.Scanner
-	// returns ErrTooLong. The line need not be valid JSON — the
-	// oversized read fails before json.Unmarshal sees anything.
-	oversized := strings.Repeat("x", (1<<20)+1024)
+// TestProcessStream_OversizedLine_ParsesSuccessfully verifies that a single
+// stream-json line larger than the legacy bufio.Scanner cap (1 MiB) is
+// processed normally instead of terminating the parser. The previous
+// behaviour silently dropped the rest of Claude's output and emitted a
+// "scan terminated" system LogEntry; with the bufio.Reader swap a long
+// thinking block parses through.
+func TestProcessStream_OversizedLine_ParsesSuccessfully(t *testing.T) {
+	// 2 MiB > the old 1 MiB scanner cap; with bufio.Scanner this would
+	// have surfaced as bufio.ErrTooLong instead of the parsed thinking
+	// block we expect.
+	longThinking := strings.Repeat("x", 2*1024*1024)
+	payload, err := json.Marshal(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"content": []map[string]any{
+				{"type": "thinking", "thinking": longThinking},
+			},
+		},
+	})
+	require.NoError(t, err)
 
 	logger, records := newTestLogger()
 
 	var emitted []logbroadcast.LogEntry
 
-	ProcessStream(strings.NewReader(oversized+"\n"), logger, func(e logbroadcast.LogEntry) {
+	ProcessStream(bytes.NewReader(append(payload, '\n')), logger, func(e logbroadcast.LogEntry) {
 		emitted = append(emitted, e)
 	})
 
-	// Expect at least one Error record describing the scanner failure.
+	for _, r := range *records {
+		assert.Less(t, int(r.Level), int(slog.LevelError),
+			"no error-level records expected; got level=%v message=%q", r.Level, r.Message)
+	}
+
+	require.Len(t, emitted, 1, "the oversized thinking block should emit exactly one entry")
+	assert.Equal(t, "thinking", emitted[0].Type)
+	assert.Equal(t, longThinking, emitted[0].Content)
+}
+
+// TestProcessStream_ReadError_EmitsSystemEntry verifies that a non-EOF read
+// error from the underlying reader still surfaces as a system LogEntry.
+// Removing the bufio.Scanner cap eliminated the ErrTooLong diagnostic, but
+// the channel for genuine I/O failures must remain.
+func TestProcessStream_ReadError_EmitsSystemEntry(t *testing.T) {
+	sentinel := errors.New("synthetic stream failure")
+	r := &errAfterReader{data: []byte("\n"), err: sentinel}
+
+	logger, records := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(r, logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
 	var sawError bool
 
-	for _, r := range *records {
-		if r.Level >= slog.LevelError {
+	for _, rec := range *records {
+		if rec.Level >= slog.LevelError {
 			sawError = true
 
 			break
 		}
 	}
 
-	assert.True(t, sawError, "scanner failure must surface as an Error log record")
+	assert.True(t, sawError, "non-EOF read error must surface as Error log record")
 
-	// Expect at least one emitted system entry naming the failure.
 	var sysEntry *logbroadcast.LogEntry
 
 	for i := range emitted {
@@ -966,31 +1001,51 @@ func TestProcessStream_ScannerError_EmitsSystemEntry(t *testing.T) {
 		}
 	}
 
-	require.NotNil(t, sysEntry, "scanner failure must emit a system LogEntry")
+	require.NotNil(t, sysEntry, "non-EOF read error must emit a system LogEntry")
 	assert.Contains(t, sysEntry.Content, "logparser")
-	assert.Contains(t, sysEntry.Content, "scan terminated")
+	assert.Contains(t, sysEntry.Content, "stream read terminated")
+	assert.Contains(t, sysEntry.Content, "synthetic stream failure")
 }
 
-// TestProcessStream_ScannerError_NilEmit verifies that a scanner failure
-// with a nil emit callback still logs the error and does not nil-panic on
-// the broadcast path.
-func TestProcessStream_ScannerError_NilEmit(t *testing.T) {
-	oversized := strings.Repeat("x", (1<<20)+1024)
+// TestProcessStream_ReadError_NilEmit verifies a non-EOF read error logs at
+// Error level even when the emit callback is nil — the broadcast path
+// must not nil-panic.
+func TestProcessStream_ReadError_NilEmit(t *testing.T) {
+	sentinel := errors.New("synthetic stream failure")
+	r := &errAfterReader{data: []byte("\n"), err: sentinel}
 
 	logger, records := newTestLogger()
-	ProcessStream(strings.NewReader(oversized+"\n"), logger, nil)
+	ProcessStream(r, logger, nil)
 
 	var sawError bool
 
-	for _, r := range *records {
-		if r.Level >= slog.LevelError {
+	for _, rec := range *records {
+		if rec.Level >= slog.LevelError {
 			sawError = true
 
 			break
 		}
 	}
 
-	assert.True(t, sawError, "scanner failure must surface even when emit is nil")
+	assert.True(t, sawError, "non-EOF read error must surface even when emit is nil")
+}
+
+// errAfterReader yields data once, then returns err on subsequent reads.
+// Used to simulate a non-EOF read failure mid-stream.
+type errAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+
+		return n, nil
+	}
+
+	return 0, r.err
 }
 
 // TestProcessStream_EmptyThinkingWithSiblingText verifies that an empty

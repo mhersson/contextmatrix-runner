@@ -1518,50 +1518,58 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 				}
 			}()
 
-			// Start small, grow only when a long line demands it.
-			// bufio.Scanner grows geometrically up to max, so a 64KiB
-			// initial buffer covers the common case (most stderr lines are
-			// a few hundred bytes) while still tolerating up to 1MiB
-			// per-line for stack traces. Resident memory per running
-			// container drops from ~2MiB of scanner buffers to ~128KiB.
-			scanner := bufio.NewScanner(stderrPr)
-			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			// bufio.Reader has no per-line cap, so a stack trace or other
+			// long stderr line no longer aborts the goroutine with
+			// bufio.ErrTooLong. The 64 KiB initial buffer matches the old
+			// scanner sizing; bufio.Reader grows as needed.
+			br := bufio.NewReaderSize(stderrPr, 64*1024)
 
-			for scanner.Scan() {
-				line := scanner.Text()
-				// Redact before slog too: a rogue child process echoing the
-				// container env through /proc can easily end up on stderr.
-				redacted := redactor.Redact(line)
-				log.Warn("container stderr", "line", redacted)
+			var readErr error
 
-				// Record the observation so the idle watchdog sees forward
-				// progress. Stderr noise counts: a container spewing stack
-				// traces is not "idle".
-				nowT := time.Now()
-				lastOutputAt.Store(&nowT)
+			for {
+				var line string
 
-				if m.broadcaster != nil {
-					m.broadcaster.Publish(logbroadcast.LogEntry{
-						Timestamp: nowT,
-						CardID:    payload.CardID,
-						Project:   payload.Project,
-						Type:      "stderr",
-						Content:   redacted,
-					})
+				line, readErr = br.ReadString('\n')
+				if line != "" {
+					line = strings.TrimRight(line, "\r\n")
+					// Redact before slog too: a rogue child process echoing the
+					// container env through /proc can easily end up on stderr.
+					redacted := redactor.Redact(line)
+					log.Warn("container stderr", "line", redacted)
+
+					// Record the observation so the idle watchdog sees forward
+					// progress. Stderr noise counts: a container spewing stack
+					// traces is not "idle".
+					nowT := time.Now()
+					lastOutputAt.Store(&nowT)
+
+					if m.broadcaster != nil {
+						m.broadcaster.Publish(logbroadcast.LogEntry{
+							Timestamp: nowT,
+							CardID:    payload.CardID,
+							Project:   payload.Project,
+							Type:      "stderr",
+							Content:   redacted,
+						})
+					}
+				}
+
+				if readErr != nil {
+					break
 				}
 			}
 
-			// If the scanner aborted (e.g. bufio.ErrTooLong on a stderr line
-			// > 1 MiB) the writer side of stderrPr would otherwise block
-			// forever on its next Write. Drain to discard so stdcopy makes
+			// On non-EOF read failure (e.g. an underlying I/O error) the
+			// writer side of stderrPr could still block on its next Write
+			// if anything is buffered. Drain to discard so stdcopy makes
 			// forward progress; the defer above also closes stderrPr so any
 			// already-blocked Write returns io.ErrClosedPipe.
-			if err := scanner.Err(); err != nil {
-				log.Warn("container stderr scanner aborted; draining pipe to unblock writer",
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				log.Warn("container stderr reader aborted; draining pipe to unblock writer",
 					"container_id", truncateID(containerID),
 					"card_id", payload.CardID,
 					"project", payload.Project,
-					"error", err)
+					"error", readErr)
 
 				_, _ = io.Copy(io.Discard, stderrPr)
 			}
@@ -3005,37 +3013,49 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 				}
 			}()
 
-			scanner := bufio.NewScanner(stderrPr)
-			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			// bufio.Reader has no per-line cap; mirrors the card-mode swap
+			// above so an oversized stderr line cannot wedge the goroutine
+			// with bufio.ErrTooLong.
+			br := bufio.NewReaderSize(stderrPr, 64*1024)
 
-			for scanner.Scan() {
-				line := scanner.Text()
-				// Redact before slog too: a rogue child process echoing the
-				// container env through /proc can easily end up on stderr.
-				redacted := redactor.Redact(line)
-				log.Warn("chat container stderr", "line", redacted)
+			var readErr error
 
-				if m.broadcaster != nil {
-					m.broadcaster.Publish(logbroadcast.LogEntry{
-						Timestamp: time.Now(),
-						SessionID: sessionID,
-						Project:   project,
-						Type:      "stderr",
-						Content:   redacted,
-					})
+			for {
+				var line string
+
+				line, readErr = br.ReadString('\n')
+				if line != "" {
+					line = strings.TrimRight(line, "\r\n")
+					// Redact before slog too: a rogue child process echoing the
+					// container env through /proc can easily end up on stderr.
+					redacted := redactor.Redact(line)
+					log.Warn("chat container stderr", "line", redacted)
+
+					if m.broadcaster != nil {
+						m.broadcaster.Publish(logbroadcast.LogEntry{
+							Timestamp: time.Now(),
+							SessionID: sessionID,
+							Project:   project,
+							Type:      "stderr",
+							Content:   redacted,
+						})
+					}
+				}
+
+				if readErr != nil {
+					break
 				}
 			}
 
-			// If the scanner aborted (e.g. bufio.ErrTooLong on a stderr line
-			// > 1 MiB) drain to discard so stdcopy makes forward progress;
-			// the defer above also closes stderrPr so an already-blocked
-			// Write returns io.ErrClosedPipe.
-			if err := scanner.Err(); err != nil {
-				log.Warn("chat container stderr scanner aborted; draining pipe to unblock writer",
+			// On non-EOF read failure drain to discard so stdcopy makes
+			// forward progress; the defer above also closes stderrPr so an
+			// already-blocked Write returns io.ErrClosedPipe.
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				log.Warn("chat container stderr reader aborted; draining pipe to unblock writer",
 					"container_id", containerID,
 					"session_id", sessionID,
 					"project", project,
-					"error", err)
+					"error", readErr)
 
 				_, _ = io.Copy(io.Discard, stderrPr)
 			}
