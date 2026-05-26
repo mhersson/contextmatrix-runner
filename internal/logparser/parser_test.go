@@ -924,6 +924,91 @@ func TestProcessStream_UsageEntryWireJSONShape(t *testing.T) {
 	assert.NotContains(t, got, `"content":`)
 }
 
+// TestProcessStream_LineExceedsCap_DropsAndContinues verifies that a line
+// over the soft cap (MaxLineBytes) is dropped (not parsed — truncated bytes
+// would fail JSON unmarshal and emit a misleading "malformed JSON" warn),
+// surfaces as a system LogEntry naming the cap, and that a subsequent
+// well-formed line in the same stream still parses normally.
+func TestProcessStream_LineExceedsCap_DropsAndContinues(t *testing.T) {
+	// Build an oversized line (cap+128 KiB) followed by a normal-sized
+	// assistant text event.
+	oversize := strings.Repeat("x", MaxLineBytes+128*1024)
+	follow, err := json.Marshal(map[string]any{
+		"type":    "assistant",
+		"message": map[string]any{"content": []map[string]any{{"type": "text", "text": "after-overflow"}}},
+	})
+	require.NoError(t, err)
+
+	stream := oversize + "\n" + string(follow) + "\n"
+
+	logger, records := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	ProcessStream(strings.NewReader(stream), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	// Exactly one system entry naming the cap drop.
+	var sysEntries []logbroadcast.LogEntry
+
+	for _, e := range emitted {
+		if e.Type == "system" {
+			sysEntries = append(sysEntries, e)
+		}
+	}
+
+	require.Len(t, sysEntries, 1, "exactly one system entry expected for the cap drop")
+	assert.Contains(t, sysEntries[0].Content, "logparser: dropped oversized stream-json line")
+
+	// The follow-up line must have parsed through.
+	var textEntry *logbroadcast.LogEntry
+
+	for i := range emitted {
+		if emitted[i].Type == "text" {
+			textEntry = &emitted[i]
+
+			break
+		}
+	}
+
+	require.NotNil(t, textEntry, "the follow-up line must still parse after a capped line")
+	assert.Equal(t, "after-overflow", textEntry.Content)
+
+	// And the truncated bytes must NOT have produced a "malformed JSON"
+	// warn — the parser skipped processLine entirely.
+	for _, r := range *records {
+		if strings.Contains(r.Message, "malformed JSON") {
+			t.Errorf("capped line should not surface as malformed JSON; got %q", r.Message)
+		}
+	}
+}
+
+// TestProcessStream_FinalLineNoNewline verifies that a final assistant event
+// without a trailing newline still emits its content blocks. Real Claude Code
+// runs always terminate with '\n', but the partial-line semantics that the
+// patch claims to handle deserve direct coverage.
+func TestProcessStream_FinalLineNoNewline(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"type":    "assistant",
+		"message": map[string]any{"content": []map[string]any{{"type": "text", "text": "no-trailing-nl"}}},
+	})
+	require.NoError(t, err)
+
+	logger, _ := newTestLogger()
+
+	var emitted []logbroadcast.LogEntry
+
+	// No trailing '\n' — bufio.Reader returns (partial line, io.EOF).
+	ProcessStream(strings.NewReader(string(payload)), logger, func(e logbroadcast.LogEntry) {
+		emitted = append(emitted, e)
+	})
+
+	require.Len(t, emitted, 1)
+	assert.Equal(t, "text", emitted[0].Type)
+	assert.Equal(t, "no-trailing-nl", emitted[0].Content)
+}
+
 // TestProcessStream_OversizedLine_ParsesSuccessfully verifies that a single
 // stream-json line larger than the legacy bufio.Scanner cap (1 MiB) is
 // processed normally instead of terminating the parser. The previous

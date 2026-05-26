@@ -543,18 +543,32 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 		}
 	}
 
-	// bufio.Reader has no hard per-line cap, so a long thinking block (or
-	// any other oversized stream-json event) no longer terminates the
-	// parser with bufio.ErrTooLong. The reader grows as needed.
+	// bufio.Reader avoids bufio.Scanner's MaxScanTokenSize; ReadBoundedLine
+	// adds a soft per-line cap (MaxLineBytes) so a wedged worker emitting
+	// unbounded text without a newline cannot pin the runner heap.
 	br := bufio.NewReaderSize(r, initReadBufSize)
 
 	for {
-		line, readErr := br.ReadString('\n')
-		// ReadString may return a partial final line together with a non-nil
-		// error (typically io.EOF). Process the line first, then handle
-		// the error — otherwise the last unterminated line is lost.
-		if line != "" {
-			processLine(strings.TrimRight(line, "\r\n"))
+		line, truncated, readErr := ReadBoundedLine(br, MaxLineBytes)
+
+		switch {
+		case truncated:
+			// The line exceeded MaxLineBytes; the rest was silently
+			// consumed from br. The truncated bytes are almost
+			// certainly not parseable JSON, so skip processLine and
+			// surface a system entry so operators see the gap.
+			msg := "logparser: dropped oversized stream-json line (>16 MiB); rest of line discarded"
+			logger.Error(msg, "max_bytes", MaxLineBytes)
+
+			if emit != nil {
+				emit(logbroadcast.LogEntry{Type: "system", Content: msg})
+			}
+		case len(line) > 0:
+			// ReadBoundedLine may return a partial final line together
+			// with a non-nil error (typically io.EOF). Process the line
+			// first, then handle the error — otherwise the last
+			// unterminated line is lost.
+			processLine(strings.TrimRight(string(line), "\r\n"))
 		}
 
 		if readErr == nil {
@@ -565,10 +579,9 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 			return
 		}
 
-		// A non-EOF read error (e.g. an underlying I/O failure) still
-		// surfaces as an Error log + system LogEntry so operators can see
-		// why the stream stopped. The bufio.ErrTooLong path that used to
-		// trigger here is gone with the bufio.Scanner removal.
+		// A non-EOF read error (e.g. an underlying I/O failure) surfaces as
+		// an Error log + system LogEntry so operators can see why the
+		// stream stopped.
 		logger.Error("logparser: stream read terminated with error", "error", readErr)
 
 		if emit != nil {
