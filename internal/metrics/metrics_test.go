@@ -1,6 +1,7 @@
 package metrics_test
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -69,10 +70,20 @@ func TestNew_RegistersGoAndProcessCollectors(t *testing.T) {
 	require.NoError(t, err)
 
 	want := map[string]bool{
-		"go_goroutines":                 false,
-		"go_memstats_alloc_bytes":       false,
-		"process_cpu_seconds_total":     false,
-		"process_resident_memory_bytes": false,
+		"go_goroutines":           false,
+		"go_memstats_alloc_bytes": false,
+	}
+
+	// ProcessCollector reads /proc/self/stat and only emits process_*
+	// series on Linux; on macOS / Windows the collector registers but
+	// Collect() returns no families, so Gather() never sees them.
+	// Production deployments are Linux containers, so we still assert
+	// the process_* series there; on dev machines we just verify the
+	// go_* collectors. (The map value is "has this been observed by
+	// Gather?" — the loop below flips it to true when found.)
+	if runtime.GOOS == "linux" {
+		want["process_cpu_seconds_total"] = false
+		want["process_resident_memory_bytes"] = false
 	}
 
 	for _, f := range families {
