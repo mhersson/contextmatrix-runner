@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,18 +18,13 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/secretenv"
 )
 
-// maxScannerBuf is the maximum token size for the scanner. Thinking blocks
-// can be very long, so we allow up to 1MiB — but the scanner allocates only
-// initScannerBuf up front and grows geometrically on demand so the typical
-// short-line case doesn't pin the worst-case buffer for the container's
-// lifetime.
-const maxScannerBuf = 1 << 20 // 1 MiB
-
-// initScannerBuf is the initial capacity handed to bufio.Scanner.Buffer.
-// bufio.Scanner doubles internally when a line exceeds the current capacity,
-// so this only sets the starting allocation — long stream-json lines still
-// work up to maxScannerBuf.
-const initScannerBuf = 64 * 1024 // 64 KiB
+// initReadBufSize is the initial capacity for the bufio.Reader that consumes
+// Claude Code's stream-json output. bufio.Reader has no hard line-length cap
+// (unlike bufio.Scanner's MaxScanTokenSize), so a single long thinking block
+// from Opus on a complex task no longer terminates the parser with
+// bufio.ErrTooLong. The reader grows as needed; this constant only sets the
+// starting allocation so the common short-line case isn't oversized.
+const initReadBufSize = 64 * 1024 // 64 KiB
 
 // maxToolCallLen is the maximum number of runes in a formatted tool call
 // summary before it is truncated with a trailing ellipsis.
@@ -443,45 +439,20 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 		return redactor.Redact(s)
 	}
 
-	scanner := bufio.NewScanner(r)
-	// Start at initScannerBuf; bufio.Scanner grows as needed up to maxScannerBuf.
-	// See maxScannerBuf for the memory-footprint rationale.
-	scanner.Buffer(make([]byte, 0, initScannerBuf), maxScannerBuf)
-
-	defer func() {
-		// Surface scanner failures (most commonly bufio.ErrTooLong on a
-		// stream-json line that exceeds maxScannerBuf). Without this
-		// check the goroutine silently returns as if EOF — the runner
-		// loses the rest of Claude's output and operators have no
-		// signal explaining why. We log at Error and broadcast a
-		// system LogEntry so the failure is visible in /logs.
-		if err := scanner.Err(); err != nil {
-			logger.Error("logparser: stream scan terminated with error", "error", err)
-
-			if emit != nil {
-				emit(logbroadcast.LogEntry{
-					Type:    "system",
-					Content: "logparser: stream scan terminated with error: " + err.Error(),
-				})
-			}
-		}
-	}()
-
-	for scanner.Scan() {
-		line := scanner.Text()
+	processLine := func(line string) {
 		if strings.TrimSpace(line) == "" {
-			continue
+			return
 		}
 
 		var ev event
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			logger.Warn("logparser: malformed JSON line", "error", err)
 
-			continue
+			return
 		}
 
 		if ev.Type != "assistant" {
-			continue
+			return
 		}
 
 		if ev.Message.Usage != nil && emit != nil {
@@ -570,6 +541,57 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 				}
 			}
 		}
+	}
+
+	// bufio.Reader avoids bufio.Scanner's MaxScanTokenSize; ReadBoundedLine
+	// adds a soft per-line cap (MaxLineBytes) so a wedged worker emitting
+	// unbounded text without a newline cannot pin the runner heap.
+	br := bufio.NewReaderSize(r, initReadBufSize)
+
+	for {
+		line, truncated, readErr := ReadBoundedLine(br, MaxLineBytes)
+
+		switch {
+		case truncated:
+			// The line exceeded MaxLineBytes; the rest was silently
+			// consumed from br. The truncated bytes are almost
+			// certainly not parseable JSON, so skip processLine and
+			// surface a system entry so operators see the gap.
+			msg := "logparser: dropped oversized stream-json line (>16 MiB); rest of line discarded"
+			logger.Error(msg, "max_bytes", MaxLineBytes)
+
+			if emit != nil {
+				emit(logbroadcast.LogEntry{Type: "system", Content: msg})
+			}
+		case len(line) > 0:
+			// ReadBoundedLine may return a partial final line together
+			// with a non-nil error (typically io.EOF). Process the line
+			// first, then handle the error — otherwise the last
+			// unterminated line is lost.
+			processLine(strings.TrimRight(string(line), "\r\n"))
+		}
+
+		if readErr == nil {
+			continue
+		}
+
+		if errors.Is(readErr, io.EOF) {
+			return
+		}
+
+		// A non-EOF read error (e.g. an underlying I/O failure) surfaces as
+		// an Error log + system LogEntry so operators can see why the
+		// stream stopped.
+		logger.Error("logparser: stream read terminated with error", "error", readErr)
+
+		if emit != nil {
+			emit(logbroadcast.LogEntry{
+				Type:    "system",
+				Content: "logparser: stream read terminated with error: " + readErr.Error(),
+			})
+		}
+
+		return
 	}
 }
 
