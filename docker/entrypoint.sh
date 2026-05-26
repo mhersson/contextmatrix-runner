@@ -74,6 +74,7 @@ ALLOWED_TOOLS_COMMON=(
     "Bash(git:*)"
     "Bash(gh:*)"
     "Bash(go test:*)"
+    "Bash(go get:*)"
     "Bash(go build:*)"
     "Bash(go vet:*)"
     "Bash(go mod:*)"
