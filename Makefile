@@ -22,6 +22,9 @@ WORKER_IMAGE_TAG  ?= $(VERSION)-$(SHORT_SHA)
 build:
 	go build -o contextmatrix-runner ./cmd/contextmatrix-runner
 
+install:
+	go install ./cmd/contextmatrix-runner
+
 test:
 	go test ./...
 
