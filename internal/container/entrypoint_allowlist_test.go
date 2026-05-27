@@ -46,6 +46,7 @@ func TestEntrypointAllowlist(t *testing.T) {
 		`"Edit"`,
 		`"Write"`,
 		`"Skill"`,
+		`"LSP"`,
 		`"Bash(git:*)"`,
 		// Text-processing utilities Claude uses in pipelines.
 		`"Bash(sed:*)"`,

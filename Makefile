@@ -11,6 +11,8 @@ GO_SHA256_ARM64         ?= 9d89a3ea57d141c2b22d70083f2c8459ba3890f2d9e818e7e933b
 GOPLS_VERSION           ?= v0.22.0
 GOLANGCI_LINT_VERSION   ?= v2.12.2
 CLAUDE_CODE_VERSION     ?= 2.1.148
+TYPESCRIPT_LSP_VERSION  ?= 5.3.0
+TYPESCRIPT_VERSION      ?= 6.0.3
 
 # Image tag components. SHORT_SHA defaults to the current HEAD short hash but
 # CI can pin it explicitly (e.g. to the commit that produced the build).
@@ -72,6 +74,8 @@ docker-worker:
 		--build-arg GOPLS_VERSION=$(GOPLS_VERSION) \
 		--build-arg GOLANGCI_LINT_VERSION=$(GOLANGCI_LINT_VERSION) \
 		--build-arg CLAUDE_CODE_VERSION=$(CLAUDE_CODE_VERSION) \
+		--build-arg TYPESCRIPT_LSP_VERSION=$(TYPESCRIPT_LSP_VERSION) \
+		--build-arg TYPESCRIPT_VERSION=$(TYPESCRIPT_VERSION) \
 		-t $(WORKER_IMAGE_NAME):$(WORKER_IMAGE_TAG) \
 		-t $(WORKER_IMAGE_NAME):latest \
 		docker/

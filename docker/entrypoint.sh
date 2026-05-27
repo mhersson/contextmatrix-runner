@@ -70,6 +70,8 @@ ALLOWED_TOOLS_COMMON=(
     "TodoWrite"
     "WebFetch"
     "WebSearch"
+    # Claude Code LSP plugin gateway (gopls, typescript-language-server, etc.).
+    "LSP"
     # Version control + language toolchain.
     "Bash(git:*)"
     "Bash(gh:*)"

@@ -193,9 +193,9 @@ derives `github.api_base_url` as `https://<host>/api/v3` (the standard GHES
 pattern) when only `host` is set. Override `api_base_url` explicitly for non-
 standard layouts such as GHEC-DR (`https://api.acme.ghe.com`). Leave both empty
 for standard `github.com`. The git host inside containers is derived
-automatically from the repo URL, so no extra git configuration is required.
-Set the matching `github.host` (or `github.api_base_url`) in ContextMatrix so
-both sides target the same enterprise instance.
+automatically from the repo URL, so no extra git configuration is required. Set
+the matching `github.host` (or `github.api_base_url`) in ContextMatrix so both
+sides target the same enterprise instance.
 
 For end-to-end setup of a GitHub App or PAT covering both the runner and the
 contextmatrix server, see
@@ -473,7 +473,7 @@ remote_execution:
    PAT)
 4. Runner pulls the Docker image and starts a hardened container with:
    - Debian bookworm-slim base with Go 1.26, Node.js 25, GitHub CLI,
-     golangci-lint, and gopls (Go language server, for Claude Code's LSP
+     golangci-lint, gopls, and typescript-language-server (for Claude Code's LSP
      integration)
    - Claude Code CLI pre-installed
    - MCP config pointing to ContextMatrix
@@ -496,6 +496,32 @@ discarded.
 The worker image (`docker/Dockerfile.worker`) is Debian-based and runs
 everything as a non-root `user` account (UID 1000). No privilege escalation or
 dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
+
+### LSP plugins
+
+The worker image includes language servers that Claude Code can use via its
+built-in LSP plugins for richer code intelligence (go-to-definition,
+diagnostics, find references):
+
+| Language              | Binary                       | Plugin name (`enabledPlugins` key)       |
+| --------------------- | ---------------------------- | ---------------------------------------- |
+| Go                    | `gopls`                      | `gopls-lsp@claude-plugins-official`      |
+| TypeScript/JavaScript | `typescript-language-server` | `typescript-lsp@claude-plugins-official` |
+
+To enable, set `enabledPlugins` in `claude_settings`:
+
+```yaml
+claude_settings: '{"enabledPlugins":{"gopls-lsp@claude-plugins-official":true,"typescript-lsp@claude-plugins-official":true}}'
+```
+
+The entrypoint allowlists Claude Code's `LSP` built-in tool in all modes, so
+plugins work out of the box once enabled.
+
+**Adding support for a new language:** install the LSP binary in
+`Dockerfile.worker` (pin the version via an `ARG`), add the matching plugin name
+to `enabledPlugins` in `claude_settings`, and rebuild the worker image. No
+entrypoint or allowlist changes are needed — all plugins route through the
+single `LSP` tool entry.
 
 ### What happens inside the container
 
@@ -528,16 +554,16 @@ dropping occurs — the Dockerfile sets `USER user` before the entrypoint.
 
 All webhooks are signed with HMAC-SHA256 using a shared secret.
 
-| Direction   | Endpoint                    | Purpose                                                                                                  |
-| ----------- | --------------------------- | -------------------------------------------------------------------------------------------------------- |
-| CM → Runner | `POST /trigger`             | Start a task                                                                                             |
-| CM → Runner | `POST /kill`                | Stop a specific task                                                                                     |
-| CM → Runner | `POST /stop-all`            | Stop all tasks (or per-project)                                                                          |
-| CM → Runner | `POST /message`             | Send a user message to an interactive session                                                            |
-| CM → Runner | `POST /promote`             | Promote interactive session to autonomous                                                                |
-| CM → Runner | `POST /end-session`         | Close container stdin so claude exits on EOF                                                             |
-| CM → Runner | `POST /refresh-knowledge`   | Spawn a containerised knowledge-base refresh for the given repo. Synthetic tracker key `kb-refresh:<repo>`. |
-| Runner → CM | `POST /api/runner/status`   | Report container status                                                                                  |
+| Direction   | Endpoint                  | Purpose                                                                                                     |
+| ----------- | ------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| CM → Runner | `POST /trigger`           | Start a task                                                                                                |
+| CM → Runner | `POST /kill`              | Stop a specific task                                                                                        |
+| CM → Runner | `POST /stop-all`          | Stop all tasks (or per-project)                                                                             |
+| CM → Runner | `POST /message`           | Send a user message to an interactive session                                                               |
+| CM → Runner | `POST /promote`           | Promote interactive session to autonomous                                                                   |
+| CM → Runner | `POST /end-session`       | Close container stdin so claude exits on EOF                                                                |
+| CM → Runner | `POST /refresh-knowledge` | Spawn a containerised knowledge-base refresh for the given repo. Synthetic tracker key `kb-refresh:<repo>`. |
+| Runner → CM | `POST /api/runner/status` | Report container status                                                                                     |
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
 HMAC is computed over `method + "\n" + uri + "\n" + timestamp + "." + body`,
