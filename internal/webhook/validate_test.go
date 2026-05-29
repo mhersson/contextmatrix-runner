@@ -878,7 +878,7 @@ func TestValidatePayload_TriggerModel(t *testing.T) {
 	require.NoError(t, ValidatePayload(base()))
 
 	// Allowlisted models accepted.
-	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"} {
+	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-haiku-4-5-20251001"} {
 		p := base()
 		p.Model = m
 		require.NoError(t, ValidatePayload(p), "model %q must be accepted", m)
