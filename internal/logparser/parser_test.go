@@ -1161,304 +1161,42 @@ func TestProcessStream_EmptyThinkingWithSiblingText(t *testing.T) {
 	assert.Equal(t, "visible answer", emitted[0].Content)
 }
 
-// TestProcessStream_AskUserQuestion_SingleQuestion verifies that an
-// AskUserQuestion tool_use is emitted as a "user_question" LogEntry with
-// the structured payload preserved as compact JSON — not routed through
-// formatToolCall's 200-rune-truncated path.
-func TestProcessStream_AskUserQuestion_SingleQuestion(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_single01","name":"AskUserQuestion","input":{` +
-		`"questions":[{"question":"Which library should we use?","header":"Library","multiSelect":false,` +
-		`"options":[{"label":"date-fns","description":"Functional, tree-shakeable"},` +
-		`{"label":"luxon","description":"Object-oriented with timezone support"}]}]}}]}}`
-
-	logger, records := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, *records, 1)
-	assert.Equal(t, slog.LevelInfo, (*records)[0].Level)
-	assert.NotEmpty(t, attr((*records)[0], "claude_user_question"))
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "user_question", emitted[0].Type)
-
-	var got askUserQuestionPayload
-
-	require.NoError(t, json.Unmarshal([]byte(emitted[0].Content), &got))
-	require.Len(t, got.Questions, 1)
-	assert.Equal(t, "Which library should we use?", got.Questions[0].Question)
-	assert.Equal(t, "Library", got.Questions[0].Header)
-	assert.False(t, got.Questions[0].MultiSelect)
-	require.Len(t, got.Questions[0].Options, 2)
-	assert.Equal(t, "date-fns", got.Questions[0].Options[0].Label)
-	assert.Equal(t, "luxon", got.Questions[0].Options[1].Label)
-}
-
-// TestProcessStream_AskUserQuestion_MultiQuestion verifies that multiple
-// questions in one AskUserQuestion call are preserved in order, and that
-// multiSelect=true round-trips.
-func TestProcessStream_AskUserQuestion_MultiQuestion(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_multi01","name":"AskUserQuestion","input":{` +
-		`"questions":[` +
-		`{"question":"Q1?","header":"H1","multiSelect":false,"options":[{"label":"a"},{"label":"b"}]},` +
-		`{"question":"Q2?","header":"H2","multiSelect":true,"options":[{"label":"x"},{"label":"y"},{"label":"z"}]}` +
-		`]}}]}}`
-
-	logger, _ := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "user_question", emitted[0].Type)
-
-	var got askUserQuestionPayload
-
-	require.NoError(t, json.Unmarshal([]byte(emitted[0].Content), &got))
-	require.Len(t, got.Questions, 2)
-	assert.Equal(t, "Q1?", got.Questions[0].Question)
-	assert.False(t, got.Questions[0].MultiSelect)
-	assert.Equal(t, "Q2?", got.Questions[1].Question)
-	assert.True(t, got.Questions[1].MultiSelect)
-	assert.Len(t, got.Questions[1].Options, 3)
-}
-
-// TestProcessStream_AskUserQuestion_PropagatesToolUseID verifies that the
-// stream-json tool_use `id` is captured and surfaced on the emitted LogEntry's
-// ToolUseID, so the chat layer can later send a `tool_result` frame back to
-// Claude that closes the tool call loop. Without this, the answer would
-// arrive as plain user text against an open tool_use and Claude would
-// rationalise the situation as "the tool isn't available".
-func TestProcessStream_AskUserQuestion_PropagatesToolUseID(t *testing.T) {
-	const toolUseID = "toolu_01ABCDEFGHIJKLMNOPQRSTUV"
-
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"` + toolUseID + `","name":"AskUserQuestion","input":{` +
-		`"questions":[{"question":"Pick one","options":[{"label":"a"},{"label":"b"}]}]}}]}}`
-
-	logger, _ := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "user_question", emitted[0].Type)
-	assert.Equal(t, toolUseID, emitted[0].ToolUseID,
-		"AskUserQuestion tool_use id must propagate to the LogEntry's ToolUseID")
-}
-
-// TestProcessStream_AskUserQuestion_MissingToolUseIDFallsBack verifies that
-// a structurally valid AskUserQuestion tool_use without an "id" field falls
-// through to the generic tool_call path rather than being emitted as a
-// user_question. Emitting a user_question without an id would surface a
-// question card in the chat UI that the runner cannot answer (no tool_use_id
-// to reference in a tool_result frame), and the operator's eventual reply
-// would arrive as plain user text against an open tool_use — the exact
-// failure mode this feature was added to prevent.
-func TestProcessStream_AskUserQuestion_MissingToolUseIDFallsBack(t *testing.T) {
-	// Structurally valid input, but no "id" on the tool_use block.
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
-		`"questions":[{"question":"Pick one","options":[{"label":"a"},{"label":"b"}]}]}}]}}`
-
-	logger, _ := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "tool_call", emitted[0].Type,
-		"AskUserQuestion without a tool_use id must fall back to the generic tool_call path")
-	assert.Empty(t, emitted[0].ToolUseID,
-		"fallback tool_call must not carry an empty-string ToolUseID either")
-	assert.Contains(t, emitted[0].Content, "AskUserQuestion")
-}
-
-// TestProcessStream_AskUserQuestion_MalformedFallsBackToToolCall verifies
-// that an AskUserQuestion payload that fails to parse still surfaces — via
-// the generic tool_call path — rather than being silently dropped.
-func TestProcessStream_AskUserQuestion_MalformedFallsBackToToolCall(t *testing.T) {
-	// "questions" is a string instead of an array — Unmarshal will fail.
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":"oops"}}]}}`
-
-	logger, _ := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "tool_call", emitted[0].Type,
-		"malformed AskUserQuestion must fall back to the generic tool_call path")
-	assert.Contains(t, emitted[0].Content, "AskUserQuestion")
-}
-
-// TestProcessStream_AskUserQuestion_EmptyQuestionsFallsBack verifies that
-// a payload with an empty questions array falls back to tool_call so the
-// event still appears in the stream.
-func TestProcessStream_AskUserQuestion_EmptyQuestionsFallsBack(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[]}}]}}`
-
-	logger, _ := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "tool_call", emitted[0].Type)
-}
-
-// TestProcessStream_AskUserQuestion_RedactsSecrets verifies that secret
-// strings embedded inside an AskUserQuestion question survive on the wire
-// and then get redacted via the standard pipeline before emission. The
-// table covers each secretPatterns family that has non-trivial
-// JSON-encoding interaction (Bearer/JWT/AWS keys use character classes
-// that JSON-string encoding preserves byte-for-byte; env-var-shaped
-// secrets are the one path with non-obvious encoding behaviour).
-func TestProcessStream_AskUserQuestion_RedactsSecrets(t *testing.T) {
-	tests := []struct {
-		name   string
-		secret string
+// TestProcessStream_AskUserQuestion_Suppressed verifies that an
+// AskUserQuestion tool_use produces no LogEntry at all. The MCP permission
+// gate denies AskUserQuestion and the agent re-asks in plain text; surfacing
+// the tool_use (as a card or a tool_call) would duplicate that question.
+func TestProcessStream_AskUserQuestion_Suppressed(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
 	}{
-		{name: "github personal access token", secret: "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"},
-		{name: "bearer token", secret: "Bearer abc123XYZabc123XYZabc123XYZ"},
-		{name: "JWT", secret: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"},
-		{name: "AWS access key id", secret: "AKIAIOSFODNN7EXAMPLE"},
-		{name: "CM env-var secret", secret: "CM_MCP_API_KEY=abc123XYZsecretvalue"},
+		{
+			name: "valid with id",
+			input: `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_x","name":"AskUserQuestion","input":{` +
+				`"questions":[{"question":"Pick one","options":[{"label":"a"},{"label":"b"}]}]}}]}}`,
+		},
+		{
+			name: "missing id",
+			input: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{` +
+				`"questions":[{"question":"Pick one","options":[{"label":"a"}]}]}}]}}`,
+		},
+		{
+			name:  "malformed input",
+			input: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":"oops"}}]}}`,
+		},
 	}
 
-	for _, tc := range tests {
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_secret01","name":"AskUserQuestion","input":{` +
-				`"questions":[{"question":"Use this token: ` + tc.secret + `?","options":[{"label":"yes"},{"label":"no"}]}]}}]}}`
-
 			logger, _ := newTestLogger()
 
 			var emitted []logbroadcast.LogEntry
 
-			ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
+			ProcessStream(strings.NewReader(tc.input), logger, func(e logbroadcast.LogEntry) {
 				emitted = append(emitted, e)
 			})
 
-			require.Len(t, emitted, 1)
-			assert.Equal(t, "user_question", emitted[0].Type)
-			assert.NotContains(t, emitted[0].Content, tc.secret,
-				"raw secret must not appear in the emitted user_question content")
-			assert.Contains(t, emitted[0].Content, "[REDACTED]",
-				"redactor must replace the secret with [REDACTED]")
+			assert.Empty(t, emitted, "AskUserQuestion must not surface any LogEntry")
 		})
 	}
-}
-
-// TestValidateAskUserQuestion_FallbackContract pins the contract used by
-// ProcessStream: nil/empty/invalid inputs must return false so the
-// caller routes to the generic tool_call path.
-func TestValidateAskUserQuestion_FallbackContract(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  bool
-	}{
-		{name: "empty input", input: ``, want: false},
-		{name: "whitespace only", input: `   `, want: false},
-		{name: "invalid JSON", input: `{not json`, want: false},
-		{name: "missing questions key", input: `{}`, want: false},
-		{name: "empty questions array", input: `{"questions":[]}`, want: false},
-		{name: "wrong type for questions", input: `{"questions":"oops"}`, want: false},
-		{
-			// Per-question shape check: nil/missing options crashes the
-			// frontend's options.map(...). Reject upstream so the event
-			// surfaces via the tool_call fallback path instead.
-			name:  "question with missing options field",
-			input: `{"questions":[{"question":"hi"}]}`,
-			want:  false,
-		},
-		{
-			// Same shape with an explicit null options — equivalent to missing.
-			name:  "question with null options",
-			input: `{"questions":[{"question":"hi","options":null}]}`,
-			want:  false,
-		},
-		{
-			// Empty options array is intentionally allowed — the model can
-			// ask an open question and let the user type free-text.
-			name:  "question with empty options array",
-			input: `{"questions":[{"question":"hi","options":[]}]}`,
-			want:  true,
-		},
-		{
-			name:  "valid single question",
-			input: `{"questions":[{"question":"hi","options":[{"label":"a"}]}]}`,
-			want:  true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, validateAskUserQuestion(json.RawMessage(tc.input)))
-		})
-	}
-}
-
-// TestProcessStream_AskUserQuestion_MissingOptionsFallsBack is the
-// integration-side counterpart to the contract table above — when a
-// payload arrives with a question missing its options field, the runner
-// emits the generic tool_call entry rather than dropping or crashing.
-func TestProcessStream_AskUserQuestion_MissingOptionsFallsBack(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"hi"}]}}]}}`
-
-	logger, _ := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "tool_call", emitted[0].Type,
-		"missing options must fall back to the generic tool_call path")
-}
-
-// TestProcessStream_AskUserQuestion_PreservesUnknownFields verifies that
-// unknown fields on the wire survive the runner. We validate via the typed
-// struct but emit the original input bytes, so a future Claude Code field
-// like `priority` does not get silently dropped.
-func TestProcessStream_AskUserQuestion_PreservesUnknownFields(t *testing.T) {
-	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_unknown01","name":"AskUserQuestion","input":{` +
-		`"questions":[{"question":"Q?","priority":"high","options":[{"label":"a","style":"primary"}]}],` +
-		`"meta":"experimental"}}]}}`
-
-	logger, _ := newTestLogger()
-
-	var emitted []logbroadcast.LogEntry
-
-	ProcessStream(strings.NewReader(input), logger, func(e logbroadcast.LogEntry) {
-		emitted = append(emitted, e)
-	})
-
-	require.Len(t, emitted, 1)
-	assert.Equal(t, "user_question", emitted[0].Type)
-	assert.Contains(t, emitted[0].Content, `"priority":"high"`,
-		"unknown per-question field must survive on the wire")
-	assert.Contains(t, emitted[0].Content, `"style":"primary"`,
-		"unknown per-option field must survive on the wire")
-	assert.Contains(t, emitted[0].Content, `"meta":"experimental"`,
-		"unknown top-level field must survive on the wire")
 }

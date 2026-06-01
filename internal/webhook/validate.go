@@ -463,9 +463,10 @@ func validateEndSession(p *EndSessionPayload) error {
 var chatModelPattern = regexp.MustCompile(`^claude-[a-z0-9.-]{1,64}$`)
 
 // chatResumeRolePattern restricts ResumeTurn.Role to the shapes the
-// transcript builder emits. `user_question` is included so an
-// AskUserQuestion turn carries its native role across rehydration
-// rather than being lossy-remapped on the CM side.
+// transcript builder emits. `user_question` is retained for backward
+// compatibility with transcripts persisted before AskUserQuestion was
+// suppressed — the current runner no longer produces that role, but old
+// sessions may still carry it across rehydration.
 var chatResumeRolePattern = regexp.MustCompile(`^(user|assistant_text|tool_call|tool_result_summary|user_question)$`)
 
 const (

@@ -500,37 +500,11 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 				}
 
 				if block.Name == "AskUserQuestion" {
-					// An empty tool_use id makes the reply path lossy: the
-					// runner cannot emit a tool_result frame, so the
-					// operator's eventual answer arrives as plain user text
-					// against an open tool_use and Claude rationalises
-					// "the tool isn't available". Fall through to the
-					// generic tool_call path so the chat UI never renders
-					// an unanswerable question card.
-					if block.ID != "" && validateAskUserQuestion(block.Input) {
-						// Emit the original input bytes (after redaction) so
-						// unknown future fields survive on the wire. The
-						// typed struct in validateAskUserQuestion is used
-						// for validation only.
-						content := redact(string(block.Input))
-						logger.Info("claude", "claude_user_question", content)
-
-						if emit != nil {
-							emit(logbroadcast.LogEntry{Type: "user_question", Content: content, ToolUseID: block.ID})
-						}
-
-						continue
-					}
-
-					if block.ID == "" {
-						logger.Warn("logparser: AskUserQuestion missing tool_use id, falling back to tool_call")
-					}
-
-					// Malformed (or id-less) AskUserQuestion input falls
-					// through to the generic tool_call path below, where
-					// the existing redact + claude_tool Info emit gives
-					// operators the same signal they have for any other
-					// tool call.
+					// AskUserQuestion is denied by the MCP permission gate; the
+					// agent re-asks in plain text. Don't surface the tool_use at
+					// all — rendering it (as a card or a tool_call) would
+					// duplicate the question the user already sees as text.
+					continue
 				}
 
 				content := redact(formatToolCall(block.Name, block.Input))
@@ -593,63 +567,6 @@ func ProcessStreamWithRedactor(r io.Reader, logger *slog.Logger, redactor *Redac
 
 		return
 	}
-}
-
-// askUserQuestionOption mirrors a single option in Claude Code's
-// AskUserQuestion tool input.
-type askUserQuestionOption struct {
-	Label       string `json:"label"`
-	Description string `json:"description,omitempty"`
-}
-
-// askUserQuestionItem mirrors a single question in Claude Code's
-// AskUserQuestion tool input.
-type askUserQuestionItem struct {
-	Question    string                  `json:"question"`
-	Header      string                  `json:"header,omitempty"`
-	MultiSelect bool                    `json:"multiSelect,omitempty"`
-	Options     []askUserQuestionOption `json:"options"`
-}
-
-// askUserQuestionPayload is the wire shape CM consumes.
-type askUserQuestionPayload struct {
-	Questions []askUserQuestionItem `json:"questions"`
-}
-
-// validateAskUserQuestion shape-checks an AskUserQuestion tool_use input.
-// The shape contract is: a non-empty `questions` array whose entries each
-// carry a non-nil `options` field (an empty options slice is valid; nil
-// is not, because nil marshals back to `null` in JSON and crashes the
-// frontend's `options.map(...)`).
-//
-// Returns true when the input is safe to emit downstream as a
-// `user_question` LogEntry. The caller emits the original input bytes,
-// not a re-marshalled form, so unknown future fields added by Claude Code
-// survive on the wire for forward compatibility.
-func validateAskUserQuestion(input json.RawMessage) bool {
-	if len(bytes.TrimSpace(input)) == 0 {
-		return false
-	}
-
-	var payload askUserQuestionPayload
-	if err := json.Unmarshal(input, &payload); err != nil {
-		return false
-	}
-
-	if len(payload.Questions) == 0 {
-		return false
-	}
-
-	for _, q := range payload.Questions {
-		// Nil options would marshal to `"options":null`, which the frontend
-		// cannot iterate. Empty `[]` is fine — it just renders a question
-		// with no options (the user types a free-text answer).
-		if q.Options == nil {
-			return false
-		}
-	}
-
-	return true
 }
 
 // handleSkillToolUse parses a Skill tool_use block and calls onSkillEngaged

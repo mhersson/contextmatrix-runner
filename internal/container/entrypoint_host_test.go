@@ -240,7 +240,7 @@ func TestEntrypointOverwriteDocsValidatorInSource(t *testing.T) {
 	// -* branch mirrors sibling validators (CM_CARD_ID, CM_PROJECT, CM_KB_REPO,
 	// CM_BASE_BRANCH) which all reject -* to defend against option injection
 	// if the value is later used as a CLI argument.
-	assert.Contains(t, src, `-*|*[!A-Za-z0-9._,-]*`,
+	assert.Contains(t, src, `-* | *[!A-Za-z0-9._,-]*`,
 		"entrypoint.sh must validate CM_KB_OVERWRITE_DOCS with a whole-string case pattern that rejects -*")
 
 	// The validator must reference CM_KB_OVERWRITE_DOCS by name in an error
@@ -260,7 +260,7 @@ func TestEntrypointBranchValidatorInSource(t *testing.T) {
 	src := string(content)
 
 	// The new whole-string case pattern.
-	assert.Contains(t, src, `-*|*[!A-Za-z0-9._/-]*`,
+	assert.Contains(t, src, `-* | *[!A-Za-z0-9._/-]*`,
 		"entrypoint.sh must validate CM_BASE_BRANCH with a whole-string case pattern")
 
 	// The old grep-based validator must be gone.
