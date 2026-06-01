@@ -1186,7 +1186,7 @@ func buildPrimingContent(payload RunConfig) string {
 		"Begin work on card `%s` now. "+
 			"Call `get_skill(skill_name='create-plan', card_id='%s', caller_model='sonnet')` "+
 			"via the contextmatrix MCP server and follow the returned skill instructions exactly. "+
-			"Use MCP tools only. Never push to main or master. "+
+			"Never push to main or master. "+
 			"Call heartbeat every 5 minutes during idle waits and `report_usage` after each heartbeat. "+
 			"On completion, call `release_card` after transitioning to done.",
 		payload.CardID, payload.CardID,

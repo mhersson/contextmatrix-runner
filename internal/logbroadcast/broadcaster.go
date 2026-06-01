@@ -49,14 +49,11 @@ type LogEntry struct {
 	// directly by the /message webhook handler, bypassing logparser.Redact.
 	// "usage" carries Claude's stream-json usage block (Usage field) and
 	// the responding model (Model field); Content is empty for these.
-	// "user_question" carries the structured payload of an AskUserQuestion
-	// tool_use; Content is compact JSON matching CM's UserQuestionCard.
-	// ToolUseID is set only on "user_question" entries and carries the
-	// stream-json tool_use id (e.g. "toolu_01ABC..."). CM stores it on
-	// pendingToolUseID for the session; Phase 1 of the permission_prompt
-	// MCP gate consumes-and-discards it (AskUserQuestion is denied
-	// before the model waits for an answer), Phase 2 will use it to
-	// key a blocked permission_prompt waiter on (sessionID, tool_use_id).
+	// "user_question" is LEGACY: the logparser no longer emits it — it now
+	// suppresses AskUserQuestion entirely (agents ask in plain text). The
+	// type string and ToolUseID field are retained for wire compatibility
+	// and for entries persisted before suppression; new entries never set
+	// ToolUseID.
 	Type      string      `json:"type"`
 	Content   string      `json:"content,omitempty"`
 	ToolUseID string      `json:"tool_use_id,omitempty"`

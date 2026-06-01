@@ -55,9 +55,12 @@ fi
 # Destructive ContextMatrix RPCs (delete_project, update_project) are
 # excluded in all modes — nothing spawned in a worker needs those.
 #
-# Shell utilities are allowlisted by exact command prefix (e.g. "Bash(sed:*)")
-# so a compromised model can't promote "Bash(sed:*)" into "Bash(rm -rf /:*)"
-# — claude evaluates each Bash invocation against the longest matching prefix.
+# Bash is allowlisted unrestricted. Worker containers are disposable and
+# isolated; container isolation, not shell-argument filtering, is the
+# blast-radius control. A prefix allowlist also rejected legitimate
+# exploratory commands (subshells, redirects, pipes) the orchestrator
+# routinely writes, which the model then misread as "Bash is unavailable".
+# Skills already require MCP tools for board ops (never curl/wget the API).
 ALLOWED_TOOLS_COMMON=(
   "Read"
   "Edit"
@@ -71,64 +74,7 @@ ALLOWED_TOOLS_COMMON=(
   "WebFetch"
   "WebSearch"
   "LSP"
-  "Bash(git:*)"
-  "Bash(gh:*)"
-  "Bash(go test:*)"
-  "Bash(go get:*)"
-  "Bash(go build:*)"
-  "Bash(go vet:*)"
-  "Bash(go mod:*)"
-  "Bash(go run:*)"
-  "Bash(go install:*)"
-  # Read-only / scratch-only go verbs. Without these, an exploratory
-  # compound command (e.g. "ls … && go version && find …") has one
-  # un-allowlisted segment, which makes claude classify the whole line as
-  # behavior:"ask" — and the headless permission gate denies it.
-  "Bash(go version:*)"
-  "Bash(go env:*)"
-  "Bash(go list:*)"
-  "Bash(go fmt:*)"
-  "Bash(go doc:*)"
-  "Bash(golangci-lint run:*)"
-  "Bash(make:*)"
-  # Node.js / frontend workflow (npm install/test/build, node scripts).
-  "Bash(npm:*)"
-  "Bash(node:*)"
-  "Bash(npx:*)"
-  # Python — generic scripts, pip for packages; pytest etc. run via python3 -m.
-  "Bash(python3:*)"
-  "Bash(pip3:*)"
-  # Filesystem basics. rm is intentionally broad because worker containers
-  # are disposable; the real blast-radius control is container isolation,
-  # not shell argument filtering.
-  "Bash(mv:*)"
-  "Bash(cp:*)"
-  "Bash(rm:*)"
-  "Bash(mkdir:*)"
-  "Bash(ls:*)"
-  "Bash(find:*)"
-  "Bash(which:*)"
-  "Bash(command:*)"
-  # Text inspection + transformation. All are read-or-stdout-only unless
-  # paired with > redirection (which claude reports per-command).
-  "Bash(cat:*)"
-  "Bash(head:*)"
-  "Bash(tail:*)"
-  "Bash(wc:*)"
-  "Bash(echo:*)"
-  "Bash(printenv:*)"
-  "Bash(sed:*)"
-  "Bash(awk:*)"
-  "Bash(grep:*)"
-  "Bash(sort:*)"
-  "Bash(uniq:*)"
-  "Bash(diff:*)"
-  "Bash(tr:*)"
-  "Bash(cut:*)"
-  "Bash(tee:*)"
-  "Bash(xargs:*)"
-  "Bash(date:*)"
-  "Bash(jq:*)"
+  "Bash"
   "mcp__contextmatrix__add_log"
   "mcp__contextmatrix__check_agent_health"
   "mcp__contextmatrix__claim_card"
@@ -452,11 +398,17 @@ fi
 # CM_GIT_TOKEN → already copied into the credential helper file.
 # CM_MCP_API_KEY → already written into ~/.claude.json.
 # Both of these would otherwise leak into every Bash/Tool subprocess claude
-# spawns (defence-in-depth — the --allowed-tools allowlist restricts which
-# tools claude will invoke, but env hygiene still matters).
+# spawns, so unset them for env hygiene.
 # CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY are intentionally preserved:
 # the Claude CLI reads them at startup, and removing them here breaks auth in
 # the env-fallback path.
+# ACCEPTED TRADE-OFF: Bash is allowlisted unrestricted (see the allowlist
+# section above), so the worker can run curl/wget — the two preserved tokens
+# are therefore reachable for network exfiltration in a way the old prefix
+# allowlist (which excluded curl) blocked. Accepted because the container is
+# single-tenant and disposable, the model is Claude running an approved
+# workflow, and the tokens are scoped to this run. Revisit if workers ever
+# execute untrusted third-party code.
 unset CM_GIT_TOKEN CM_MCP_API_KEY
 
 # ----- Task skills (filesystem-mounted Claude Code skills) -----
@@ -465,7 +417,7 @@ unset CM_GIT_TOKEN CM_MCP_API_KEY
 
 # Space-separated allowlist passed via a single --allowed-tools flag, per
 # `claude --help`: "--allowedTools, --allowed-tools <tools...>  Comma or
-# space-separated list of tool names to allow (e.g. \"Bash(git *) Edit\")".
+# space-separated list of tool names to allow (e.g. \"Bash Edit\")".
 # Four-way dispatch:
 #   1. chat (CM_CHAT_SESSION set) — non-card-bound interactive session.
 #   2. knowledge-refresh — KB refresh mode with its own tool allowlist and prompt.

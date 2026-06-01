@@ -40,23 +40,16 @@ func TestEntrypointAllowlist(t *testing.T) {
 	assert.Contains(t, src, `"${ALLOWED_TOOLS_AUTO[*]}"`,
 		"autonomous branch must expand ALLOWED_TOOLS_AUTO via space-separated [*] form")
 
-	// 4. Core must-have tools must be on the common allowlist.
+	// 4. Core must-have tools must be on the common allowlist. Bash is
+	// allowlisted unrestricted (bare "Bash") — a prefix allowlist rejected
+	// legitimate compound/subshell commands; see the rationale in entrypoint.sh.
 	mustHave := []string{
 		`"Read"`,
 		`"Edit"`,
 		`"Write"`,
 		`"Skill"`,
 		`"LSP"`,
-		`"Bash(git:*)"`,
-		// Text-processing utilities Claude uses in pipelines.
-		`"Bash(sed:*)"`,
-		`"Bash(awk:*)"`,
-		`"Bash(grep:*)"`,
-		`"Bash(find:*)"`,
-		`"Bash(sort:*)"`,
-		`"Bash(diff:*)"`,
-		`"Bash(xargs:*)"`,
-		`"Bash(printenv:*)"`,
+		`"Bash"`,
 		`"mcp__contextmatrix__transition_card"`,
 	}
 	for _, tool := range mustHave {
@@ -138,17 +131,12 @@ func TestEntrypointKBAllowlistDoesNotContainDestructiveTools(t *testing.T) {
 	// Each entry below must be verified absent from the current allowlist
 	// before being added — the goal is a regression guard, not a
 	// false-positive trap. Items that ARE legitimately present (e.g.
-	// "Write", "Edit", "Bash(rm:*)", update_card) are deliberately
-	// excluded.
+	// "Write", "Edit", "Bash", update_card) are deliberately excluded.
 	denied := []string{
 		// Destructive ContextMatrix RPCs the refresh skill never invokes.
 		`"mcp__contextmatrix__delete_project"`,
 		`"mcp__contextmatrix__update_project"`,
 		`"mcp__contextmatrix__delete_card"`,
-		// Bash escapes that defeat per-command prefix matching.
-		`"Bash(*)"`,
-		`"Bash(curl:*)"`,
-		`"Bash(eval:*)"`,
 	}
 	for _, tool := range denied {
 		assert.NotContains(t, effective, tool,
