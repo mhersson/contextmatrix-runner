@@ -15,7 +15,6 @@ ContextMatrix repo.
 ```
 cmd/contextmatrix-runner/main.go  → entrypoint, wires dependencies
 internal/config/                  → YAML config + env overrides + validation
-internal/hmac/                    → HMAC-SHA256 signing/verification (shared)
 internal/webhook/                 → HTTP handlers (/trigger, /kill, /stop-all, /message,
                                     /promote, /end-session, /chat/start, /chat/end,
                                     /logs, /containers, /health, /readyz)
@@ -45,6 +44,12 @@ GitHub authentication is not an internal package: the runner imports the shared
 contextmatrix server, so the App (JWT → installation token) and PAT providers
 stay in lockstep across the two repos.
 
+The CM↔runner wire contract is likewise a shared module:
+`github.com/mhersson/contextmatrix-protocol` is the single home of the HMAC
+signing/verification code, the webhook payload/response DTOs, and the stable
+error codes. `internal/webhook/types.go` and `codes.go` alias its types and
+constants so package-local call sites read `webhook.*` unchanged.
+
 ## Tech stack
 
 - **Go 1.26+** — backend
@@ -54,6 +59,9 @@ stay in lockstep across the two repos.
   (App + PAT + caching). GitHub App JWT signing now lives inside this module;
   `golang-jwt/jwt/v5` is only an indirect dependency of the runner via the auth
   module.
+- **`github.com/mhersson/contextmatrix-protocol`** — shared wire-contract module
+  (HMAC signing/verification, webhook DTOs, error codes). Also imported by the
+  contextmatrix server.
 - **go-yaml v3** — config parsing
 - **testify** — test assertions
 
@@ -142,9 +150,9 @@ RSA keys generated per test.
 
 ## Webhook contract
 
-The runner must produce and verify HMAC signatures identical to ContextMatrix's
-`internal/runner/hmac.go`. The `internal/hmac/` package mirrors that code. Both
-sides sign as
+HMAC signing/verification lives in the shared
+`github.com/mhersson/contextmatrix-protocol` module, imported by both the
+runner and ContextMatrix, so the two sides cannot drift. Both sides sign as
 `HMAC-SHA256(key, method + "\n" + uri + "\n" + timestamp + "." + body)`,
 hex-encoded, where `uri` is the request-target form (path plus `?rawquery` when
 present, matching `r.URL.RequestURI()` on the receiver). Binding the HTTP method

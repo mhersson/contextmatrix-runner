@@ -1343,6 +1343,7 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 			skew = protocol.DefaultMaxClockSkew
 		}
 
+		// nil ReplayCache: replay is handled by h.replayCache below.
 		if !protocol.VerifySignatureWithTimestamp(h.apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, skew, nil) {
 			h.logWarn("webhook authentication failed",
 				"remote_addr", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
