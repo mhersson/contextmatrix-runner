@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -96,15 +96,15 @@ func TestReportStatus_Success(t *testing.T) {
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sigHeader = r.Header.Get(cmhmac.SignatureHeader)
-		tsHeader = r.Header.Get(cmhmac.TimestampHeader)
+		sigHeader = r.Header.Get(protocol.SignatureHeader)
+		tsHeader = r.Header.Get(protocol.TimestampHeader)
 
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &received)
 
 		// Verify HMAC
 		sig := strings.TrimPrefix(sigHeader, "sha256=")
-		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, cmhmac.DefaultMaxClockSkew))
+		assert.True(t, protocol.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, protocol.DefaultMaxClockSkew, nil))
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -182,8 +182,8 @@ func TestReportStatus_HMACFormat(t *testing.T) {
 	apiKey := "my-super-long-api-key-for-hmac-testing"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sig := r.Header.Get(cmhmac.SignatureHeader)
-		ts := r.Header.Get(cmhmac.TimestampHeader)
+		sig := r.Header.Get(protocol.SignatureHeader)
+		ts := r.Header.Get(protocol.TimestampHeader)
 
 		assert.True(t, strings.HasPrefix(sig, "sha256="), "signature must start with sha256=")
 		assert.NotEmpty(t, ts, "timestamp header must be set")
@@ -191,7 +191,7 @@ func TestReportStatus_HMACFormat(t *testing.T) {
 		// Verify the signature is valid
 		body, _ := io.ReadAll(r.Body)
 		hexSig := strings.TrimPrefix(sig, "sha256=")
-		assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.RequestURI(), hexSig, ts, body, cmhmac.DefaultMaxClockSkew))
+		assert.True(t, protocol.VerifySignatureWithTimestamp(apiKey, r.Method, r.URL.RequestURI(), hexSig, ts, body, protocol.DefaultMaxClockSkew, nil))
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -292,8 +292,8 @@ func TestVerifyAutonomous_HMACSigned(t *testing.T) {
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sigHeader = r.Header.Get(cmhmac.SignatureHeader)
-		tsHeader = r.Header.Get(cmhmac.TimestampHeader)
+		sigHeader = r.Header.Get(protocol.SignatureHeader)
+		tsHeader = r.Header.Get(protocol.TimestampHeader)
 		authHeader = r.Header.Get("Authorization")
 		receivedMethod = r.Method
 		receivedPath = r.URL.Path
@@ -315,7 +315,7 @@ func TestVerifyAutonomous_HMACSigned(t *testing.T) {
 
 	// Signature must verify against an empty body (GET carries no body).
 	hexSig := strings.TrimPrefix(sigHeader, "sha256=")
-	assert.True(t, cmhmac.VerifySignatureWithTimestamp(apiKey, receivedMethod, receivedPath, hexSig, tsHeader, nil, cmhmac.DefaultMaxClockSkew))
+	assert.True(t, protocol.VerifySignatureWithTimestamp(apiKey, receivedMethod, receivedPath, hexSig, tsHeader, nil, protocol.DefaultMaxClockSkew, nil))
 }
 
 // TestVerifyAutonomous_HMACSigned_RejectsMissingHeaders ensures that a
@@ -369,8 +369,8 @@ func TestVerifyAutonomous_BearerFallbackWhenDisabled(t *testing.T) {
 	var sigHeader, tsHeader, authHeader string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sigHeader = r.Header.Get(cmhmac.SignatureHeader)
-		tsHeader = r.Header.Get(cmhmac.TimestampHeader)
+		sigHeader = r.Header.Get(protocol.SignatureHeader)
+		tsHeader = r.Header.Get(protocol.TimestampHeader)
 		authHeader = r.Header.Get("Authorization")
 
 		w.WriteHeader(http.StatusOK)
@@ -575,7 +575,7 @@ func TestClient_ReportSkillEngaged(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "/api/runner/skill-engaged", r.URL.Path)
-		assert.NotEmpty(t, r.Header.Get(cmhmac.SignatureHeader))
+		assert.NotEmpty(t, r.Header.Get(protocol.SignatureHeader))
 
 		receivedBody, _ = io.ReadAll(r.Body)
 
@@ -600,8 +600,8 @@ func TestClient_KnowledgeStatus_PostsSignedRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "/api/runner/knowledge-status", r.URL.Path)
-		assert.NotEmpty(t, r.Header.Get(cmhmac.SignatureHeader))
-		assert.NotEmpty(t, r.Header.Get(cmhmac.TimestampHeader))
+		assert.NotEmpty(t, r.Header.Get(protocol.SignatureHeader))
+		assert.NotEmpty(t, r.Header.Get(protocol.TimestampHeader))
 
 		rawBody, _ = io.ReadAll(r.Body)
 		assert.NoError(t, json.Unmarshal(rawBody, &received))

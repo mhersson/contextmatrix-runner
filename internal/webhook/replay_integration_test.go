@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
@@ -39,12 +39,12 @@ func TestHMACMiddleware_RejectsReplay(t *testing.T) {
 	// Build a single signed payload and replay it byte-identically.
 	body := []byte(`{"test":true}`)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/test", body, ts)
+	sig := protocol.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/test", body, ts)
 
 	mkReq := func() *http.Request {
 		req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", bytes.NewReader(body))
-		req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-		req.Header.Set(cmhmac.TimestampHeader, ts)
+		req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+		req.Header.Set(protocol.TimestampHeader, ts)
 
 		return req
 	}
@@ -81,11 +81,11 @@ func TestHMACMiddleware_DifferentSignaturesAllBypass_Replay(t *testing.T) {
 
 	for i := range 3 {
 		ts := strconv.FormatInt(time.Now().Unix()-int64(i), 10) // distinct ts ensures distinct sig
-		sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/test", body, ts)
+		sig := protocol.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/test", body, ts)
 
 		req := httptest.NewRequestWithContext(context.Background(), "POST", "/test", bytes.NewReader(body))
-		req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-		req.Header.Set(cmhmac.TimestampHeader, ts)
+		req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+		req.Header.Set(protocol.TimestampHeader, ts)
 
 		w := httptest.NewRecorder()
 		handler(w, req)

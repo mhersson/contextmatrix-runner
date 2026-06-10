@@ -13,8 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
@@ -1053,13 +1053,13 @@ func TestHandleTrigger_InvalidCardID_NoTrackerOrRun(t *testing.T) {
 	require.NoError(t, err)
 
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/trigger", body, ts)
+	sig := protocol.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/trigger", body, ts)
 
 	req := httptest.NewRequestWithContext(
 		context.Background(), http.MethodPost, "/trigger", strings.NewReader(string(body)),
 	)
-	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-	req.Header.Set(cmhmac.TimestampHeader, ts)
+	req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+	req.Header.Set(protocol.TimestampHeader, ts)
 
 	w := httptest.NewRecorder()
 	h.hmacAuth(h.handleTrigger)(w, req)

@@ -18,7 +18,7 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 )
 
@@ -152,7 +152,7 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 		// (method, uri, timestamp, signature) tuple — will treat each
 		// attempt as a distinct request and will not self-409 the retry.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusURI, body, ts)
+		signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusURI, body, ts)
 
 		lastErr = c.doRequest(ctx, body, signature, ts)
 		if lastErr == nil {
@@ -239,7 +239,7 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 		// receiver's replay cache treats each attempt as a distinct
 		// request and does not self-409 the retry.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillURI, body, ts)
+		signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillURI, body, ts)
 
 		reqURL := c.contextMatrixURL + "/api/runner/skill-engaged"
 
@@ -249,8 +249,8 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
-		req.Header.Set(cmhmac.TimestampHeader, ts)
+		req.Header.Set(protocol.SignatureHeader, "sha256="+signature)
+		req.Header.Set(protocol.TimestampHeader, ts)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -341,7 +341,7 @@ func (c *Client) KnowledgeStatus(ctx context.Context, req KnowledgeStatusRequest
 		// receiver's replay cache treats each attempt as a distinct
 		// request and does not self-409 the retry.
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, uri, body, ts)
+		signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, uri, body, ts)
 
 		reqURL := c.contextMatrixURL + "/api/runner/knowledge-status"
 
@@ -351,8 +351,8 @@ func (c *Client) KnowledgeStatus(ctx context.Context, req KnowledgeStatusRequest
 		}
 
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
-		httpReq.Header.Set(cmhmac.TimestampHeader, ts)
+		httpReq.Header.Set(protocol.SignatureHeader, "sha256="+signature)
+		httpReq.Header.Set(protocol.TimestampHeader, ts)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -586,9 +586,9 @@ func (c *Client) doVerifyAutonomous(ctx context.Context, reqURL string) (bool, e
 			return false, perr
 		}
 
-		signature := cmhmac.SignPayloadWithTimestamp(c.apiKey, http.MethodGet, uri, nil, ts)
-		req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
-		req.Header.Set(cmhmac.TimestampHeader, ts)
+		signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodGet, uri, nil, ts)
+		req.Header.Set(protocol.SignatureHeader, "sha256="+signature)
+		req.Header.Set(protocol.TimestampHeader, ts)
 	} else {
 		// Deprecated Bearer fallback — retained only so the runner stays
 		// compatible with a CM server that has not yet rolled the HMAC
@@ -642,8 +642,8 @@ func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts strin
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(cmhmac.SignatureHeader, "sha256="+signature)
-	req.Header.Set(cmhmac.TimestampHeader, ts)
+	req.Header.Set(protocol.SignatureHeader, "sha256="+signature)
+	req.Header.Set(protocol.TimestampHeader, ts)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

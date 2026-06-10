@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
@@ -54,12 +54,12 @@ func TestAdminMetrics_RejectsUnauthenticated(t *testing.T) {
 	// Correctly signed GET: should be accepted.
 	{
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		sig := cmhmac.SignPayloadWithTimestamp(adminTestAPIKey, http.MethodGet, "/metrics", []byte{}, ts)
+		sig := protocol.SignPayloadWithTimestamp(adminTestAPIKey, http.MethodGet, "/metrics", []byte{}, ts)
 
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/metrics", http.NoBody)
 		require.NoError(t, err)
-		req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-		req.Header.Set(cmhmac.TimestampHeader, ts)
+		req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+		req.Header.Set(protocol.TimestampHeader, ts)
 
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
