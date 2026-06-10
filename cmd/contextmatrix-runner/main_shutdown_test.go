@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 	"github.com/mhersson/contextmatrix-runner/internal/webhook"
 )
@@ -230,13 +230,13 @@ func TestShutdown_WedgedContainer(t *testing.T) {
 
 	body, _ := json.Marshal(payload)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := cmhmac.SignPayloadWithTimestamp(apiKey, http.MethodPost, "/trigger", body, ts)
+	sig := protocol.SignPayloadWithTimestamp(apiKey, http.MethodPost, "/trigger", body, ts)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/trigger", strings.NewReader(string(body)))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-	req.Header.Set(cmhmac.TimestampHeader, ts)
+	req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+	req.Header.Set(protocol.TimestampHeader, ts)
 
 	resp, err = http.DefaultClient.Do(req)
 	if err == nil {

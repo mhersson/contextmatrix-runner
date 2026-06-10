@@ -16,9 +16,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
@@ -54,7 +54,7 @@ func TestHMACAuth_AllFailuresReturn401Generic(t *testing.T) {
 			build: func() *http.Request {
 				r := httptest.NewRequestWithContext(context.Background(),
 					http.MethodPost, "/trigger", strings.NewReader("{}"))
-				r.Header.Set(cmhmac.SignatureHeader, "sha256=abc")
+				r.Header.Set(protocol.SignatureHeader, "sha256=abc")
 
 				return r
 			},
@@ -64,8 +64,8 @@ func TestHMACAuth_AllFailuresReturn401Generic(t *testing.T) {
 			build: func() *http.Request {
 				r := httptest.NewRequestWithContext(context.Background(),
 					http.MethodPost, "/trigger", strings.NewReader("{}"))
-				r.Header.Set(cmhmac.SignatureHeader, "sha256=deadbeef")
-				r.Header.Set(cmhmac.TimestampHeader,
+				r.Header.Set(protocol.SignatureHeader, "sha256=deadbeef")
+				r.Header.Set(protocol.TimestampHeader,
 					strconv.FormatInt(time.Now().Unix(), 10))
 
 				return r
@@ -77,11 +77,11 @@ func TestHMACAuth_AllFailuresReturn401Generic(t *testing.T) {
 				// Sign correctly but with a timestamp outside the skew window.
 				body := []byte(`{}`)
 				oldTS := strconv.FormatInt(time.Now().Add(-2*time.Hour).Unix(), 10)
-				sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/trigger", body, oldTS)
+				sig := protocol.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, "/trigger", body, oldTS)
 				r := httptest.NewRequestWithContext(context.Background(),
 					http.MethodPost, "/trigger", bytes.NewReader(body))
-				r.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-				r.Header.Set(cmhmac.TimestampHeader, oldTS)
+				r.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+				r.Header.Set(protocol.TimestampHeader, oldTS)
 
 				return r
 			},
@@ -91,8 +91,8 @@ func TestHMACAuth_AllFailuresReturn401Generic(t *testing.T) {
 			build: func() *http.Request {
 				r := httptest.NewRequestWithContext(context.Background(),
 					http.MethodPost, "/trigger", errReader)
-				r.Header.Set(cmhmac.SignatureHeader, "sha256=abc")
-				r.Header.Set(cmhmac.TimestampHeader,
+				r.Header.Set(protocol.SignatureHeader, "sha256=abc")
+				r.Header.Set(protocol.TimestampHeader,
 					strconv.FormatInt(time.Now().Unix(), 10))
 
 				return r
@@ -543,11 +543,11 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 			}
 
 			ts := strconv.FormatInt(time.Now().Unix(), 10)
-			sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, tc.path, body, ts)
+			sig := protocol.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, tc.path, body, ts)
 			req := httptest.NewRequestWithContext(context.Background(),
 				http.MethodPost, tc.path, bytes.NewReader(body))
-			req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-			req.Header.Set(cmhmac.TimestampHeader, ts)
+			req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+			req.Header.Set(protocol.TimestampHeader, ts)
 
 			w := httptest.NewRecorder()
 			h.hmacAuth(tc.handler(h))(w, req)
@@ -598,11 +598,11 @@ func TestNoRawErrLeakIntoResponseBody(t *testing.T) {
 	for _, ep := range endpoints {
 		t.Run(ep.path, func(t *testing.T) {
 			ts := strconv.FormatInt(time.Now().Unix(), 10)
-			sig := cmhmac.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, ep.path, body, ts)
+			sig := protocol.SignPayloadWithTimestamp(testAPIKey, http.MethodPost, ep.path, body, ts)
 			req := httptest.NewRequestWithContext(context.Background(),
 				http.MethodPost, ep.path, bytes.NewReader(body))
-			req.Header.Set(cmhmac.SignatureHeader, "sha256="+sig)
-			req.Header.Set(cmhmac.TimestampHeader, ts)
+			req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+			req.Header.Set(protocol.TimestampHeader, ts)
 
 			w := httptest.NewRecorder()
 			h.hmacAuth(ep.handler)(w, req)

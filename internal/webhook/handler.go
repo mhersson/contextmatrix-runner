@@ -14,9 +14,9 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
+	protocol "github.com/mhersson/contextmatrix-protocol"
 	"github.com/mhersson/contextmatrix-runner/internal/callback"
 	"github.com/mhersson/contextmatrix-runner/internal/container"
-	cmhmac "github.com/mhersson/contextmatrix-runner/internal/hmac"
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/mhersson/contextmatrix-runner/internal/metrics"
 	"github.com/mhersson/contextmatrix-runner/internal/streammsg"
@@ -100,7 +100,7 @@ type Handler struct {
 	metrics       *metrics.Metrics
 
 	// webhookReplaySkew is the maximum allowed age for webhook timestamps.
-	// Defaults to cmhmac.DefaultMaxClockSkew when zero (for backward
+	// Defaults to protocol.DefaultMaxClockSkew when zero (for backward
 	// compatibility with tests that construct Handler literals directly).
 	webhookReplaySkew time.Duration
 
@@ -125,7 +125,7 @@ type Handler struct {
 // webhookReplaySkew is the maximum allowed age for incoming webhook timestamps.
 // Pass time.Duration(cfg.WebhookReplaySkewSeconds)*time.Second from main; in
 // tests that construct Handler literals directly the field defaults to zero
-// which falls back to cmhmac.DefaultMaxClockSkew inside hmacAuth.
+// which falls back to protocol.DefaultMaxClockSkew inside hmacAuth.
 //
 // health is optional — pass nil in tests that do not exercise /readyz. In
 // production wiring (cmd/contextmatrix-runner/main.go), the same
@@ -1295,7 +1295,7 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		sigHeader := r.Header.Get(cmhmac.SignatureHeader)
+		sigHeader := r.Header.Get(protocol.SignatureHeader)
 		if sigHeader == "" {
 			h.logDebug("hmac auth: missing signature header", "remote_addr", r.RemoteAddr)
 			writeUnauthorized(w)
@@ -1303,7 +1303,7 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		tsHeader := r.Header.Get(cmhmac.TimestampHeader)
+		tsHeader := r.Header.Get(protocol.TimestampHeader)
 		if tsHeader == "" {
 			h.logDebug("hmac auth: missing timestamp header", "remote_addr", r.RemoteAddr)
 			writeUnauthorized(w)
@@ -1324,7 +1324,7 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		sig := strings.TrimPrefix(sigHeader, "sha256=")
 
 		// webhookReplaySkew == 0 means "use the library default"
-		// (cmhmac.DefaultMaxClockSkew) — NOT "reject every request
+		// (protocol.DefaultMaxClockSkew) — NOT "reject every request
 		// because the allowed window is zero seconds". This fallback
 		// exists so test fixtures that construct a Handler literal
 		// without specifying skew still behave reasonably; production
@@ -1340,10 +1340,10 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		// to 0. Fix W11 in REVIEW.md.
 		skew := h.webhookReplaySkew
 		if skew == 0 {
-			skew = cmhmac.DefaultMaxClockSkew
+			skew = protocol.DefaultMaxClockSkew
 		}
 
-		if !cmhmac.VerifySignatureWithTimestamp(h.apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, skew) {
+		if !protocol.VerifySignatureWithTimestamp(h.apiKey, r.Method, r.URL.RequestURI(), sig, tsHeader, body, skew, nil) {
 			h.logWarn("webhook authentication failed",
 				"remote_addr", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
 			writeUnauthorized(w)
