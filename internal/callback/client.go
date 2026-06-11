@@ -34,28 +34,13 @@ const (
 	bearerFallbackLogInterval = 5 * time.Minute
 )
 
-// statusRequest is the JSON body sent to ContextMatrix.
-type statusRequest struct {
-	CardID       string `json:"card_id"`
-	Project      string `json:"project"`
-	RunnerStatus string `json:"runner_status"`
-	Message      string `json:"message,omitempty"`
-}
-
-// skillEngagedRequest is the JSON body sent when the agent engages a skill.
-type skillEngagedRequest struct {
-	CardID    string `json:"card_id"`
-	Project   string `json:"project"`
-	SkillName string `json:"skill_name"`
-}
-
-// KnowledgeStatusRequest is the body of POST /api/runner/knowledge-status.
-type KnowledgeStatusRequest struct {
-	Project string `json:"project"`
-	Repo    string `json:"repo"`
-	State   string `json:"state"` // "succeeded" or "failed"
-	Error   string `json:"error,omitempty"`
-}
+// Callback request bodies are defined in contextmatrix-protocol; aliased
+// so call sites and tests keep compiling unchanged.
+type (
+	statusRequest          = protocol.StatusCallbackPayload
+	skillEngagedRequest    = protocol.SkillEngagedPayload
+	KnowledgeStatusRequest = protocol.KnowledgeStatusPayload
+)
 
 // Client sends signed status callbacks to ContextMatrix.
 //
