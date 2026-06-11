@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	protocol "github.com/mhersson/contextmatrix-protocol"
 )
 
 const (
@@ -38,39 +40,14 @@ const (
 const truncatedMarker = "…[truncated]"
 
 // LogEntry represents a single log entry emitted by a runner container.
-type LogEntry struct {
-	Timestamp time.Time `json:"ts"`
-	CardID    string    `json:"card_id,omitempty"`
-	Project   string    `json:"project,omitempty"`
-	SessionID string    `json:"session_id,omitempty"`
-	// Type is one of: text, thinking, tool_call, user_question, stderr,
-	// system, user, usage.
-	// "user" is a message submitted via the HITL chat input — published
-	// directly by the /message webhook handler, bypassing logparser.Redact.
-	// "usage" carries Claude's stream-json usage block (Usage field) and
-	// the responding model (Model field); Content is empty for these.
-	// "user_question" is LEGACY: the logparser no longer emits it — it now
-	// suppresses AskUserQuestion entirely (agents ask in plain text). The
-	// type string and ToolUseID field are retained for wire compatibility
-	// and for entries persisted before suppression; new entries never set
-	// ToolUseID.
-	Type      string      `json:"type"`
-	Content   string      `json:"content,omitempty"`
-	ToolUseID string      `json:"tool_use_id,omitempty"`
-	Usage     *TokenUsage `json:"usage,omitempty"`
-	Model     string      `json:"model,omitempty"`
-}
+// The wire shape is owned by contextmatrix-protocol (this is the /logs SSE
+// frame CM consumes); aliased so the rest of the runner keeps compiling
+// unchanged. See protocol.LogEntry for the field/type documentation.
+type LogEntry = protocol.LogEntry
 
-// TokenUsage carries the per-turn context window accounting reported by
-// Claude in its stream-json output. Wire shape consumed by CM's chat
-// manager: input + cache_read + cache_create ≈ the prompt size Claude
-// actually processed.
-type TokenUsage struct {
-	InputTokens       int64 `json:"input_tokens"`
-	OutputTokens      int64 `json:"output_tokens"`
-	CacheReadTokens   int64 `json:"cache_read_tokens"`
-	CacheCreateTokens int64 `json:"cache_creation_tokens"`
-}
+// TokenUsage carries the per-turn context-window accounting reported by
+// Claude in its stream-json output. Aliased to the protocol wire shape.
+type TokenUsage = protocol.LogTokenUsage
 
 // subscriber represents a single log subscriber with a buffered channel and
 // an optional project or session filter.
