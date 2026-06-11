@@ -61,3 +61,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )
+
+replace github.com/mhersson/contextmatrix-protocol => ../contextmatrix-protocol
