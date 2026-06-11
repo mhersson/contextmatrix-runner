@@ -6029,3 +6029,47 @@ func (f *failingTokenGen) GenerateToken(_ context.Context) (string, time.Time, e
 
 	return "", time.Time{}, f.err
 }
+
+func TestCACertMount(t *testing.T) {
+	t.Run("unset returns false", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.CACertFile = ""
+		m := &Manager{cfg: cfg}
+
+		_, ok := m.caCertMount()
+		assert.False(t, ok)
+	})
+
+	t.Run("set returns read-only bind at fixed target", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.CACertFile = "/host/dnb-root.pem"
+		m := &Manager{cfg: cfg}
+
+		mnt, ok := m.caCertMount()
+		require.True(t, ok)
+		assert.Equal(t, mount.TypeBind, mnt.Type)
+		assert.Equal(t, "/host/dnb-root.pem", mnt.Source)
+		assert.Equal(t, caCertMountTarget, mnt.Target)
+		assert.True(t, mnt.ReadOnly)
+	})
+}
+
+func TestAppendCommonEnv_CACert(t *testing.T) {
+	t.Run("absent when unset", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.CACertFile = ""
+		m := &Manager{cfg: cfg}
+
+		env := m.appendCommonEnv(nil, nil)
+		assert.NotContains(t, env, "NODE_EXTRA_CA_CERTS="+caCertMountTarget)
+	})
+
+	t.Run("set when configured", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.CACertFile = "/host/dnb-root.pem"
+		m := &Manager{cfg: cfg}
+
+		env := m.appendCommonEnv(nil, nil)
+		assert.Contains(t, env, "NODE_EXTRA_CA_CERTS="+caCertMountTarget)
+	})
+}

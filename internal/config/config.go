@@ -46,25 +46,34 @@ type UnpinnedImageRef struct {
 
 // Config holds all runner configuration.
 type Config struct {
-	Port                      int          `yaml:"port"`
-	AdminPort                 int          `yaml:"admin_port"`
-	ContextMatrixURL          string       `yaml:"contextmatrix_url"`
-	ContainerContextMatrixURL string       `yaml:"container_contextmatrix_url"`
-	APIKey                    string       `yaml:"api_key"`
-	BaseImage                 string       `yaml:"base_image"`
-	AllowedImages             []string     `yaml:"allowed_images"`
-	ImagePullPolicy           string       `yaml:"image_pull_policy"`
-	MaxConcurrent             int          `yaml:"max_concurrent"`
-	ContainerTimeout          string       `yaml:"container_timeout"`
-	ContainerMemoryLimit      int64        `yaml:"container_memory_limit"`
-	ContainerPidsLimit        int64        `yaml:"container_pids_limit"`
-	ClaudeAuthDir             string       `yaml:"claude_auth_dir"`
-	ClaudeOAuthToken          string       `yaml:"claude_oauth_token"`
-	AnthropicAPIKey           string       `yaml:"anthropic_api_key"`
-	ClaudeSettings            string       `yaml:"claude_settings"`
-	GitHub                    GitHubConfig `yaml:"github"`
-	LogLevel                  string       `yaml:"log_level"`
-	LogFormat                 string       `yaml:"log_format"`
+	Port                      int      `yaml:"port"`
+	AdminPort                 int      `yaml:"admin_port"`
+	ContextMatrixURL          string   `yaml:"contextmatrix_url"`
+	ContainerContextMatrixURL string   `yaml:"container_contextmatrix_url"`
+	APIKey                    string   `yaml:"api_key"`
+	BaseImage                 string   `yaml:"base_image"`
+	AllowedImages             []string `yaml:"allowed_images"`
+	ImagePullPolicy           string   `yaml:"image_pull_policy"`
+	MaxConcurrent             int      `yaml:"max_concurrent"`
+	ContainerTimeout          string   `yaml:"container_timeout"`
+	ContainerMemoryLimit      int64    `yaml:"container_memory_limit"`
+	ContainerPidsLimit        int64    `yaml:"container_pids_limit"`
+	ClaudeAuthDir             string   `yaml:"claude_auth_dir"`
+	ClaudeOAuthToken          string   `yaml:"claude_oauth_token"`
+	AnthropicAPIKey           string   `yaml:"anthropic_api_key"`
+	// CACertFile is an optional host path to a PEM file holding extra CA
+	// certificate(s) to trust inside worker containers. When set, the runner
+	// bind-mounts the file read-only at /run/cm-ca/ca.crt and sets
+	// NODE_EXTRA_CA_CERTS to that path so Claude Code's Node TLS trusts the
+	// chain. Only needed behind a TLS-inspecting corporate proxy (e.g. a
+	// Zscaler MITM that re-signs api.anthropic.com / the configured
+	// ANTHROPIC_BASE_URL with a private root). Empty disables the feature.
+	// Env: CMR_CA_CERT_FILE.
+	CACertFile     string       `yaml:"ca_cert_file"`
+	ClaudeSettings string       `yaml:"claude_settings"`
+	GitHub         GitHubConfig `yaml:"github"`
+	LogLevel       string       `yaml:"log_level"`
+	LogFormat      string       `yaml:"log_format"`
 	// SecretsDir is the host directory where the runner stages the shared
 	// secrets file. The runner writes $SecretsDir/shared/env (created at
 	// boot, rotated by tokenRefresher) and bind-mounts $SecretsDir/shared/
@@ -793,6 +802,7 @@ func (c *Config) Validate() error {
 			"LD_PRELOAD", "LD_LIBRARY_PATH",
 			"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
 			"NODE_OPTIONS",
+			"NODE_EXTRA_CA_CERTS",
 			"PATH",
 			"GOPROXY", "GOSUMDB", "GOFLAGS",
 			"PYTHONPATH":
@@ -815,6 +825,12 @@ func (c *Config) Validate() error {
 	if c.ClaudeAuthDir != "" {
 		if _, err := os.Stat(c.ClaudeAuthDir); err != nil {
 			return fmt.Errorf("claude_auth_dir does not exist: %w", err)
+		}
+	}
+
+	if c.CACertFile != "" {
+		if _, err := os.Stat(c.CACertFile); err != nil {
+			return fmt.Errorf("ca_cert_file does not exist: %w", err)
 		}
 	}
 
@@ -1021,6 +1037,10 @@ func applyEnvOverrides(cfg *Config) error {
 
 	if v := os.Getenv("CMR_ANTHROPIC_API_KEY"); v != "" {
 		cfg.AnthropicAPIKey = v
+	}
+
+	if v := os.Getenv("CMR_CA_CERT_FILE"); v != "" {
+		cfg.CACertFile = v
 	}
 
 	if v := os.Getenv("CMR_CLAUDE_SETTINGS"); v != "" {
