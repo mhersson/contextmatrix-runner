@@ -1660,6 +1660,7 @@ func TestValidate_WorkerExtraEnv_RejectsDangerousKeys(t *testing.T) {
 		"HTTPS_PROXY",
 		"NO_PROXY",
 		"NODE_OPTIONS",
+		"NODE_EXTRA_CA_CERTS",
 		"PATH",
 		"GOPROXY",
 		"GOSUMDB",
@@ -1686,6 +1687,30 @@ func TestValidate_WorkerExtraEnv_AllowsBenignKeys(t *testing.T) {
 		"CI":                  "false",
 	}
 	require.NoError(t, c.Validate())
+}
+
+func TestValidate_CACertFile(t *testing.T) {
+	t.Run("empty is allowed", func(t *testing.T) {
+		c := minimalValidConfig(t)
+		c.CACertFile = ""
+		require.NoError(t, c.Validate())
+	})
+
+	t.Run("existing file is allowed", func(t *testing.T) {
+		c := minimalValidConfig(t)
+		f := filepath.Join(t.TempDir(), "ca.pem")
+		require.NoError(t, os.WriteFile(f, []byte("-----BEGIN CERTIFICATE-----\n"), 0o600))
+		c.CACertFile = f
+		require.NoError(t, c.Validate())
+	})
+
+	t.Run("missing file is rejected", func(t *testing.T) {
+		c := minimalValidConfig(t)
+		c.CACertFile = filepath.Join(t.TempDir(), "does-not-exist.pem")
+		err := c.Validate()
+		require.Error(t, err)
+		require.ErrorContains(t, err, "ca_cert_file")
+	})
 }
 
 // TestLoad_UnknownYAMLField verifies that yaml.NewDecoder().KnownFields(true)

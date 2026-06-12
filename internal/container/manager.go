@@ -712,6 +712,11 @@ func (m *Manager) runningCallbackAsync(payload RunConfig, log *slog.Logger) {
 // false positive.
 const secretsMountTarget = "/run/cm-secrets" //nolint:gosec // path, not a credential
 
+// caCertMountTarget is the in-container path where the optional extra-CA PEM
+// (config: ca_cert_file) is bind-mounted read-only. The runner points
+// NODE_EXTRA_CA_CERTS at this path so Claude Code's Node TLS trusts the chain.
+const caCertMountTarget = "/run/cm-ca/ca.crt"
+
 func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string, secretDelivery, []string, error) {
 	img := payload.RunnerImage
 	if img == "" {
@@ -805,6 +810,10 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 
 	if skillsMount, ok := m.taskSkillsMount(ctx, gitToken); ok {
 		mounts = append(mounts, skillsMount)
+	}
+
+	if caMount, ok := m.caCertMount(); ok {
+		mounts = append(mounts, caMount)
 	}
 
 	// Determine secret delivery mode and collect secret values for the
@@ -2710,6 +2719,10 @@ func (m *Manager) StartChat(ctx context.Context, opts StartChatOpts) (string, er
 		mounts = append(mounts, skillsMount)
 	}
 
+	if caMount, ok := m.caCertMount(); ok {
+		mounts = append(mounts, caMount)
+	}
+
 	// Collect secret values for the per-container Redactor. See
 	// collectSecretValues for the threat-model and CM_GIT_TOKEN-absent
 	// rationale. Shared with card-mode startContainer so both modes redact
@@ -3154,6 +3167,24 @@ func (m *Manager) claudeAuthMount() (mount.Mount, bool) {
 	}, true
 }
 
+// caCertMount returns the read-only bind for the optional extra-CA PEM
+// (m.cfg.CACertFile) at caCertMountTarget, plus true; otherwise the zero Mount
+// and false. Both card-mode and chat-mode use this so a deployment behind a
+// TLS-inspecting proxy trusts the same CA regardless of worker mode. The
+// matching NODE_EXTRA_CA_CERTS env var is set in appendCommonEnv.
+func (m *Manager) caCertMount() (mount.Mount, bool) {
+	if m.cfg.CACertFile == "" {
+		return mount.Mount{}, false
+	}
+
+	return mount.Mount{
+		Type:     mount.TypeBind,
+		Source:   m.cfg.CACertFile,
+		Target:   caCertMountTarget,
+		ReadOnly: true,
+	}, true
+}
+
 // appendCommonEnv appends deployment-wide env vars consumed by every spawned
 // worker — CM_CLAUDE_SETTINGS, CM_TASK_SKILLS_SET/CM_TASK_SKILLS, and the
 // WorkerExtraEnv map (sorted by key). Both card-mode startContainer and
@@ -3167,6 +3198,14 @@ func (m *Manager) appendCommonEnv(env []string, taskSkills *[]string) []string {
 	if m.cfg.TaskSkillsDir != "" && taskSkills != nil {
 		env = append(env, "CM_TASK_SKILLS_SET=1")
 		env = append(env, "CM_TASK_SKILLS="+strings.Join(*taskSkills, ","))
+	}
+
+	// Point Node (Claude Code) at the bind-mounted extra CA when configured.
+	// The matching read-only mount is added by caCertMount() at both
+	// startContainer and StartChat. NODE_EXTRA_CA_CERTS is blocked in
+	// worker_extra_env (see config.Validate) so this is the only setter.
+	if m.cfg.CACertFile != "" {
+		env = append(env, "NODE_EXTRA_CA_CERTS="+caCertMountTarget)
 	}
 
 	if len(m.cfg.WorkerExtraEnv) > 0 {

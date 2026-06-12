@@ -135,6 +135,15 @@ claude_oauth_token: ""
 # Env: CMR_ANTHROPIC_API_KEY
 anthropic_api_key: ""
 
+# Optional path to a PEM file with extra CA certificate(s) to trust inside
+# worker containers. When set, the file is bind-mounted read-only at
+# /run/cm-ca/ca.crt and NODE_EXTRA_CA_CERTS is pointed at it so Claude Code's
+# Node TLS trusts the chain. Only needed behind a TLS-inspecting corporate
+# proxy (e.g. a Zscaler MITM that re-signs the Anthropic API endpoint with a
+# private corporate root). Leave empty if you don't need it.
+# Env: CMR_CA_CERT_FILE
+ca_cert_file: ""
+
 # ----- Claude Code Settings -----
 
 # Raw JSON written to /home/user/.claude/settings.json inside the container.
