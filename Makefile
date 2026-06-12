@@ -2,12 +2,12 @@
 
 # Pinned worker toolchain versions. Override on the command line
 # if a newer version has been vetted, e.g.
-#   make docker-worker GO_VERSION=1.26.3
+#   make docker-worker GO_VERSION=1.26.4
 # These values are passed into the Dockerfile as --build-args so the build is
 # reproducible from CI and local shells alike.
-GO_VERSION              ?= 1.26.3
-GO_SHA256_AMD64         ?= 2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556
-GO_SHA256_ARM64         ?= 9d89a3ea57d141c2b22d70083f2c8459ba3890f2d9e818e7e933b75614936565
+GO_VERSION              ?= 1.26.4
+GO_SHA256_AMD64         ?= 1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f
+GO_SHA256_ARM64         ?= ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768
 GOPLS_VERSION           ?= v0.22.0
 GOLANGCI_LINT_VERSION   ?= v2.12.2
 CLAUDE_CODE_VERSION     ?= 2.1.156
