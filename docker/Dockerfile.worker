@@ -103,11 +103,12 @@ RUN GOBIN=/usr/local/go/bin go install "golang.org/x/tools/gopls@${GOPLS_VERSION
 # `curl … | bash` installer (REVIEW.md C15). The npm tarball integrity is
 # verified by npm against the registry's published signatures. Run as root
 # so the global install can write to /usr/lib/node_modules.
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
-
-# TypeScript language server for Claude Code's LSP plugin
-# (typescript-lsp@claude-plugins-official). Pinned like all other dev tools.
+# The TypeScript language server rides in the same layer for Claude Code's
+# LSP plugin (typescript-lsp@claude-plugins-official), pinned like all other
+# dev tools and combined into one RUN so hadolint DL3059 does not flag
+# consecutive instructions.
 RUN npm install -g \
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     "typescript-language-server@${TYPESCRIPT_LSP_VERSION}" \
     "typescript@${TYPESCRIPT_VERSION}"
 
