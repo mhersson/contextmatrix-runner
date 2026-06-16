@@ -3,16 +3,14 @@
 # Every entry must include a justification and an expiry. Review on every
 # worker-image bump; delete entries whose underlying fix has landed.
 
-# --- gopls pulls github.com/modelcontextprotocol/go-sdk v0.8.0 as a
-# transitive dep; v1.3.1/1.4.0/1.4.1 fix the CVEs below. gopls v0.21.1 is
-# the latest release and has not yet bumped the dep. We ship gopls only so
-# Claude Code can drive LSP operations inside the container workspace --
-# it never terminates network connections itself, so the DNS-rebinding /
-# case-sensitivity / null-byte parsing issues are not reachable from the
-# sandbox. Accepted until gopls upstream bumps.
-CVE-2026-27896
+# --- gopls (v0.22.0, pinned) bundles github.com/modelcontextprotocol/go-sdk
+# v1.4.0 as a transitive dep; the two issues below are fixed in v1.4.1, which
+# gopls has not yet bumped to. We ship gopls only so Claude Code can drive LSP
+# operations inside the container workspace -- it never terminates network
+# connections itself, so the underlying transport/parsing issues are not
+# reachable from the sandbox. Accepted until gopls upstream bumps to go-sdk
+# v1.4.1.
 CVE-2026-33252
-CVE-2026-34742
 GHSA-q382-vc8q-7jhj
 
 # --- /usr/bin/gh from GitHub's apt repo is compiled against Go stdlib
@@ -38,10 +36,11 @@ CVE-2026-39820
 CVE-2026-39836
 CVE-2026-42499
 
-# --- @anthropic-ai/claude-code@2.1.116 pulls picomatch 4.0.3 as an npm
-# transitive; 4.0.4 fixes the ReDoS. Upstream claude-code has not yet
-# published a version that picks up the newer picomatch. Worker
-# container is single-tenant and the allowlist restricts which globs
-# are ever parsed, so the ReDoS is not reachable from a prompt
-# attacker.
+# --- the bundled npm CLI ships tinyglobby -> picomatch 4.0.3 (at
+# /usr/lib/node_modules/npm/node_modules/tinyglobby/node_modules/picomatch);
+# 4.0.4 fixes the ReDoS. This is npm's own transitive dep, not
+# @anthropic-ai/claude-code's, so bumping Claude Code does not clear it --
+# only an npm upgrade past the fixed tinyglobby/picomatch will. Worker
+# container is single-tenant and the allowlist restricts which globs are
+# ever parsed, so the ReDoS is not reachable from a prompt attacker.
 CVE-2026-33671
