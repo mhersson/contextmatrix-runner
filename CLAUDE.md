@@ -16,7 +16,8 @@ ContextMatrix repo.
 cmd/contextmatrix-runner/main.go  → entrypoint, wires dependencies
 internal/config/                  → YAML config + env overrides + validation
 internal/webhook/                 → HTTP handlers (/trigger, /kill, /stop-all, /message,
-                                    /promote, /end-session, /chat/start, /chat/end,
+                                    /promote, /end-session, /refresh-knowledge,
+                                    /chat/start, /chat/end,
                                     /logs, /containers, /health, /readyz)
 internal/container/               → Docker SDK abstraction, container lifecycle,
                                     chat resume payload writer (prepareChatResume),

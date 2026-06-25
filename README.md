@@ -404,20 +404,41 @@ behaviour.
 
 2. **Wider HMAC replay window** — `webhook_replay_skew_seconds` defaults to
    86400 (24 h) instead of 330 s, so a laptop that slept still processes
-   webhooks. `image_pull_policy` defaults to `if-not-present` instead of
-   `never`. Applied defaults are listed at startup:
+   webhooks. Listed in the startup applied-defaults line:
    `level=INFO msg="dev profile: applied defaults" defaults=[webhook_replay_skew_seconds=86400 image_pull_policy=if-not-present]`
 
-3. **Configurable HMAC skew** — the skew from `webhook_replay_skew_seconds` is
+3. **Local image pull policy** — `image_pull_policy` defaults to
+   `if-not-present` instead of `never`, so a freshly built worker image is
+   pulled if missing. Shown in the same applied-defaults line as the skew
+   default above.
+
+4. **Configurable HMAC skew** — the skew from `webhook_replay_skew_seconds` is
    now threaded into HMAC verification (previously hardcoded to 5 min), so the
    wider dev-mode window actually takes effect.
 
-4. **`secrets_dir` env-var fallback** — if the runner cannot write to
-   `secrets_dir` (e.g. a `systemctl --user` service on a read-only `/var/run`),
-   it falls back to delivering secrets as container env vars instead of a bind
-   mount, with a WARN:
-   `level=WARN msg="dev profile: secrets_dir not writable, falling back to env-var delivery" dir=... error=...`
-   Production mode still fails closed on this error.
+5. **Chat resume files staged in tmp** — when staging a chat session's
+   rehydration files, the runner first tries `secrets_dir` (default
+   `/var/run/cm-runner/secrets`). If that directory is not writable (e.g. a
+   `systemctl --user` service running as a regular user), dev mode falls back
+   to a subdir of the OS temp dir, with a WARN:
+   `level=WARN msg="dev profile: secrets_dir not writable, falling back to tmp for resume files" secrets_dir=... tmp_dir=... error=...`
+   The resume payload is operator-supplied transcript text, not a credential.
+   Production mode fails closed on this error instead.
+
+### Secrets delivery: bind mount vs. env var
+
+By default the runner stages the shared secrets file under `secrets_dir`
+(default `/var/run/cm-runner/secrets`, should be tmpfs) and bind-mounts it
+read-only into every worker at `/run/cm-secrets/`. Setting `secrets_dir` to an
+empty string switches the runner to **env-var delivery**: secrets are folded
+directly into each container's environment instead of a bind mount.
+
+This is selected by the empty config value at boot, not by a write failure, and
+it is **not** a dev-profile relaxation — it is reachable from any deployment.
+It is **unsupported in production**: secrets land in the container's
+`HostConfig.Env`, so `docker inspect` exposes them to anyone with read access to
+the daemon. `ApplyDefaults` seeds the default path, so a real production config
+never hits this fallback unless `secrets_dir` is explicitly cleared.
 
 ### Minimal dev-mode config
 
@@ -563,7 +584,11 @@ All webhooks are signed with HMAC-SHA256 using a shared secret.
 | CM → Runner | `POST /promote`           | Promote interactive session to autonomous                                                                   |
 | CM → Runner | `POST /end-session`       | Close container stdin so claude exits on EOF                                                                |
 | CM → Runner | `POST /refresh-knowledge` | Spawn a containerised knowledge-base refresh for the given repo. Synthetic tracker key `kb-refresh:<repo>`. |
-| Runner → CM | `POST /api/runner/status` | Report container status                                                                                     |
+| CM → Runner | `POST /chat/start`        | Start a long-lived chat container for a global chat session.                                                |
+| CM → Runner | `POST /chat/end`          | End a tracked chat container (close stdin, force-stop, drop tracker entry).                                 |
+| Runner → CM | `POST /api/runner/status`           | Report container status                                                                           |
+| Runner → CM | `POST /api/runner/skill-engaged`    | Report that the agent engaged a task skill                                                        |
+| Runner → CM | `POST /api/runner/knowledge-status` | Report knowledge-base refresh progress/result                                                     |
 
 Signatures: `X-Signature-256: sha256={hex}`, `X-Webhook-Timestamp: {unix-ts}`.
 HMAC is computed over `method + "\n" + uri + "\n" + timestamp + "." + body`,
@@ -601,7 +626,9 @@ non-zero exit), `completed` (clean exit).
 | POST   | `/promote`           | HMAC | Promote an interactive session to autonomous mode                                                                                                                                                                                                                                                                                          |
 | POST   | `/end-session`       | HMAC | Close stdin of an interactive container; claude exits on EOF                                                                                                                                                                                                                                                                               |
 | POST   | `/refresh-knowledge` | HMAC | Spawn a containerised knowledge-base refresh for the given repo. Synthetic tracker key `kb-refresh:<repo>`.                                                                                                                                                                                                                                |
-| GET    | `/logs`              | HMAC | SSE log stream for all active containers. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature.                                                                                                                                                                     |
+| POST   | `/chat/start`        | HMAC | Start a long-lived chat container for a global chat session (409 if the session already has a container, 429 when the chat concurrency cap is reached).                                                                                                                                                                                    |
+| POST   | `/chat/end`          | HMAC | End a tracked chat container: close stdin, force-stop, drop tracker entry (404 if no container is tracked).                                                                                                                                                                                                                                |
+| GET    | `/logs`              | HMAC | SSE log stream. Optional, mutually-exclusive query filters: `?project=<name>` (card-mode / project-scoped) or `?session_id=<id>` (chat-mode); supplying both is a 400, no filter streams every entry. Browser EventSource cannot send headers, so this endpoint must be proxied through a server that attaches the HMAC signature.         |
 | GET    | `/containers`        | HMAC | List currently-running worker containers. Returns `ListContainersResponse` (one entry per container with `container_id`, `card_id`, `project`, `state`, RFC3339 `started_at`, and a `tracked` flag). CM uses this to age-cap runaway containers and to detect tracker drift (`tracked=false` while `state="running"` indicates an orphan). |
 | GET    | `/health`            | none | Health check                                                                                                                                                                                                                                                                                                                               |
 | GET    | `/readyz`            | none | Readiness probe (503 during preflight or drain)                                                                                                                                                                                                                                                                                            |
