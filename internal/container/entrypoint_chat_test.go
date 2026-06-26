@@ -31,12 +31,12 @@ func TestEntrypoint_ChatModeBranch(t *testing.T) {
 	assert.Contains(t, src, "mkdir -p /home/user/workspace",
 		"entrypoint must create the home workspace before dispatch")
 
-	// Extract the entire chat-mode dispatch branch (the Four-way dispatch one,
+	// Extract the entire chat-mode dispatch branch (the Three-way dispatch one,
 	// not the early MCP header setup). Search for the dispatch comment marker
 	// to disambiguate the multiple CM_CHAT_SESSION checks.
-	dispatchMarker := `# Four-way dispatch:`
+	dispatchMarker := `# Three-way dispatch:`
 	dispatchIdx := strings.Index(src, dispatchMarker)
-	require.NotEqual(t, -1, dispatchIdx, "entrypoint.sh must contain the Four-way dispatch comment")
+	require.NotEqual(t, -1, dispatchIdx, "entrypoint.sh must contain the Three-way dispatch comment")
 
 	// Extract from the dispatch section onward (avoiding the early MCP header setup).
 	srcFromDispatch := src[dispatchIdx:]
@@ -62,9 +62,9 @@ func TestEntrypoint_ChatModeBranch(t *testing.T) {
 		"CM_CHAT_RESUME branch must reference the resume payload file")
 
 	// The extracted chat block must be correctly scoped: it must NOT leak into
-	// the sibling elif branch that handles knowledge-refresh mode.
-	require.NotContains(t, chatBranch, "knowledge-refresh",
-		"extracted chat block must not leak into the sibling elif branch")
+	// the sibling elif branch that handles HITL (interactive) mode.
+	require.NotContains(t, chatBranch, "ALLOWED_TOOLS_HITL",
+		"extracted chat block must not leak into the sibling HITL elif branch")
 }
 
 func TestEntrypoint_ChatModeValidation(t *testing.T) {

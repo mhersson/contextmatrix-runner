@@ -33,10 +33,8 @@ fi
 #
 #   ALLOWED_TOOLS_COMMON       — everything safe across all modes.
 #   ALLOWED_TOOLS_AUTO_EXTRAS  — autonomous-task-mode additions (Task).
-#   ALLOWED_TOOLS_KB           — knowledge-refresh mode (built inline below):
-#                                COMMON + Task + KB-specific MCP tools.
 #
-# Why three axes (HITL vs autonomous vs knowledge-refresh):
+# Why two axes (HITL vs autonomous):
 #   HITL (interactive task mode): Task (sub-agents) excluded — the user
 #     expects to review every change before a commit lands. Sub-agents
 #     making autonomous commits during an interactive session would bypass
@@ -45,12 +43,6 @@ fi
 #     top-level agent is already committing without human review, so
 #     sub-agents doing the same is fine and lets the orchestrator
 #     parallelise research/subtasks.
-#   Knowledge-refresh: Task included — the refresh-knowledge skill spawns
-#     one sub-agent per doc by design (parallel doc generation), and the
-#     only write surface is commit_knowledge_docs which is server-side
-#     atomic. The skill never pushes or opens PRs against the cloned
-#     target repo, so sub-agents cannot land code changes from inside
-#     the container.
 #
 # Destructive ContextMatrix RPCs (delete_project, update_project) are
 # excluded in all modes — nothing spawned in a worker needs those.
@@ -81,7 +73,6 @@ ALLOWED_TOOLS_COMMON=(
   "mcp__contextmatrix__complete_task"
   "mcp__contextmatrix__create_card"
   "mcp__contextmatrix__get_card"
-  "mcp__contextmatrix__get_knowledge_base"
   "mcp__contextmatrix__get_ready_tasks"
   "mcp__contextmatrix__get_skill"
   "mcp__contextmatrix__get_subtask_summary"
@@ -89,10 +80,8 @@ ALLOWED_TOOLS_COMMON=(
   "mcp__contextmatrix__heartbeat"
   "mcp__contextmatrix__increment_review_attempts"
   "mcp__contextmatrix__list_cards"
-  "mcp__contextmatrix__list_knowledge_bases"
   "mcp__contextmatrix__list_projects"
   "mcp__contextmatrix__promote_to_autonomous"
-  "mcp__contextmatrix__read_knowledge_doc"
   "mcp__contextmatrix__recalculate_costs"
   "mcp__contextmatrix__release_card"
   "mcp__contextmatrix__report_push"
@@ -195,49 +184,11 @@ mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 # Validate CM_CARD_ID early — we interpolate it into prompts and container logs.
 # Use `case` (whole-string match) rather than grep (line-oriented) so embedded
 # newline/CR/NUL bytes fall into the reject pattern.
-# Skip in knowledge-refresh mode: no card ID is set; the runner uses a synthetic
-# kb-refresh:<repo> key internally but does not pass it as CM_CARD_ID.
-if [ "${CM_MODE:-}" != "knowledge-refresh" ]; then
-  if [ -n "${CM_CARD_ID:-}" ]; then
-    case "$CM_CARD_ID" in
-      -* | *[!A-Za-z0-9._-]*)
-        echo "ERROR: invalid CM_CARD_ID" >&2
-        exit 1
-        ;;
-    esac
-  fi
-fi
-
-if [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
-  case "${CM_PROJECT:-}" in
-    "" | -* | *[!A-Za-z0-9._-]*)
-      echo "ERROR: invalid CM_PROJECT for knowledge-refresh mode" >&2
+if [ -n "${CM_CARD_ID:-}" ]; then
+  case "$CM_CARD_ID" in
+    -* | *[!A-Za-z0-9._-]*)
+      echo "ERROR: invalid CM_CARD_ID" >&2
       exit 1
-      ;;
-  esac
-  case "${CM_KB_REPO:-}" in
-    "" | -* | *[!A-Za-z0-9._-]*)
-      echo "ERROR: invalid CM_KB_REPO for knowledge-refresh mode" >&2
-      exit 1
-      ;;
-  esac
-  case "${CM_AGENT_ID:-}" in
-    human:?*) ;;
-    *)
-      echo "ERROR: CM_AGENT_ID must start with human: and have a non-empty suffix in knowledge-refresh mode" >&2
-      exit 1
-      ;;
-  esac
-  # Defence-in-depth: webhook validator already enforces the doc allowlist,
-  # but if a future caller sets this env var directly (skipping the webhook
-  # path), the value would otherwise interpolate unchecked into the prompt.
-  # Empty value is permitted — most refresh runs have no overwrite_docs.
-  case "${CM_KB_OVERWRITE_DOCS:-}" in
-    "" | -* | *[!A-Za-z0-9._,-]*)
-      if [ -n "${CM_KB_OVERWRITE_DOCS:-}" ]; then
-        echo "ERROR: CM_KB_OVERWRITE_DOCS contains invalid characters" >&2
-        exit 1
-      fi
       ;;
   esac
 fi
@@ -418,11 +369,10 @@ unset CM_GIT_TOKEN CM_MCP_API_KEY
 # Space-separated allowlist passed via a single --allowed-tools flag, per
 # `claude --help`: "--allowedTools, --allowed-tools <tools...>  Comma or
 # space-separated list of tool names to allow (e.g. \"Bash Edit\")".
-# Four-way dispatch:
+# Three-way dispatch:
 #   1. chat (CM_CHAT_SESSION set) — non-card-bound interactive session.
-#   2. knowledge-refresh — KB refresh mode with its own tool allowlist and prompt.
-#   3. HITL (CM_INTERACTIVE=1) — common list only; sub-agents excluded.
-#   4. autonomous (default) — common list + Task sub-agent spawning.
+#   2. HITL (CM_INTERACTIVE=1) — common list only; sub-agents excluded.
+#   3. autonomous (default) — common list + Task sub-agent spawning.
 if [ -n "${CM_CHAT_SESSION:-}" ]; then
   # Chat mode — non-card-bound interactive session.
   # /home/user/workspace is already created+cd'd above; chat sub-clones land
@@ -462,36 +412,6 @@ if [ -n "${CM_CHAT_SESSION:-}" ]; then
     --permission-prompt-tool mcp__contextmatrix__permission_prompt \
     -- \
     "Chat session ${CM_CHAT_SESSION}. Wait for the operator's first message."
-elif [ "${CM_MODE:-}" = "knowledge-refresh" ]; then
-  ALLOWED_TOOLS_KB=("${ALLOWED_TOOLS_COMMON[@]}"
-    "Task"
-    "mcp__contextmatrix__refresh_knowledge_base"
-    "mcp__contextmatrix__commit_knowledge_docs"
-    "mcp__contextmatrix__update_refresh_progress")
-
-  echo "Starting Claude Code in knowledge-refresh mode for ${CM_PROJECT}/${CM_KB_REPO}..."
-  exec claude -p \
-    --thinking adaptive --thinking-display summarized \
-    --model "${CM_ORCHESTRATOR_MODEL:-claude-sonnet-4-6}" \
-    --output-format stream-json --verbose \
-    --allowed-tools "${ALLOWED_TOOLS_KB[*]}" \
-    --permission-prompt-tool mcp__contextmatrix__permission_prompt \
-    -- \
-    "You are running inside a contextmatrix-runner container in knowledge-refresh mode.
-
-Steps:
-1. Call get_skill(skill_name='refresh-knowledge', caller_model='sonnet')
-2. Follow the returned skill instructions exactly.
-   - project: ${CM_PROJECT}
-   - repo: ${CM_KB_REPO}
-   - target repo working tree: /home/user/workspace (already cloned)
-   - confirmed overwrite_docs: ${CM_KB_OVERWRITE_DOCS}
-   - agent_id for all MCP calls: ${CM_AGENT_ID}
-
-IMPORTANT:
-- Interact with the ContextMatrix board only through the contextmatrix MCP
-  tools — never call the CM REST API directly (no curl/wget/HTTP clients).
-- Do not modify the target repo working tree."
 elif [ "${CM_INTERACTIVE:-}" = "1" ]; then
   ALLOWED_TOOLS_HITL=("${ALLOWED_TOOLS_COMMON[@]}")
   echo "Starting Claude Code for card ${CM_CARD_ID}..."

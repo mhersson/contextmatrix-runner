@@ -48,7 +48,7 @@ lint:
 	golangci-lint run
 
 lint-sh:
-	shellcheck svc.sh docker/entrypoint.sh
+	shellcheck -x svc.sh docker/entrypoint.sh
 
 # Run the same supply-chain scan CI runs so developers can catch
 # vulnerabilities locally before pushing.
