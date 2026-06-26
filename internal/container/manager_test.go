@@ -105,7 +105,6 @@ func testPATProvider(t *testing.T) githubauth.TokenGenerator {
 
 func testPayload() RunConfig {
 	return RunConfig{
-		Mode:    ModeTask,
 		CardID:  "PROJ-042",
 		Project: "my-project",
 		RepoURL: "https://github.com/org/repo.git",
@@ -1467,7 +1466,7 @@ func (s *spyWriteCloser) Write(p []byte) (int, error) {
 // TestBuildPrimingContent verifies the priming content helper directly.
 func TestBuildPrimingContent(t *testing.T) {
 	t.Run("without base branch", func(t *testing.T) {
-		payload := RunConfig{Mode: ModeTask, CardID: "PROJ-123", Project: "myproj"}
+		payload := RunConfig{CardID: "PROJ-123", Project: "myproj"}
 		content := buildPrimingContent(payload)
 		assert.Contains(t, content, "PROJ-123")
 		assert.Contains(t, content, "get_skill(skill_name='create-plan'")
@@ -1476,7 +1475,7 @@ func TestBuildPrimingContent(t *testing.T) {
 	})
 
 	t.Run("with base branch", func(t *testing.T) {
-		payload := RunConfig{Mode: ModeTask, CardID: "PROJ-456", Project: "myproj", BaseBranch: "main"}
+		payload := RunConfig{CardID: "PROJ-456", Project: "myproj", BaseBranch: "main"}
 		content := buildPrimingContent(payload)
 		assert.Contains(t, content, "PROJ-456")
 		assert.Contains(t, content, "get_skill(skill_name='create-plan'")

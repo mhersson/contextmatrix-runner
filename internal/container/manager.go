@@ -45,15 +45,6 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
-// Mode selects the entrypoint dispatch path inside the container.
-type Mode string
-
-const (
-	// ModeTask is the default — card execution. Callers must set this
-	// explicitly; the empty zero-value is not treated as a valid mode.
-	ModeTask Mode = "task"
-)
-
 // RunConfig holds the parameters needed to start a container.
 // This mirrors the webhook TriggerPayload but avoids an import cycle.
 type RunConfig struct {
@@ -72,10 +63,6 @@ type RunConfig struct {
 	// set is explicit. The entrypoint uses CM_TASK_SKILLS_SET to distinguish
 	// the two cases.
 	TaskSkills *[]string
-
-	// Mode selects the entrypoint dispatch. Must be set explicitly to ModeTask;
-	// the empty zero-value is invalid.
-	Mode Mode
 }
 
 const (
@@ -590,22 +577,6 @@ func (m *Manager) Wait() {
 // soon as startContainer succeeds so the outer Run's deferred panic recovery
 // can see the ID even before tracker.UpdateContainerID has been called.
 func (m *Manager) run(ctx context.Context, payload RunConfig, containerIDOut *string) string {
-	// RunConfig.Mode is mandatory: with an empty Mode the entrypoint takes
-	// the wrong dispatch path. Reject early so a misconfigured caller fails
-	// loudly instead of spawning a half-configured container.
-	if payload.Mode == "" {
-		m.logger.Error("RunConfig.Mode is required",
-			"card_id", payload.CardID, "project", payload.Project)
-
-		cbCtx, cancel := withCleanupTimeout(ctx)
-		defer cancel()
-
-		m.reportFailure(cbCtx, payload, "internal error: RunConfig.Mode is required")
-		m.tracker.Remove(payload.Project, payload.CardID)
-
-		return metrics.OutcomeFailure
-	}
-
 	log := m.logger.With("card_id", payload.CardID, "project", payload.Project)
 
 	containerID, _, secretValues, err := m.startContainer(ctx, payload)

@@ -313,7 +313,6 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.manager.Run(ctx, container.RunConfig{
-		Mode:          container.ModeTask,
 		CardID:        payload.CardID,
 		Project:       payload.Project,
 		RepoURL:       payload.RepoURL,

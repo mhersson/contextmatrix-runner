@@ -157,7 +157,6 @@ func TestSecretsDelivered_EnvVarMode_IntegrationStartContainer(t *testing.T) {
 	m := NewManager(mock, tr, nil, testPATProvider(t), nil, envCfg, testLogger())
 
 	payload := RunConfig{
-		Mode:    ModeTask,
 		CardID:  "TEST-042",
 		Project: "envvar-proj",
 		RepoURL: "https://github.com/org/repo.git",

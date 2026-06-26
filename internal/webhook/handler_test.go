@@ -722,7 +722,6 @@ func TestHandleTrigger_InteractivePropagated(t *testing.T) {
 			case cfg := <-fake.runCh:
 				assert.Equal(t, tt.interactive, cfg.Interactive)
 				assert.Equal(t, testMCPURL, cfg.MCPURL, "handler must inject config-derived MCP URL, not payload")
-				assert.Equal(t, container.ModeTask, cfg.Mode, "trigger handler must set Mode=ModeTask explicitly")
 			case <-time.After(5 * time.Second):
 				t.Fatal("timed out waiting for Run to be called")
 			}
