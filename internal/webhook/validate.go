@@ -173,9 +173,8 @@ func validateContent(v string) error {
 // newlines or NUL bytes via the Authorization header.
 const maxMCPAPIKeyBytes = 1024
 
-// validateMCPAPIKey is the shared check used by /trigger, /chat/start and
-// /refresh-knowledge. Empty is allowed — CM may run without MCP auth in
-// loopback dev mode.
+// validateMCPAPIKey is the shared check used by /trigger and /chat/start.
+// Empty is allowed — CM may run without MCP auth in loopback dev mode.
 func validateMCPAPIKey(v string) error {
 	if v == "" {
 		return nil
@@ -259,8 +258,7 @@ func ValidateTaskSkills(skills []string) error {
 // dedicated Validate<Foo> helper. Calling the helper directly from the
 // handler bypasses ValidatePayload, which is the single entry point for the
 // payload-validation surface — bypassing it splits the dispatch into two
-// inconsistent code paths and is the class of mistake that hid a missing
-// validator on /refresh-knowledge for one release cycle (Fix W2 in REVIEW.md).
+// inconsistent code paths (Fix W2 in REVIEW.md).
 func ValidatePayload(p any) error {
 	switch v := p.(type) {
 	case *TriggerPayload:
@@ -334,15 +332,6 @@ func ValidatePayload(p any) error {
 		return validateChatEnd(v)
 	case ChatEndPayload:
 		return validateChatEnd(&v)
-
-	case *RefreshKnowledgePayload:
-		if v == nil {
-			return nil
-		}
-
-		return ValidateRefreshKnowledge(v)
-	case RefreshKnowledgePayload:
-		return ValidateRefreshKnowledge(&v)
 
 	default:
 		// Loud failure on unknown payload types so a registration mistake
@@ -607,104 +596,4 @@ func validateChatResume(r *ChatResumeContext) error {
 
 func validateChatEnd(p *ChatEndPayload) error {
 	return validateIdent("session_id", p.SessionID)
-}
-
-// agentIDSuffixRE bounds the suffix after the "human:" prefix on agent_id so
-// downstream env injection cannot pass arbitrary control bytes or argv flags.
-// Same shape as identRE; documented separately for clarity at the call site.
-var agentIDSuffixRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
-
-// ValidateRefreshKnowledge mirrors ValidatePayload's rules for the refresh
-// webhook: project + repo + https repo URL + human-prefixed agent_id.
-// overwrite_docs is optional; if present, every entry must be a known KB
-// doc filename to prevent the runner-side allowlist from being bypassed.
-//
-// All rejections are returned as *ValidationError so writeValidationError can
-// surface the field-name diagnostic ("invalid project", etc.). A raw
-// fmt.Errorf would degrade to "invalid payload" through the type assertion.
-func ValidateRefreshKnowledge(p *RefreshKnowledgePayload) error {
-	if p == nil {
-		return &ValidationError{Field: "payload", Reason: "required"}
-	}
-
-	if err := validateIdent("project", p.Project); err != nil {
-		return err
-	}
-
-	// Repo follows the same shape as project/card_id: alphanumeric plus
-	// '.', '_', '-'. It flows through to CM_KB_REPO and into the synthetic
-	// tracker key "kb-refresh:<repo>", so a charset escape would leak into
-	// container env and tracker keys.
-	if err := validateIdent("repo", p.Repo); err != nil {
-		return err
-	}
-
-	if p.RepoURL == "" {
-		return &ValidationError{Field: "repo_url", Reason: "required"}
-	}
-
-	if !strings.HasPrefix(p.RepoURL, "https://") {
-		return &ValidationError{Field: "repo_url", Reason: "must be https://"}
-	}
-
-	if err := validateRepoURL(p.RepoURL); err != nil {
-		return err
-	}
-
-	if err := validateBaseBranch(p.BaseBranch); err != nil {
-		return err
-	}
-
-	if !strings.HasPrefix(p.AgentID, "human:") {
-		return &ValidationError{Field: "agent_id", Reason: `must start with "human:"`}
-	}
-
-	// Tighten past the prefix: reject control bytes and limit charset on the
-	// suffix so the full agent_id is safe as a container env value.
-	suffix := strings.TrimPrefix(p.AgentID, "human:")
-	if suffix == "" {
-		return &ValidationError{Field: "agent_id", Reason: "suffix required after human:"}
-	}
-
-	if containsCtlBytes(suffix) {
-		return &ValidationError{Field: "agent_id", Reason: "control bytes not allowed"}
-	}
-
-	if !agentIDSuffixRE.MatchString(suffix) {
-		return &ValidationError{Field: "agent_id", Reason: "suffix must match " + agentIDSuffixRE.String()}
-	}
-
-	for _, d := range p.OverwriteDocs {
-		if !isKnownKBDoc(d) {
-			return &ValidationError{Field: "overwrite_docs", Reason: "entry is not a known KB doc"}
-		}
-	}
-
-	// Model is optional; when present, must match the chat-model allowlist
-	// pattern. Value flows into `claude --model "${CM_ORCHESTRATOR_MODEL}"`
-	// inside the worker container. Keep the validator in lockstep with the
-	// /trigger and /chat/start surface.
-	if p.Model != "" && !chatModelPattern.MatchString(p.Model) {
-		return &ValidationError{
-			Field:  "model",
-			Reason: "must match " + chatModelPattern.String(),
-		}
-	}
-
-	if err := validateMCPAPIKey(p.MCPAPIKey); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// isKnownKBDoc enumerates the v1 doc set. Update if the spec adds docs.
-func isKnownKBDoc(name string) bool {
-	switch name {
-	case "architecture.md", "code-structure.md",
-		"api-documentation.md", "glossary.md":
-		return true
-	}
-
-	return false
 }

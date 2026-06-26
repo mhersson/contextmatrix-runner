@@ -127,7 +127,6 @@ func TestNormalizeEndpoint_Allowlist(t *testing.T) {
 		"/message",
 		"/promote",
 		"/end-session",
-		"/refresh-knowledge",
 		"/chat/start",
 		"/chat/end",
 		"/logs",

@@ -37,9 +37,8 @@ const (
 // Callback request bodies are defined in contextmatrix-protocol; aliased
 // so call sites and tests keep compiling unchanged.
 type (
-	statusRequest          = protocol.StatusCallbackPayload
-	skillEngagedRequest    = protocol.SkillEngagedPayload
-	KnowledgeStatusRequest = protocol.KnowledgeStatusPayload
+	statusRequest       = protocol.StatusCallbackPayload
+	skillEngagedRequest = protocol.SkillEngagedPayload
 )
 
 // Client sends signed status callbacks to ContextMatrix.
@@ -306,109 +305,6 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 	return fmt.Errorf("skill-engaged callback failed after %d attempts: %w", maxRetries, lastErr)
 }
 
-// KnowledgeStatus posts the runner's terminal callback for a knowledge-refresh
-// job. Same HMAC scheme and retry policy as ReportStatus / ReportSkillEngaged.
-func (c *Client) KnowledgeStatus(ctx context.Context, req KnowledgeStatusRequest) error {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal knowledge-status: %w", err)
-	}
-
-	uri, err := callbackKnowledgeStatusURI(c.contextMatrixURL)
-	if err != nil {
-		return err
-	}
-
-	var lastErr error
-
-	for attempt := range maxRetries {
-		// Each retry uses a fresh ts (and a fresh HMAC signature), so the
-		// receiver's replay cache treats each attempt as a distinct
-		// request and does not self-409 the retry.
-		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, uri, body, ts)
-
-		reqURL := c.contextMatrixURL + "/api/runner/knowledge-status"
-
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
-		if err != nil {
-			return fmt.Errorf("create knowledge-status request: %w", err)
-		}
-
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set(protocol.SignatureHeader, "sha256="+signature)
-		httpReq.Header.Set(protocol.TimestampHeader, ts)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			lastErr = fmt.Errorf("send knowledge-status request: %w", err)
-		} else {
-			func() {
-				defer func() { _ = resp.Body.Close() }()
-
-				respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-				if readErr != nil {
-					lastErr = fmt.Errorf("read knowledge-status response: %w", readErr)
-
-					return
-				}
-
-				if resp.StatusCode >= 400 {
-					lastErr = newError(reqURL, resp.StatusCode, respBody)
-				} else {
-					lastErr = nil
-				}
-			}()
-		}
-
-		if lastErr == nil {
-			return nil
-		}
-
-		if isClientError(lastErr) {
-			return lastErr
-		}
-
-		c.logger.Warn("knowledge-status callback failed, retrying",
-			"attempt", attempt+1,
-			"project", req.Project,
-			"repo", req.Repo,
-			"error", lastErr.Error(),
-		)
-
-		if c.metrics != nil {
-			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointKnowledgeStatus).Inc()
-		}
-
-		// Skip the backoff on the final attempt — the loop is about to exit
-		// regardless of how long we wait. Without this, a maxRetries=3 run
-		// burns ~4s on a stopped timer before returning the failure. Fix
-		// W6 in REVIEW.md.
-		if attempt == maxRetries-1 {
-			break
-		}
-
-		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does
-		// not leak the timer. backoff is per-attempt, so declaring the
-		// timer inside the loop body is correct — each attempt gets a
-		// fresh timer. Under Go 1.23+ the runtime GC's a stopped timer
-		// even if its channel was not drained after Stop returns false,
-		// so no manual drain is needed.
-		backoff := time.Duration(1<<uint(attempt)) * time.Second
-		timer := time.NewTimer(backoff)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-
-	return fmt.Errorf("knowledge-status callback failed after %d attempts: %w", maxRetries, lastErr)
-}
-
 // Ping checks that ContextMatrix is reachable at the configured URL via a
 // TCP dial to host:port. The runner does not assume CM exposes a dedicated
 // readiness endpoint (and several deployments rewrite /api/* paths at an
@@ -475,7 +371,7 @@ type cardResponse struct {
 //
 // Transient errors (5xx, connection reset, etc.) are retried up to
 // maxRetries times with exponential backoff, mirroring ReportStatus /
-// ReportSkillEngaged / KnowledgeStatus. A 4xx response is non-retryable
+// ReportSkillEngaged. A 4xx response is non-retryable
 // (isClientError short-circuits) and returns immediately. Fix W2 in
 // REVIEW.md: the pre-fix VerifyAutonomous failed-closed on the first
 // transient error, which propagated as a 502 to CM even when a single
@@ -665,12 +561,6 @@ func callbackSkillEngagedURI(contextMatrixURL string) (string, error) {
 	return deriveURI(contextMatrixURL + "/api/runner/skill-engaged")
 }
 
-// callbackKnowledgeStatusURI returns the request-target of the CM
-// /api/runner/knowledge-status endpoint, derived from the configured base URL.
-func callbackKnowledgeStatusURI(contextMatrixURL string) (string, error) {
-	return deriveURI(contextMatrixURL + "/api/runner/knowledge-status")
-}
-
 // verifyAutonomousURI returns the request-target of the constructed
 // /autonomous verify URL.
 func verifyAutonomousURI(reqURL string) (string, error) {
@@ -795,11 +685,10 @@ func endpointLabel(status string) string {
 }
 
 // Endpoint labels for cmr_callback_retries_total on the skill-engaged and
-// knowledge-status callbacks. Kept as constants so the label set stays
+// verify-autonomous callbacks. Kept as constants so the label set stays
 // closed and matches what dashboards key on.
 const (
-	endpointSkillEngaged    = "skill_engaged"
-	endpointKnowledgeStatus = "knowledge_status"
+	endpointSkillEngaged = "skill_engaged"
 	// endpointVerifyAutonomous labels retries of the read-only
 	// VerifyAutonomous GET so transient CM failures (a brief 5xx or a
 	// connection reset) show up in the same cmr_callback_retries_total
