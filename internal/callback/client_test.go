@@ -591,41 +591,9 @@ func TestClient_ReportSkillEngaged(t *testing.T) {
 	assert.Contains(t, string(receivedBody), `"skill_name":"go-development"`)
 }
 
-func TestClient_KnowledgeStatus_PostsSignedRequest(t *testing.T) {
-	var (
-		received KnowledgeStatusRequest
-		rawBody  []byte
-	)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPost, r.Method)
-		assert.Equal(t, "/api/runner/knowledge-status", r.URL.Path)
-		assert.NotEmpty(t, r.Header.Get(protocol.SignatureHeader))
-		assert.NotEmpty(t, r.Header.Get(protocol.TimestampHeader))
-
-		rawBody, _ = io.ReadAll(r.Body)
-		assert.NoError(t, json.Unmarshal(rawBody, &received))
-
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer srv.Close()
-
-	c := NewClient(srv.URL, "secret-key-that-is-at-least-32-chars-long", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	require.NoError(t, c.KnowledgeStatus(context.Background(), KnowledgeStatusRequest{
-		Project: "p", Repo: "r", State: "succeeded",
-	}))
-	assert.Equal(t, "succeeded", received.State)
-	assert.Equal(t, "p", received.Project)
-	assert.Equal(t, "r", received.Repo)
-	assert.NotContains(t, string(rawBody), "commit_sha",
-		"marshalled body must not contain commit_sha field")
-}
-
 // TestReportSkillEngaged_ServerError_IncrementsRetryMetric pins the
 // cmr_callback_retries_total counter to the skill-engaged endpoint label
-// on retries. Asymmetric metric coverage across the three callback
-// methods previously left skill-engaged and knowledge-status invisible to
-// dashboards.
+// on retries.
 func TestReportSkillEngaged_ServerError_IncrementsRetryMetric(t *testing.T) {
 	var calls atomic.Int32
 
@@ -650,37 +618,6 @@ func TestReportSkillEngaged_ServerError_IncrementsRetryMetric(t *testing.T) {
 
 	got := labelledCounterValue(t, mx, "cmr_callback_retries_total", "skill_engaged")
 	assert.InDelta(t, 2.0, got, 0, "two retries (first two attempts failed) must increment the skill_engaged label")
-}
-
-// TestKnowledgeStatus_ServerError_IncrementsRetryMetric mirrors the
-// skill-engaged assertion above against the knowledge-status endpoint
-// label.
-func TestKnowledgeStatus_ServerError_IncrementsRetryMetric(t *testing.T) {
-	var calls atomic.Int32
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := calls.Add(1)
-		if n < 3 {
-			w.WriteHeader(http.StatusInternalServerError)
-
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer srv.Close()
-
-	mx := metrics.New()
-	client := NewClient(srv.URL, "test-secret-key-that-is-long-enough", testLogger()).WithMetrics(mx)
-
-	require.NoError(t, client.KnowledgeStatus(context.Background(), KnowledgeStatusRequest{
-		Project: "p", Repo: "r", State: "succeeded",
-	}))
-	assert.Equal(t, int32(3), calls.Load(), "should retry on 5xx")
-
-	got := labelledCounterValue(t, mx, "cmr_callback_retries_total", "knowledge_status")
-	assert.InDelta(t, 2.0, got, 0, "two retries must increment the knowledge_status label")
 }
 
 // TestVerifyAutonomous_BearerFallback_IncrementsCounter pins the
@@ -874,18 +811,30 @@ func TestIsClientError_TreatsCtxErrorsAsTerminal(t *testing.T) {
 	}{
 		{"raw context.Canceled", context.Canceled, true},
 		{"raw context.DeadlineExceeded", context.DeadlineExceeded, true},
-		{"wrapped context.Canceled",
-			&wrappedErr{inner: context.Canceled}, true},
-		{"wrapped context.DeadlineExceeded",
-			&wrappedErr{inner: context.DeadlineExceeded}, true},
-		{"4xx Error stays a client error",
-			newError("https://host.example/x", http.StatusBadRequest, []byte("bad")), true},
-		{"5xx Error is not a client error",
-			newError("https://host.example/x", http.StatusInternalServerError, []byte("oops")), false},
-		{"unrelated error",
-			io.ErrUnexpectedEOF, false},
-		{"nil",
-			nil, false},
+		{
+			"wrapped context.Canceled",
+			&wrappedErr{inner: context.Canceled}, true,
+		},
+		{
+			"wrapped context.DeadlineExceeded",
+			&wrappedErr{inner: context.DeadlineExceeded}, true,
+		},
+		{
+			"4xx Error stays a client error",
+			newError("https://host.example/x", http.StatusBadRequest, []byte("bad")), true,
+		},
+		{
+			"5xx Error is not a client error",
+			newError("https://host.example/x", http.StatusInternalServerError, []byte("oops")), false,
+		},
+		{
+			"unrelated error",
+			io.ErrUnexpectedEOF, false,
+		},
+		{
+			"nil",
+			nil, false,
+		},
 	}
 
 	for _, c := range cases {

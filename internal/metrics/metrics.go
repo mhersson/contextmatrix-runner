@@ -75,21 +75,20 @@ const (
 // there, add it here too or it will show up as "other" in metrics and
 // traces.
 var endpointAllowlist = map[string]struct{}{
-	"/trigger":           {},
-	"/kill":              {},
-	"/stop-all":          {},
-	"/message":           {},
-	"/promote":           {},
-	"/end-session":       {},
-	"/refresh-knowledge": {},
-	"/chat/start":        {},
-	"/chat/end":          {},
-	"/logs":              {},
-	"/containers":        {},
-	"/health":            {},
-	"/readyz":            {},
-	"/metrics":           {},
-	"/ready":             {},
+	"/trigger":     {},
+	"/kill":        {},
+	"/stop-all":    {},
+	"/message":     {},
+	"/promote":     {},
+	"/end-session": {},
+	"/chat/start":  {},
+	"/chat/end":    {},
+	"/logs":        {},
+	"/containers":  {},
+	"/health":      {},
+	"/readyz":      {},
+	"/metrics":     {},
+	"/ready":       {},
 }
 
 // NormalizeEndpoint collapses an arbitrary request path to one of the
