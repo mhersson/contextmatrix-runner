@@ -314,9 +314,9 @@ func main() {
 	}()
 
 	// Background maintenance loop: periodically sweeps orphaned worker
-	// containers and prunes dangling images. Closes the M12 gap where
-	// CleanupOrphans only ran once at startup and the image cache grew
-	// unbounded across worker-image upgrades.
+	// containers and prunes dangling images. Running it periodically (not
+	// just once at startup) keeps the image cache from growing unbounded
+	// across worker-image upgrades.
 	//
 	// Same respawn-on-panic discipline as the dockerd monitor — the
 	// maintenance loop must keep ticking even if a single Docker SDK call
@@ -574,8 +574,8 @@ func shutdown(d shutdownDeps) {
 	// We use a top-level shutdownCtx for the manager-drain wait below, but
 	// each per-container callback gets its own bounded context so one slow
 	// ContextMatrix response cannot drain the budget for the rest of the
-	// fleet — previously a single 30 s ReportStatus could starve the
-	// remaining containers' status callbacks.
+	// fleet — without the per-container bound a single 30 s ReportStatus
+	// would starve the remaining containers' status callbacks.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), managerDrainTimeout)
 	defer shutdownCancel()
 

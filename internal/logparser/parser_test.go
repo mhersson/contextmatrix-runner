@@ -333,9 +333,9 @@ func TestRedact(t *testing.T) {
 			want:  "Authorization: [REDACTED]",
 		},
 		{
-			// Regression: base64-padded Bearer tokens used to slip through
-			// because '=' was missing from the character class. The redactor
-			// must mask the entire opaque token including any '=' padding.
+			// Regression: a base64-padded Bearer token would slip through if
+			// '=' were missing from the character class. The redactor must
+			// mask the entire opaque token including any '=' padding.
 			name:  "Bearer token with base64 padding",
 			input: "Authorization: Bearer dGVzdHRlc3R0ZXN0dGVzdHRlc3R0ZXN0==",
 			want:  "Authorization: [REDACTED]",
@@ -1010,13 +1010,12 @@ func TestProcessStream_FinalLineNoNewline(t *testing.T) {
 }
 
 // TestProcessStream_OversizedLine_ParsesSuccessfully verifies that a single
-// stream-json line larger than the legacy bufio.Scanner cap (1 MiB) is
-// processed normally instead of terminating the parser. The previous
-// behaviour silently dropped the rest of Claude's output and emitted a
-// "scan terminated" system LogEntry; with the bufio.Reader swap a long
-// thinking block parses through.
+// stream-json line larger than bufio.Scanner's 1 MiB cap is processed
+// normally instead of terminating the parser. bufio.Reader parses a long
+// thinking block through; a Scanner-based parser would silently drop the
+// rest of Claude's output and emit a "scan terminated" system LogEntry.
 func TestProcessStream_OversizedLine_ParsesSuccessfully(t *testing.T) {
-	// 2 MiB > the old 1 MiB scanner cap; with bufio.Scanner this would
+	// 2 MiB > bufio.Scanner's 1 MiB cap; with bufio.Scanner this would
 	// have surfaced as bufio.ErrTooLong instead of the parsed thinking
 	// block we expect.
 	longThinking := strings.Repeat("x", 2*1024*1024)

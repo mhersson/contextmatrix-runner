@@ -241,8 +241,8 @@ func TestVerifyAutonomous_False(t *testing.T) {
 }
 
 func TestVerifyAutonomous_ServerError(t *testing.T) {
-	// 5xx → (false, err); caller must not write stdin. After Fix W2 the
-	// VerifyAutonomous call retries transient 5xxs maxRetries times before
+	// 5xx → (false, err); caller must not write stdin. VerifyAutonomous
+	// retries transient 5xxs maxRetries times before
 	// failing; this test asserts every attempt fires (so a regression to
 	// a single-shot path would also fail here) and that the final error
 	// still carries the upstream status.
@@ -281,8 +281,8 @@ func TestVerifyAutonomous_NotFound(t *testing.T) {
 
 // TestVerifyAutonomous_HMACSigned confirms the default auth mode: the
 // request carries HMAC headers (X-Signature-256 + X-Webhook-Timestamp)
-// and NO `Authorization: Bearer`. This is the fix for H10
-// (apiKey-triple-purpose Bearer leakage).
+// and NO `Authorization: Bearer`: sending the apiKey as a Bearer token would
+// leak the triple-purpose secret.
 func TestVerifyAutonomous_HMACSigned(t *testing.T) {
 	apiKey := "test-secret-key-that-is-long-enough"
 
@@ -336,7 +336,7 @@ func TestVerifyAutonomous_HMACSigned_RejectsMissingHeaders(t *testing.T) {
 }
 
 // TestVerifyAutonomous_PathEscaping verifies that project and cardID are
-// url.PathEscape'd unconditionally (REVIEW.md M27). The project contains
+// url.PathEscape'd unconditionally. The project contains
 // a space and the cardID contains a slash, both of which would otherwise
 // produce a malformed URL or a path-traversal vector.
 func TestVerifyAutonomous_PathEscaping(t *testing.T) {
@@ -360,9 +360,9 @@ func TestVerifyAutonomous_PathEscaping(t *testing.T) {
 }
 
 // TestVerifyAutonomous_BearerFallbackWhenDisabled verifies that disabling
-// the HMAC flag restores the legacy Bearer behaviour so the runner stays
-// compatible with a CM server that has not yet rolled the HMAC change.
-// No HMAC headers must be sent in this mode.
+// the HMAC flag makes the runner use the Bearer fallback so it stays
+// compatible with a CM server that does not accept HMAC. No HMAC headers
+// must be sent in this mode.
 func TestVerifyAutonomous_BearerFallbackWhenDisabled(t *testing.T) {
 	apiKey := "test-secret-key-that-is-long-enough"
 
@@ -495,10 +495,10 @@ func TestPing_InvalidURL(t *testing.T) {
 }
 
 // TestRetryLoop_TimerStopOnCtx verifies that cancelling ctx mid-backoff
-// returns promptly and does not leak the per-attempt Timer. Under the old
-// time.After-based loop the Timer kept a reference into the runtime heap
-// until it fired (up to 4s later on the last attempt) so a burst of
-// cancelled callbacks would pile up unreachable Timers.
+// returns promptly and does not leak the per-attempt Timer. A time.After-based
+// loop would keep the Timer referenced in the runtime heap until it fired
+// (up to 4s later on the last attempt), so a burst of cancelled callbacks
+// would pile up unreachable Timers.
 //
 // The test kicks off a ReportStatus against a server that always 500s,
 // then cancels the ctx just as the first backoff starts. We assert two
@@ -751,7 +751,7 @@ func TestVerifyAutonomous_BearerFallback_NilMetricsSafe(t *testing.T) {
 	assert.False(t, autonomous)
 }
 
-// TestSanitizeURLForError_StripsUserinfo pins Fix W4: a misconfigured base
+// TestSanitizeURLForError_StripsUserinfo pins the rule that a misconfigured base
 // URL with embedded credentials (https://user:token@host/path) must NEVER
 // leak the userinfo into error messages. The sanitised form keeps only
 // scheme + host + path; query, fragment and userinfo are dropped.
@@ -799,7 +799,7 @@ func TestSanitizeURLForError_StripsUserinfo(t *testing.T) {
 	}
 }
 
-// TestIsClientError_TreatsCtxErrorsAsTerminal pins Fix W3: errors wrapping
+// TestIsClientError_TreatsCtxErrorsAsTerminal pins the rule that errors wrapping
 // context.Canceled or context.DeadlineExceeded must short-circuit the retry
 // loop so the next attempt does not burn a backoff before the ctx.Done()
 // select catches the cancellation.
@@ -855,13 +855,12 @@ func (e *wrappedErr) Unwrap() error { return e.inner }
 
 // TestReportStatus_ContextCanceled_NoRetrySleep verifies that a cancelled
 // context returns promptly: the retry loop must short-circuit on the
-// first ctx-aware error instead of sleeping out the backoff. Fix W3 in
-// REVIEW.md.
+// first ctx-aware error instead of sleeping out the backoff.
 //
 // Strategy: point the client at an unreachable localhost port so every
-// attempt fails fast with a ctx-wrapped dial error. Without the W3 fix the
-// loop would sleep one backoff (1s) before the next ctx.Done() select
-// caught the cancellation; with W3 the loop returns within ~ctx-timeout.
+// attempt fails fast with a ctx-wrapped dial error. Without the short-circuit
+// the loop would sleep one backoff (1s) before the next ctx.Done() select
+// caught the cancellation; with it the loop returns within ~ctx-timeout.
 func TestReportStatus_ContextCanceled_NoRetrySleep(t *testing.T) {
 	// 127.0.0.1:1 is a port no listener can bind to; Dial fails immediately
 	// with a connection-refused / no-such-host error.
@@ -877,15 +876,15 @@ func TestReportStatus_ContextCanceled_NoRetrySleep(t *testing.T) {
 	elapsed := time.Since(start)
 
 	require.Error(t, err)
-	// Pre-W3, a maxRetries=3 run burns ~3s on backoff after each failed
-	// attempt because isClientError returned false on ctx-wrapped errors.
-	// Post-W3 the first ctx.Canceled / DeadlineExceeded short-circuits the
-	// loop. Allow generous slack (700ms) for CI scheduling.
+	// Without the ctx-aware short-circuit, isClientError returns false on
+	// ctx-wrapped errors and a maxRetries=3 run burns ~3s on backoff after
+	// each failed attempt. With it, the first ctx.Canceled / DeadlineExceeded
+	// short-circuits the loop. Allow generous slack (700ms) for CI scheduling.
 	assert.Less(t, elapsed, 700*time.Millisecond,
 		"ReportStatus must short-circuit on ctx cancellation; took %s", elapsed)
 }
 
-// TestVerifyAutonomous_TransientRetrySucceeds verifies Fix W2: the first
+// TestVerifyAutonomous_TransientRetrySucceeds verifies that the first
 // transient 5xx is retried and the eventual 2xx is returned without
 // surfacing the prior failure to the caller. The retry metric for the
 // verify_autonomous label increments per failed attempt, mirroring the
@@ -920,7 +919,7 @@ func TestVerifyAutonomous_TransientRetrySucceeds(t *testing.T) {
 		"two retries (first two attempts failed) must increment the verify_autonomous label")
 }
 
-// TestVerifyAutonomous_4xxNoRetry verifies Fix W2: a 4xx response is a
+// TestVerifyAutonomous_4xxNoRetry verifies that a 4xx response is a
 // client error and must NOT be retried — mirrors ReportStatus's
 // isClientError short-circuit.
 func TestVerifyAutonomous_4xxNoRetry(t *testing.T) {
@@ -942,7 +941,7 @@ func TestVerifyAutonomous_4xxNoRetry(t *testing.T) {
 	assert.Equal(t, int32(1), calls.Load(), "4xx must not be retried")
 }
 
-// TestVerifyAutonomous_CtxCancelShortCircuits verifies Fix W2: a cancelled
+// TestVerifyAutonomous_CtxCancelShortCircuits verifies that a cancelled
 // context returns promptly without burning a full retry ladder. Without
 // the isClientError check for ctx errors a cancelled VerifyAutonomous
 // would sleep through 1s + 2s of backoff before exiting.

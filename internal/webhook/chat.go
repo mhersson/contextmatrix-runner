@@ -21,7 +21,7 @@ import (
 // tracker.WriteStdinChat returns and releases stdin.mu.
 //
 // Declared as a package var so tests can shrink it without waiting for the
-// 5s wall-clock budget. Fix W1 in REVIEW.md.
+// 5s wall-clock budget.
 var chatPrimingWriteTimeout = 5 * time.Second
 
 // handleChatStart starts a long-lived chat-mode container. The container runs
@@ -143,7 +143,6 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		if stopErr := h.manager.Stop(stopCtx, containerID); stopErr != nil {
 			// Surface as a metric in addition to the log so dashboards can
 			// alarm on orphaned chat containers without parsing log lines.
-			// Fix W7 in REVIEW.md.
 			if h.metrics != nil {
 				h.metrics.ChatRollbackFailuresTotal.Inc()
 			}
@@ -194,7 +193,6 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		// returning, so we deliberately do NOT call streamCancel() again
 		// here — a second invocation would be a redundant no-op (Go's
 		// context.CancelFunc is idempotent) and obscured the lifecycle.
-		// Fix W9 in REVIEW.md.
 		h.tracker.RemoveChat(p.SessionID)
 
 		// Detached ctx: AttachChatStdin failure is often the consequence of
@@ -205,7 +203,6 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		if stopErr := h.manager.Stop(stopCtx, containerID); stopErr != nil {
 			// Surface as a metric in addition to the log so dashboards can
 			// alarm on orphaned chat containers without parsing log lines.
-			// Fix W7 in REVIEW.md.
 			if h.metrics != nil {
 				h.metrics.ChatRollbackFailuresTotal.Inc()
 			}
@@ -332,7 +329,7 @@ func (h *Handler) handleChatEnd(w http.ResponseWriter, r *http.Request) {
 	// short-circuit and leak the container until the 2h sweep, while
 	// RemoveChat below would still drop the tracker entry. 5s matches
 	// container.dockerCleanupTimeout (unexported) and mirrors the rollback
-	// paths in handleChatStart. Fix W3 in REVIEW.md.
+	// paths in handleChatStart.
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopCancel()
 
@@ -353,7 +350,7 @@ func (h *Handler) handleChatEnd(w http.ResponseWriter, r *http.Request) {
 	// container will exit asynchronously through the
 	// WaitAndCleanupChat / Stop path. Returning 200 here would imply the
 	// teardown is synchronously complete on return, which is not strictly
-	// true. Fix W10 in REVIEW.md.
+	// true.
 	writeSuccess(w, http.StatusAccepted, "")
 }
 
@@ -365,23 +362,22 @@ func (h *Handler) handleChatEnd(w http.ResponseWriter, r *http.Request) {
 // orphaned container the operator can't end through normal channels.
 //
 // The actual stdin write is bounded by chatPrimingWriteTimeout. A wedged
-// hijacked socket whose Write blocks on kernel-buffer pressure used to
-// freeze the /chat/start HTTP request thread indefinitely; now the write
-// is run on a worker goroutine and we force-close the chat container's
-// stdin via tracker.CloseStdinChat on timeout so the in-flight Write
-// returns and releases stdin.mu. Card-mode uses an equivalent pattern in
-// container.Manager.writePrimingWithTimeout; this is its chat-mode
-// counterpart. Fix W1 in REVIEW.md.
+// hijacked socket whose Write blocks on kernel-buffer pressure would
+// otherwise freeze the /chat/start HTTP request thread indefinitely;
+// instead the write runs on a worker goroutine and the handler
+// force-closes the chat container's stdin via tracker.CloseStdinChat on
+// timeout so the in-flight Write returns and releases stdin.mu. Card-mode
+// uses an equivalent pattern in container.Manager.writePrimingWithTimeout;
+// this is its chat-mode counterpart.
 //
 // ctx carries the correlation_id used in log lines so a primer-write failure
-// can be traced back to the originating /chat/start request. Fix W7 in
-// REVIEW.md.
+// can be traced back to the originating /chat/start request.
 //
 // kind is a human-readable label (e.g. "primer", "rehydration priming")
 // never persisted to the transcript. Pass it as a structured slog field
 // instead of concatenating into the message so log aggregators bucket by
 // the constant "chat/start: build envelope failed" rather than splitting
-// the series per kind. Fix W11 in REVIEW.md.
+// the series per kind.
 func (h *Handler) writeChatPrimingEnvelope(ctx context.Context, sessionID, kind, text string) {
 	envelope, buildErr := streammsg.BuildUserMessage(text)
 	if buildErr != nil {
@@ -406,7 +402,7 @@ func (h *Handler) writeChatPrimingEnvelope(ctx context.Context, sessionID, kind,
 // function returns, so the /chat/start request still returns 202 rather
 // than leaving an orphaned container the operator cannot end through
 // normal channels. Mirrors container.Manager.writePrimingWithTimeout for
-// card-mode. Fix W1 in REVIEW.md.
+// card-mode.
 func (h *Handler) writeChatStdinWithTimeout(ctx context.Context, sessionID, kind string, envelope []byte) {
 	done := make(chan error, 1)
 

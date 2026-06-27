@@ -63,8 +63,7 @@ func TestReadyz_PreflightFailing(t *testing.T) {
 func TestReadyz_Draining(t *testing.T) {
 	state := NewHealthState()
 	// Draining trumps preflight state: a runner that has started
-	// shutdown must report "draining" even if preflight previously
-	// passed.
+	// shutdown must report "draining" even when preflight has passed.
 	state.PreflightPassed.Store(true)
 	state.Draining.Store(true)
 

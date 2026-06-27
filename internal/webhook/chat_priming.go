@@ -11,8 +11,7 @@ import "fmt"
 // mounted resume.jsonl, re-establish workspace state, and call the
 // chat_rehydration_complete MCP tool when done.
 //
-// The text intentionally mirrors the (now-unused) heredoc in entrypoint.sh
-// so all rehydration rules live in one place.
+// All rehydration rules live in this function.
 func buildChatRehydrationPriming(sessionID string) string {
 	return fmt.Sprintf(`You are resuming chat session %s in a FRESH container. The
 prior conversation is in /run/cm-chat/resume.jsonl (one JSON object per line,

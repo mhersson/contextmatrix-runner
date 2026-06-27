@@ -249,16 +249,16 @@ func ValidateTaskSkills(skills []string) error {
 // can test with errors.As, or a nil error on success.
 //
 // The caller must pass a pointer to or value of one of the supported payload
-// types. Unknown types now return a non-nil error rather than silently
+// types. Unknown types return a non-nil error rather than silently
 // passing — a registration mistake (a new payload struct decoded by a
 // handler but never added to the dispatch below) fails the request rather
-// than bypassing the validation gate. Fix W8 in REVIEW.md.
+// than bypassing the validation gate.
 //
 // New payload types MUST be added to this type switch even if they have a
 // dedicated Validate<Foo> helper. Calling the helper directly from the
 // handler bypasses ValidatePayload, which is the single entry point for the
 // payload-validation surface — bypassing it splits the dispatch into two
-// inconsistent code paths (Fix W2 in REVIEW.md).
+// inconsistent code paths.
 func ValidatePayload(p any) error {
 	switch v := p.(type) {
 	case *TriggerPayload:
@@ -337,7 +337,7 @@ func ValidatePayload(p any) error {
 		// Loud failure on unknown payload types so a registration mistake
 		// (handler decodes a new struct but forgets to wire its dispatch
 		// branch above) fails the request rather than silently bypassing
-		// the validation gate. Fix W8 in REVIEW.md.
+		// the validation gate.
 		return fmt.Errorf("unknown payload type %T", p)
 	}
 }
@@ -452,10 +452,9 @@ func validateEndSession(p *EndSessionPayload) error {
 var chatModelPattern = regexp.MustCompile(`^claude-[a-z0-9.-]{1,64}$`)
 
 // chatResumeRolePattern restricts ResumeTurn.Role to the shapes the
-// transcript builder emits. `user_question` is retained for backward
-// compatibility with transcripts persisted before AskUserQuestion was
-// suppressed — the current runner no longer produces that role, but old
-// sessions may still carry it across rehydration.
+// transcript builder emits. `user_question` is accepted for compatibility:
+// the runner suppresses AskUserQuestion and does not emit that role, but
+// rehydrated sessions persisted with it can still carry it.
 var chatResumeRolePattern = regexp.MustCompile(`^(user|assistant_text|tool_call|tool_result_summary|user_question)$`)
 
 const (
@@ -582,7 +581,7 @@ func validateChatResume(r *ChatResumeContext) error {
 
 		// Mirror validateContent: free-form transcript text may contain
 		// newlines but NUL bytes would smuggle through any downstream
-		// C-style consumer (libgit2, exec arg lists). Fix W9 in REVIEW.md.
+		// C-style consumer (libgit2, exec arg lists).
 		if strings.ContainsRune(t.Content, '\x00') {
 			return &ValidationError{
 				Field:  fmt.Sprintf("resume.turns[%d].content", i),

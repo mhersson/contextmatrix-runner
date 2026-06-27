@@ -25,7 +25,7 @@ const (
 // through the card-mode or chat-mode code path. Clients should branch on
 // Code, not on Message, but the messages still need to match so operator
 // dashboards and log aggregators are not split by an irrelevant string
-// difference. See Fix W1 in REVIEW.md.
+// difference.
 const (
 	// MsgNotInteractive is the wire message returned with CodeConflict when a
 	// container exists but stdin is not attached (the container was started

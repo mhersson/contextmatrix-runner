@@ -60,8 +60,9 @@ func signedRequest(t *testing.T, path string, payload any) *http.Request {
 	return req
 }
 
-// Pin the A1 clean-break: future-dated timestamps beyond 30s are rejected
-// (the old symmetric window accepted up to 5m of future drift).
+// Future-dated timestamps beyond 30s are rejected; the skew window is
+// asymmetric and does not accept the 5m of future drift a symmetric window
+// would.
 func TestVerifyRejectsFutureBeyond30s(t *testing.T) {
 	ts := strconv.FormatInt(time.Now().Add(2*time.Minute).Unix(), 10)
 
@@ -71,7 +72,7 @@ func TestVerifyRejectsFutureBeyond30s(t *testing.T) {
 	}
 }
 
-// TestHmacAuth_ContentLengthExceedsCap pins Fix W1/W10: a request whose
+// TestHmacAuth_ContentLengthExceedsCap pins the rule that a request whose
 // Content-Length header exceeds the 1 MiB read cap must be rejected with
 // 413 (CodeTooLarge) BEFORE the io.LimitReader silently truncates it.
 // Without the precheck, validators that allow oversized payloads (e.g.
@@ -106,7 +107,7 @@ func TestHmacAuth_ContentLengthExceedsCap(t *testing.T) {
 
 // TestHmacAuth_ContentLengthAtCap verifies a Content-Length exactly at the
 // cap is allowed (still rejected with 401 because the signature is fake,
-// but NOT rejected with 413 first). Boundary case for W1.
+// but NOT rejected with 413 first).
 func TestHmacAuth_ContentLengthAtCap(t *testing.T) {
 	h := &Handler{apiKey: testAPIKey}
 	handler := h.hmacAuth(func(_ http.ResponseWriter, _ *http.Request) {
@@ -127,7 +128,7 @@ func TestHmacAuth_ContentLengthAtCap(t *testing.T) {
 }
 
 // TestHmacAuth_NoContentLengthOversizeStreamingBody pins the fallback path
-// of Fix W1: a chunked-encoding request whose Content-Length is -1 cannot
+// for a chunked-encoding request whose Content-Length is -1: it cannot
 // be prechecked, so the LimitReader inside hmacAuth still bounds the read.
 // The signature was computed over the FULL body; the truncated body fails
 // verification, producing 401. This is the documented fallback behavior:
@@ -376,9 +377,9 @@ func TestHandleTrigger_BaseBranchAccepted(t *testing.T) {
 
 // TestHandleKill_IdempotentWhenAlreadyStopped verifies that /kill on a card
 // with no tracked container and no matching labeled Docker container returns
-// 200 OK. The old behaviour was 404, which made retry logic
-// in CM harder (a legitimate not-yet-started tracker miss was indistinguishable
-// from a hard failure). ForceRemoveByLabels returns 0 for this case so the
+// 200 OK. Returning 404 here would make CM's retry logic harder (a
+// legitimate not-yet-started tracker miss indistinguishable from a hard
+// failure). ForceRemoveByLabels returns 0 for this case so the
 // handler falls through to the no-op branch.
 func TestHandleKill_IdempotentWhenAlreadyStopped(t *testing.T) {
 	fake := &reconcileFakeRunner{forceRet: 0}
@@ -1155,8 +1156,8 @@ func TestHandleMessage_401_InvalidHMAC(t *testing.T) {
 // --- /promote handler tests ---
 
 // autonomousTrueServer starts an httptest server that always returns
-// autonomous=true so /promote happy-path tests can satisfy the W5 fail-closed
-// gate (cmClient is required; nil cmClient now produces a 502). The server is
+// autonomous=true so /promote happy-path tests can satisfy the fail-closed
+// gate (cmClient is required; a nil cmClient produces a 502). The server is
 // torn down via t.Cleanup so callers don't need an extra defer.
 func autonomousTrueServer(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -1172,8 +1173,8 @@ func autonomousTrueServer(t *testing.T) *httptest.Server {
 
 // setupPromoteHandler builds a Handler with a tracker that has a container
 // registered (optionally with stdin attached), a broadcaster, and a real
-// callback.Client pointed at a fake CM that returns autonomous=true. After
-// fix W5, /promote refuses to write to stdin unless cmClient.VerifyAutonomous
+// callback.Client pointed at a fake CM that returns autonomous=true.
+// /promote refuses to write to stdin unless cmClient.VerifyAutonomous
 // returns true — so happy-path tests need a server, not a nil client.
 func setupPromoteHandler(t *testing.T, withStdin bool) (*Handler, *logbroadcast.Broadcaster, *fakeWriteCloser) {
 	t.Helper()
@@ -1328,10 +1329,10 @@ func TestHandlePromote_401_InvalidHMAC(t *testing.T) {
 }
 
 func TestHandlePromote_PublishAfterStdinSuccess(t *testing.T) {
-	// W4: the system LogEntry must be published only AFTER the stdin write
+	// The system LogEntry must be published only AFTER the stdin write
 	// succeeds — never before — so a failed write does not leave a phantom
-	// "promoted to autonomous mode" line in the UI. The previous ordering
-	// asserted "publish first, then write"; that was the bug W4 fixed.
+	// "promoted to autonomous mode" line in the UI. Publishing before the
+	// write would leave that phantom line.
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
 
@@ -1378,11 +1379,11 @@ func TestHandlePromote_PublishAfterStdinSuccess(t *testing.T) {
 	}
 }
 
-// TestHandlePromote_NoPublishOnStdinFailure verifies the W4 invariant from the
+// TestHandlePromote_NoPublishOnStdinFailure verifies the invariant from the
 // other direction: when WriteStdin fails (here: no stdin attached → 409), the
 // handler must NOT publish the "promoted to autonomous mode" system LogEntry.
-// Previously the broadcaster.Publish call ran before WriteStdin, so a phantom
-// promotion line appeared in the UI for a promote that actually errored out.
+// Publishing before WriteStdin succeeds would put a phantom promotion line in
+// the UI for a promote that actually errored out.
 func TestHandlePromote_NoPublishOnStdinFailure(t *testing.T) {
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
@@ -1650,10 +1651,9 @@ func TestHandlePromote_EndSessionIdempotentAfterPromote(t *testing.T) {
 	require.True(t, fw.closed, "stdin must be closed by /promote before /end-session")
 
 	// /end-session on already-closed stdin returns 410 Gone (idempotent
-	// retry; the session was active and has been closed). Fix W5: this
-	// case used to share the 409 sentinel with "container is non-
-	// interactive", which is misleading — the container WAS interactive
-	// and is now over.
+	// retry; the session was active and has been closed). Sharing the 409
+	// sentinel with "container is non-interactive" would mislead here — the
+	// container WAS interactive and the session is now over.
 	endPayload := EndSessionPayload{CardID: "PROJ-001", Project: "my-project"}
 	we := httptest.NewRecorder()
 	h.hmacAuth(h.handleEndSession)(we, signedRequest(t, "/end-session", endPayload))
@@ -1664,9 +1664,9 @@ func TestHandlePromote_EndSessionIdempotentAfterPromote(t *testing.T) {
 	assert.Equal(t, CodeStdinClosed, resp.Code, "/end-session idempotent retry must use stdin_closed code")
 }
 
-// TestHandlePromote_NilCMClient_500Internal verifies the W3 fix: a /promote
+// TestHandlePromote_NilCMClient_500Internal verifies that a /promote
 // against a runner whose cmClient was never wired must return 500 with
-// CodeInternal, not 502 with CodeUpstreamFailure. The original 502 implied
+// CodeInternal, not 502 with CodeUpstreamFailure. A 502 implies
 // "CM is unreachable" but the actual cause is runner-side misconfiguration —
 // surface it as such so operator dashboards do not blame CM.
 func TestHandlePromote_NilCMClient_500Internal(t *testing.T) {
@@ -1698,7 +1698,7 @@ func TestHandlePromote_NilCMClient_500Internal(t *testing.T) {
 	assert.Empty(t, fw.buf, "stdin must NOT be written when cmClient is misconfigured")
 }
 
-// TestHandleLogs_NilBroadcaster_500Internal verifies the W4 fix: handleLogs
+// TestHandleLogs_NilBroadcaster_500Internal verifies that handleLogs
 // nil-guards the broadcaster like every other handler that touches it.
 // Without the guard a Handler constructed with a nil broadcaster would
 // panic on /logs.
@@ -1969,9 +1969,9 @@ func TestHandleEndSession_Idempotent(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, w1.Code)
 
 	// Second call distinguishes "had stdin, closed" (410 Gone, idempotent
-	// retry) from "never had stdin" (409 Conflict, non-interactive). Fix
-	// W5: the pre-fix code collapsed both into 409, which made retried
-	// /end-session indistinguishable from /end-session against a card
+	// retry) from "never had stdin" (409 Conflict, non-interactive).
+	// Collapsing both into 409 would make a retried /end-session
+	// indistinguishable from /end-session against a card
 	// that was never interactive — operators couldn't tell whether their
 	// retry succeeded or whether the container ran in autonomous mode
 	// all along.
@@ -1990,9 +1990,8 @@ func TestHandleEndSession_Idempotent(t *testing.T) {
 // TestHandleEndSession_NeverInteractive_409 is the negative case of
 // TestHandleEndSession_Idempotent: a /end-session against a container
 // that was never made interactive (SetStdin never called) must still
-// return 409 with CodeConflict / MsgNotInteractive, not 410. This
-// preserves the existing semantics of W5 — only "was interactive, now
-// closed" maps to 410.
+// return 409 with CodeConflict / MsgNotInteractive, not 410. Only
+// "was interactive, now closed" maps to 410.
 func TestHandleEndSession_NeverInteractive_409(t *testing.T) {
 	tr := tracker.New()
 	b := logbroadcast.NewBroadcaster(nil, nil)
@@ -2739,13 +2738,13 @@ func TestMessage_ChatPath_NoStdin(t *testing.T) {
 }
 
 // TestMessage_ChatPath_UnknownToolUseIDFieldIgnored verifies that a /message
-// POST carrying a `tool_use_id` field (left over from older CM deployments)
-// is silently dropped — the field was removed when AskUserQuestion routing
-// moved to the MCP permission_prompt gate; payloads with it must still
-// produce a plain user-text stdin frame so a rolling upgrade does not break
-// chat. encoding/json ignores unknown object keys by default, so the
-// regression we guard against here is a future contributor re-adding the
-// field to MessagePayload without thinking through Phase 2.
+// POST carrying a `tool_use_id` field (sent by older CM deployments) is
+// silently dropped — AskUserQuestion routing goes through the MCP
+// permission_prompt gate, so MessagePayload has no such field; payloads with
+// it must still produce a plain user-text stdin frame so a rolling upgrade
+// does not break chat. encoding/json ignores unknown object keys by default,
+// so the regression guarded here is a contributor re-adding the field to
+// MessagePayload.
 func TestMessage_ChatPath_UnknownToolUseIDFieldIgnored(t *testing.T) {
 	h, _, fw := setupChatMessageHandler(t, true)
 

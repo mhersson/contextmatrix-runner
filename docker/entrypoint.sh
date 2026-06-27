@@ -1,5 +1,5 @@
 #!/bin/bash
-# Explicit allowlist replaces the old unconditional permission-bypass flag.
+# An explicit tool allowlist gates permissions; no unconditional bypass flag.
 # To add a tool, justify in PR + update this list + add a test.
 set -euo pipefail
 
@@ -355,8 +355,8 @@ fi
 # the env-fallback path.
 # ACCEPTED TRADE-OFF: Bash is allowlisted unrestricted (see the allowlist
 # section above), so the worker can run curl/wget — the two preserved tokens
-# are therefore reachable for network exfiltration in a way the old prefix
-# allowlist (which excluded curl) blocked. Accepted because the container is
+# are therefore reachable for network exfiltration. Accepted because the
+# container is
 # single-tenant and disposable, the model is Claude running an approved
 # workflow, and the tokens are scoped to this run. Revisit if workers ever
 # execute untrusted third-party code.

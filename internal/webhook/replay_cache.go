@@ -116,13 +116,12 @@ func (r *ReplayCache) Seen(sig string) bool {
 		entry := el.Value.(*replayEntry)
 		if r.ttl <= 0 || now.Sub(entry.seen) <= r.ttl {
 			// Keep entry.seen pinned to the original first-sight
-			// timestamp so the entry ages out predictably at ttl. Fix
-			// W7 in REVIEW.md: refreshing seen on hit let an attacker
-			// (or a buggy client) pin a hot signature in the cache
-			// indefinitely, defeating the TTL bound. MoveToBack is
-			// still fine here — it only affects LRU eviction order,
-			// not the seen-timestamp the sweep / expiry compares
-			// against.
+			// timestamp so the entry ages out predictably at ttl.
+			// Refreshing seen on hit would let an attacker (or a buggy
+			// client) pin a hot signature in the cache indefinitely,
+			// defeating the TTL bound. MoveToBack is still fine here — it
+			// only affects LRU eviction order, not the seen-timestamp the
+			// sweep / expiry compares against.
 			r.entries.MoveToBack(el)
 
 			return true

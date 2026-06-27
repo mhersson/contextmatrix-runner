@@ -20,8 +20,8 @@
 # Hardening.
 # ----------
 # The generated [Service] section applies a baseline sandbox + resource
-# limits + restart-jitter policy. The directives below address REVIEW.md
-# findings H18, L34, L35.
+# limits + restart-jitter policy. The directives below apply the systemd
+# sandbox hardening:
 #   NoNewPrivileges, ProtectSystem=strict, ProtectHome=read-only,
 #   PrivateTmp, PrivateDevices, ProtectKernelTunables,
 #   ProtectKernelModules, ProtectControlGroups, LockPersonality,

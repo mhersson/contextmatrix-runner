@@ -200,10 +200,9 @@ func (c *MessageDedupCache) putByKey(key string, ack CachedAck) {
 	// Overwrite existing entry if present; otherwise append. Both branches
 	// take a defensive copy of ack.Body so the cache invariant ("stored
 	// bytes are owned by the cache, never aliased to caller-supplied
-	// slices") holds on every insert path. Fix W6 in REVIEW.md: the
-	// overwrite path used to alias the caller's slice while the
-	// new-entry path copied — a caller that mutated the slice after Put
-	// could corrupt the cached ack in the overwrite case only.
+	// slices") holds on every insert path. Without the copy on the
+	// overwrite path, a caller that mutated the slice after Put could
+	// corrupt the cached ack.
 	bodyCopy := make([]byte, len(ack.Body))
 	copy(bodyCopy, ack.Body)
 

@@ -422,7 +422,7 @@ func TestCloseStdin_ClosesWriter(t *testing.T) {
 }
 
 // TestCloseStdin_Idempotent verifies the second call returns ErrStdinClosed
-// (Fix W5: idempotent retry surfaces the "was attached, then closed" state
+// (idempotent retry surfaces the "was attached, then closed" state
 // so handlers can map to 410 Gone instead of 409 Conflict) and does not
 // close the writer again.
 func TestCloseStdin_Idempotent(t *testing.T) {
@@ -689,7 +689,7 @@ func (f *fakeWriteCloserSimple) Close() error                { return nil }
 // TestRemove_BlockingStdinClose_DoesNotBlockReturn verifies that Remove returns
 // within stdinCloseTimeout even when stdin.Close() blocks indefinitely. This
 // guards against the HITL 2h leak hypothesis: a wedged hijacked socket in
-// Close would previously stall Remove and starve the removeSecretsFile /
+// Close would otherwise stall Remove and starve the removeSecretsFile /
 // removeContainer defers that follow it in waitAndCleanup.
 func TestRemove_BlockingStdinClose_DoesNotBlockReturn(t *testing.T) {
 	// Shrink the timeout so the test is fast.
@@ -865,12 +865,12 @@ func TestErrSentinels(t *testing.T) {
 }
 
 // TestSetStdin_RemoveRace exercises the ordering race where SetStdin and
-// Remove fire concurrently on the same tracker entry. H20 in REVIEW.md
-// flagged that the old SetStdin released the tracker mu before assigning
-// info.stdin.stdin, so a concurrent Remove could delete the entry and the
-// late SetStdin would then attach a writer/onClose to a ContainerInfo that
-// was no longer reachable from the tracker — leaking the hijacked TCP
-// connection because no subsequent Remove would ever find it to call Close.
+// Remove fire concurrently on the same tracker entry. If SetStdin released
+// the tracker mu before assigning info.stdin.stdin, a concurrent Remove
+// could delete the entry and the late SetStdin would then attach a
+// writer/onClose to a ContainerInfo no longer reachable from the tracker —
+// leaking the hijacked TCP connection because no subsequent Remove would
+// ever find it to call Close.
 //
 // Invariants verified here:
 //
@@ -885,7 +885,7 @@ func TestErrSentinels(t *testing.T) {
 //
 // The test runs many iterations with runtime.Gosched() nudges so the
 // -race detector has a chance to catch unsynchronised writes to
-// stdinState and the original H20 interleaving specifically.
+// stdinState and that specific interleaving.
 func TestSetStdin_RemoveRace(t *testing.T) {
 	const iterations = 500
 
@@ -943,7 +943,7 @@ func TestSetStdin_RemoveRace(t *testing.T) {
 
 		mu.Lock()
 
-		// Invariant #1 (H20 fix): the writer must be closed EXACTLY once,
+		// Invariant #1: the writer must be closed EXACTLY once,
 		// never zero and never twice. The tracker is responsible for making
 		// sure the hijacked TCP conn is always released, regardless of which
 		// goroutine won the race.
@@ -998,16 +998,16 @@ func TestTracker_ChatAndCardCoexist(t *testing.T) {
 
 // TestChatKeyDoesNotCollideWithProject verifies that the chat-key namespace
 // sentinel (NUL byte) cannot collide with any card-mode (project, cardID)
-// key. The literal "__chat__" prefix used previously was a valid project
-// name under the webhook validator's [A-Za-z0-9_.-] charset, so a
-// /trigger call for project="__chat__", card_id=X aliased to the same map
-// entry as /chat/start for session_id=X.
+// key. A literal "__chat__" prefix would be a valid project name under the
+// webhook validator's [A-Za-z0-9_.-] charset, so a /trigger call for
+// project="__chat__", card_id=X would alias to the same map entry as
+// /chat/start for session_id=X.
 func TestChatKeyDoesNotCollideWithProject(t *testing.T) {
 	tr := New()
 
-	// Register a card-mode container using a project name that mirrors the
-	// old chat-key literal. With the legacy "__chat__/<id>" key this would
-	// alias to AddChat(SessionID=X).
+	// Register a card-mode container using the "__chat__" project name that a
+	// string-prefix chat key would collide with. With a "__chat__/<id>" key
+	// this would alias to AddChat(SessionID=X).
 	require.NoError(t, tr.Add(&ContainerInfo{
 		ContainerID: "card-1",
 		CardID:      "X",
@@ -1015,7 +1015,7 @@ func TestChatKeyDoesNotCollideWithProject(t *testing.T) {
 	}))
 
 	// AddChat(SessionID="X") must succeed: a separate namespace means the
-	// two entries coexist. Pre-fix this would return ErrAlreadyTracked.
+	// two entries coexist; a shared namespace would return ErrAlreadyTracked.
 	require.NoError(t, tr.AddChat(&ContainerInfo{
 		ContainerID: "chat-1",
 		SessionID:   "X",
@@ -1195,12 +1195,12 @@ func TestRemoveChat_InvokesCancel(t *testing.T) {
 	}
 }
 
-// TestCancel_DoesNotHoldRLockDuringCancelFunc pins Fix W5: tracker.Cancel
+// TestCancel_DoesNotHoldRLockDuringCancelFunc pins the rule that tracker.Cancel
 // captures info.Cancel under tracker.mu (read) and releases the lock BEFORE
 // invoking it. A CancelFunc that reaches back into the tracker (e.g. calls
-// Snapshot or Has on the same Tracker) used to deadlock-by-self because
-// Cancel held the RLock while the cancel func tried to take it again. The
-// fix matches the discipline used in Remove.
+// Snapshot or Has on the same Tracker) would deadlock-by-self if Cancel held
+// the RLock while the cancel func tried to take it again. This matches the
+// discipline used in Remove.
 //
 // The test exercises the reentrant read path explicitly: the cancel func
 // calls Has on the same tracker. Without the fix this would still pass
@@ -1230,8 +1230,8 @@ func TestCancel_DoesNotHoldRLockDuringCancelFunc(t *testing.T) {
 		Cancel:  cancelFn,
 	}))
 
-	// Run a parallel writer that wants tracker.mu.Lock(). With the
-	// pre-W5 behaviour, the writer would queue behind the Cancel's
+	// Run a parallel writer that wants tracker.mu.Lock(). If Cancel held
+	// its RLock during the cancel func, the writer would queue behind that
 	// RLock and starve the reentrant Has() inside the cancel func.
 	writerStarted := make(chan struct{})
 	writerDone := make(chan struct{})
@@ -1293,14 +1293,14 @@ func TestCancel_NilCancelFuncIsNoOp(t *testing.T) {
 	}
 }
 
-// TestSetStdin_LateArrivalWedgedClose_DoesNotBlockTracker exercises Fix M4:
-// when SetStdin arrives AFTER Remove (the entry is gone), the late-arrival
-// branch used to close the writer SYNCHRONOUSLY under tracker.mu (write).
-// A wedged hijacked TCP socket's Close() would therefore freeze the entire
-// tracker for any concurrent operation.
+// TestSetStdin_LateArrivalWedgedClose_DoesNotBlockTracker verifies that when
+// SetStdin arrives AFTER Remove (the entry is gone), the late-arrival branch
+// does not close the writer SYNCHRONOUSLY under tracker.mu (write). Closing
+// it synchronously would let a wedged hijacked TCP socket's Close() freeze
+// the entire tracker for any concurrent operation.
 //
-// The fix runs the Close + onClose on a background goroutine bounded by
-// stdinCloseTimeout. We verify two invariants:
+// The late-arrival branch runs the Close + onClose on a background goroutine
+// bounded by stdinCloseTimeout. We verify two invariants:
 //  1. SetStdin returns within the timeout even when Close wedges forever.
 //  2. Other tracker operations (Has, Add, Count) remain responsive while
 //     the close is wedged, proving tracker.mu was released.
@@ -1389,7 +1389,7 @@ func TestSetStdinChat_LateArrivalWedgedClose_DoesNotBlockTracker(t *testing.T) {
 	assert.Equal(t, 1, tr.Count())
 }
 
-// TestSetStdin_WriteStdin_RaceUnderRace exercises Fix W8: concurrent
+// TestSetStdin_WriteStdin_RaceUnderRace verifies that concurrent
 // SetStdin and WriteStdin must not produce a data race on the
 // stdinState field. The invariant under test is that info.stdin is
 // "set once under tracker.mu (write), then stable" — WriteStdin
@@ -1397,10 +1397,9 @@ func TestSetStdinChat_LateArrivalWedgedClose_DoesNotBlockTracker(t *testing.T) {
 // then nil-checks info.stdin. The race detector (-race) catches any
 // unsynchronised write to that field.
 //
-// Without the W8 invariant documentation, a future refactor that
-// re-introduced a "reset to nil" path for info.stdin would race the
-// lock-free nil-check inside WriteStdin and this test would surface
-// the regression.
+// A refactor that introduced a "reset to nil" path for info.stdin would race
+// the lock-free nil-check inside WriteStdin, and this test would surface the
+// regression.
 func TestSetStdin_WriteStdin_RaceUnderRace(t *testing.T) {
 	const iterations = 200
 

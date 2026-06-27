@@ -23,7 +23,7 @@ import (
 	"github.com/mhersson/contextmatrix-runner/internal/tracker"
 )
 
-// TestHMACAuth_AllFailuresReturn401Generic verifies M8 in REVIEW.md: every
+// TestHMACAuth_AllFailuresReturn401Generic verifies that every
 // authentication failure collapses to a byte-identical 401 body so a scanner
 // cannot fingerprint the specific reason (missing header vs bad signature vs
 // expired timestamp vs unreadable body).
@@ -121,7 +121,7 @@ func TestHMACAuth_AllFailuresReturn401Generic(t *testing.T) {
 			assert.Equal(t, "unauthorized", resp.Message,
 				"message must be the fixed 'unauthorized' literal, not a specific reason")
 
-			// M8 fingerprint protection: the raw response bytes must be
+			// Fingerprint protection: the raw response bytes must be
 			// byte-identical across every failure mode.
 			if i == 0 {
 				canonical = append(canonical[:0], body...)
@@ -177,7 +177,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 
 	// withTrackedAndAutonomousCM is the /promote variant of withTracked: it
 	// also wires a real callback.Client pointed at a fake CM server that
-	// returns autonomous=true. After fix W5, /promote refuses to write
+	// returns autonomous=true. /promote refuses to write
 	// stdin without a cmClient, so the no-stdin / stdin-closed promote
 	// rows need this richer setup to reach the WriteStdin branch under
 	// test.
@@ -450,7 +450,7 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 
 		// /promote
 		//
-		// After fix W5, /promote refuses to operate without a cmClient
+		// /promote refuses to operate without a cmClient
 		// (autonomous verification is mandatory). Tests using the "blank"
 		// setup hit the 404 path before cmClient is touched, so they work
 		// fine; the no-stdin / stdin-closed cases need a real cmClient
@@ -567,8 +567,8 @@ func TestEndpointStatusCodeMatrix(t *testing.T) {
 	}
 }
 
-// TestNoRawErrLeakIntoResponseBody sanity-checks the error-message hygiene
-// required by M4 / M41 in REVIEW.md. It feeds each endpoint a JSON body that,
+// TestNoRawErrLeakIntoResponseBody sanity-checks error-message hygiene by
+// feeding each endpoint a JSON body that,
 // if blindly echoed, would surface a recognisable marker into the response.
 func TestNoRawErrLeakIntoResponseBody(t *testing.T) {
 	tr := tracker.New()
@@ -576,9 +576,9 @@ func TestNoRawErrLeakIntoResponseBody(t *testing.T) {
 		testAPIKey, 3, testMCPURL,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
-	// An unmarshal on this produces an error with byte offset; the old code
-	// echoed err.Error() which surfaced internal implementation details
-	// (M41).
+	// An unmarshal on this produces an error with a byte offset; echoing
+	// err.Error() would surface internal implementation details, so it must
+	// not be echoed.
 	const marker = "___PEEK_ME___"
 
 	body := []byte("{" + marker + "}")

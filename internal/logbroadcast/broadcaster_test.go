@@ -444,7 +444,7 @@ func TestConcurrentSafety(t *testing.T) {
 // TestPublish_ReleasesLockBeforeSend verifies that Publish snapshots the
 // subscriber set under the lock and then sends outside of it, so a slow
 // subscriber's full channel cannot starve Subscribe / Unsubscribe callers.
-// Under the old RLock-held-during-send pattern, a subscriber that stayed
+// If the RLock were held during send, a subscriber that stayed
 // full for the whole test would hold the lock's readers high enough that
 // an incoming Subscribe (which acquires a write lock) would stall until
 // publishing quieted. This test asserts Subscribe returns promptly even

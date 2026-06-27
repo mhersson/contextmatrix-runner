@@ -22,7 +22,7 @@ const (
 
 	// dropReportInterval bounds how often aggregated drop warnings are logged.
 	// Without this bound a chronically-slow SSE client would flood the log
-	// with one warn line per dropped entry. Default matches the REVIEW.md ask.
+	// with one warn line per dropped entry.
 	dropReportInterval = 10 * time.Second
 
 	// maxLogEntryContentBytes caps Content bytes per LogEntry. The logparser
@@ -170,9 +170,8 @@ const dropReporterRespawnBackoff = 5 * time.Second
 // dropReporterRespawnBackoff (respecting b.closed so a Close during the
 // backoff still exits promptly) and restarts the flush loop with a fresh
 // ticker. This keeps the broadcaster's panic discipline consistent with the
-// peer background goroutines in main.go — previously a single panic would
-// silently disable drop reporting for the lifetime of the broadcaster while
-// the peer pattern would have respawned.
+// peer background goroutines in main.go: without the respawn a single panic
+// would silently disable drop reporting for the lifetime of the broadcaster.
 //
 // reporterDone is closed exactly once when the goroutine returns for the
 // final time (after b.closed is signalled), so Close()'s wait semantics are

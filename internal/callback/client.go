@@ -76,7 +76,7 @@ type Client struct {
 // becomes a child span of whatever caller context the request is made in.
 //
 // A nil logger is replaced with slog.Default() so retry / fallback paths
-// can always log without a nil-deref panic. Fix W5 in REVIEW.md.
+// can always log without a nil-deref panic.
 func NewClient(cmURL, apiKey string, logger *slog.Logger) *Client {
 	if logger == nil {
 		logger = slog.Default()
@@ -170,8 +170,7 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 
 		// Skip the backoff on the final attempt — the loop is about to exit
 		// regardless of how long we wait. Without this, a maxRetries=3 run
-		// burns ~4s on a stopped timer before returning the failure. Fix
-		// W6 in REVIEW.md.
+		// burns ~4s on a stopped timer before returning the failure.
 		if attempt == maxRetries-1 {
 			break
 		}
@@ -278,8 +277,7 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 
 		// Skip the backoff on the final attempt — the loop is about to exit
 		// regardless of how long we wait. Without this, a maxRetries=3 run
-		// burns ~4s on a stopped timer before returning the failure. Fix
-		// W6 in REVIEW.md.
+		// burns ~4s on a stopped timer before returning the failure.
 		if attempt == maxRetries-1 {
 			break
 		}
@@ -366,16 +364,15 @@ type cardResponse struct {
 // working against an older CM server that does not yet accept HMAC on
 // this endpoint.
 //
-// project and cardID are url.PathEscape'd unconditionally (M27) so values
+// project and cardID are url.PathEscape'd unconditionally so values
 // like "my project" or "CARD/42" produce a well-formed URL in either mode.
 //
 // Transient errors (5xx, connection reset, etc.) are retried up to
 // maxRetries times with exponential backoff, mirroring ReportStatus /
 // ReportSkillEngaged. A 4xx response is non-retryable
-// (isClientError short-circuits) and returns immediately. Fix W2 in
-// REVIEW.md: the pre-fix VerifyAutonomous failed-closed on the first
-// transient error, which propagated as a 502 to CM even when a single
-// retry would have succeeded.
+// (isClientError short-circuits) and returns immediately. Without the
+// retry, a single transient error fails closed as a 502 to CM even when
+// a retry would have succeeded.
 func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (bool, error) {
 	reqURL := fmt.Sprintf("%s/api/v1/cards/%s/%s/autonomous",
 		c.contextMatrixURL,
@@ -418,8 +415,8 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 		}
 
 		// Skip the backoff on the final attempt — the loop is about to exit
-		// regardless of how long we wait. Mirrors the existing W6 fix in
-		// the POST callbacks.
+		// regardless of how long we wait. Mirrors the same skip in the
+		// POST callbacks.
 		if attempt == maxRetries-1 {
 			break
 		}
@@ -693,7 +690,7 @@ const (
 	// VerifyAutonomous GET so transient CM failures (a brief 5xx or a
 	// connection reset) show up in the same cmr_callback_retries_total
 	// series as the POST callbacks rather than disappearing into a
-	// fail-closed 502 response on the runner. Fix W2 in REVIEW.md.
+	// fail-closed 502 response on the runner.
 	endpointVerifyAutonomous = "verify_autonomous"
 )
 

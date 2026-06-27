@@ -193,9 +193,9 @@ github:
 # default is comfortably above peak throughput for a single runner.
 webhook_replay_cache_size: 10000
 
-# TTL (seconds) for each cached signature. Should be HMAC clock-skew
-# window (300s) plus a small grace margin so an entry can never expire
-# before a replay becomes out-of-window on its own.
+# Maximum age (seconds) for an incoming webhook timestamp (the HMAC
+# clock-skew window) and the TTL for each cached signature. One value
+# serves both, so a signature never expires while still within the window.
 webhook_replay_skew_seconds: 330
 
 # /message idempotency cache: stores the ack for each successful
@@ -253,8 +253,8 @@ maintenance_interval: "10m"
 # ----- Callback auth -----
 
 # Use HMAC-signed GET for VerifyAutonomous callbacks to ContextMatrix.
-# Set to false ONLY during the cross-repo transition if the CM server
-# does not yet accept HMAC on that endpoint.
+# Set to false only if the ContextMatrix server does not accept HMAC on
+# that endpoint.
 use_hmac_for_verify_autonomous: true
 
 # ----- Logging -----
