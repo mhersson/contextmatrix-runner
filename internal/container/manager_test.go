@@ -62,8 +62,8 @@ func testConfig(t *testing.T) *config.Config {
 		ContainerTimeout: "1h",
 		AnthropicAPIKey:  "sk-test",
 		// Explicit ImagePullPolicy: tests assert ImagePullFn is invoked, so
-		// PullAlways preserves the behavior that previously came from the
-		// now-removed empty-string fallback in Manager.pullImage.
+		// PullAlways forces Manager.pullImage to call ImagePullFn on every
+		// spawn.
 		ImagePullPolicy: config.PullAlways,
 		// Per-test isolation: each test gets its own temp dir so parallel
 		// tests (and cleanup) can't step on each other's secrets state.
@@ -665,7 +665,7 @@ func TestCleanupOrphans_SkipsTrackedContainers(t *testing.T) {
 // a per-container Stop failure that ends in a successful force-Remove is
 // logged as a warning but NOT returned as an error. The container is gone,
 // which is the only outcome that matters. Returning Stop failures as hard
-// errors used to mislead callers into thinking cleanup did not complete,
+// errors would mislead callers into thinking cleanup did not complete,
 // even when every orphan was ultimately destroyed.
 func TestCleanupOrphans_StopFailureWithSuccessfulRemoveIsNotAnError(t *testing.T) {
 	var (
@@ -2101,7 +2101,7 @@ func TestWaitAndCleanup_ErrChFromContainerWait(t *testing.T) {
 // TIME the parent ctx is canceled.
 //
 // Go's select picks pseudo-randomly between errCh and ctx.Done(); when errCh
-// wins, the cleanup branch used to read `waitCtx.Err() != nil` and classify
+// wins, reading `waitCtx.Err() != nil` in the cleanup branch would classify
 // the cancellation as a timeout, silently reporting the wrong terminal state
 // to ContextMatrix and the metrics histogram.
 //
@@ -2580,10 +2580,10 @@ func TestPullImage_EmptyPolicyReturnsError(t *testing.T) {
 }
 
 // TestPullImage_RegistryErrorInStream verifies pullImage surfaces a
-// registry-side error reported via the ImagePull NDJSON stream. Pre-fix
-// these errors were silently swallowed by io.Copy(io.Discard, reader),
-// and the failure only manifested later as the much less actionable
-// `ContainerCreate: no such image`.
+// registry-side error reported via the ImagePull NDJSON stream. Without
+// parsing the stream these errors are silently swallowed by
+// io.Copy(io.Discard, reader), and the failure manifests later only as the
+// much less actionable `ContainerCreate: no such image`.
 func TestPullImage_RegistryErrorInStream(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -2688,12 +2688,11 @@ func TestPullImage_MalformedStreamLogsButDoesNotError(t *testing.T) {
 }
 
 // TestWaitAndCleanup_MessageDuringCleanupGets404 verifies that the tracker
-// entry is removed BEFORE the Docker container is removed during cleanup
-// (H21 in REVIEW.md). The old defer order left the tracker entry in place
-// while the container was already gone, so a /message or /promote arriving
-// in that window tried to write stdin to a dead container and produced a
-// 500. After the fix, the tracker is unpublished first and the same request
-// gets the correct 404.
+// entry is removed BEFORE the Docker container is removed during cleanup.
+// If the tracker entry stayed in place while the container was already gone,
+// a /message or /promote arriving in that window would write stdin to a dead
+// container and produce a 500; removing the tracker entry first makes the
+// same request get the correct 404.
 //
 // We exercise the race by blocking ContainerRemove on a channel. Inside
 // that blocked window we inspect the tracker state: with the correct LIFO
@@ -2771,7 +2770,7 @@ func TestWaitAndCleanup_MessageDuringCleanupGets404(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond,
 		"ContainerRemove must be entered so the test can inspect tracker state")
 
-	// H21 assertion: by the time ContainerRemove is entered, the tracker
+	// By the time ContainerRemove is entered, the tracker
 	// entry must already be gone — tracker.Remove is the last defer (first
 	// to execute) in waitAndCleanup.
 	assert.False(t, trackedDuringRm.Load(),
@@ -2948,8 +2947,8 @@ func TestIdleWatchdog_Disabled(t *testing.T) {
 	tr := tracker.New()
 
 	// Count Cancel invocations. waitAndCleanup invokes tracker.Remove on
-	// normal teardown, which now calls the stored Cancel exactly once (H4
-	// fix). If the watchdog ALSO fires it would call Kill -> tracker.Cancel
+	// normal teardown, which calls the stored Cancel exactly once. If the
+	// watchdog ALSO fires it would call Kill -> tracker.Cancel
 	// -> info.Cancel, bumping the counter past one.
 	var cancelCount atomic.Int32
 
@@ -5500,20 +5499,20 @@ func TestStartTokenRefresherWritesSecretsFile(t *testing.T) {
 // line through the streamLogs pipeline and verifies the cleanup sequence
 // completes within a bounded deadline.
 //
-// History: this test originally guarded a wedge bug where bufio.Scanner's
-// 1 MiB cap caused ErrTooLong, leaving stdcopy's Write into an undrained
-// io.Pipe blocked forever. The current pipeline uses bufio.Reader plus
-// logparser.ReadBoundedLine (16 MiB soft cap) — a 1.5 MiB line is now an
-// ordinary long line that streams through cleanly. The test still exercises
-// the real production code path for an oversized-but-under-cap stderr line
-// and is the only end-to-end coverage we have for the io.Pipe + stdcopy +
-// scanner shutdown sequence, so it earns its keep as a regression guard.
+// The pipeline uses bufio.Reader plus logparser.ReadBoundedLine (16 MiB soft
+// cap), so a 1.5 MiB line is an ordinary long line that streams through
+// cleanly. The test guards against a wedge where an oversized line trips a
+// hard cap and leaves stdcopy's Write into an undrained io.Pipe blocked
+// forever. It exercises the real production code path for an
+// oversized-but-under-cap stderr line and is the only end-to-end coverage of
+// the io.Pipe + stdcopy + scanner shutdown sequence, so it earns its keep as
+// a regression guard.
 func TestStreamLogs_OversizedStderrLine_DoesNotWedge(t *testing.T) {
 	// Build a Docker multiplexed stream with a 1.5 MiB stderr "line"
 	// followed by EOF on the underlying reader. 1.5 MiB sits comfortably
-	// above the legacy 1 MiB scanner cap (proving the regression has
-	// not returned) but below the new 16 MiB ReadBoundedLine cap, so the
-	// line streams to the broadcaster as a normal stderr entry.
+	// above bufio.Scanner's 1 MiB cap (the size that would wedge a
+	// Scanner-based pipeline) but below the 16 MiB ReadBoundedLine cap, so
+	// the line streams to the broadcaster as a normal stderr entry.
 	var buf bytes.Buffer
 
 	stderrW := stdcopy.NewStdWriter(&buf, stdcopy.Stderr)
@@ -5551,9 +5550,9 @@ func TestStreamLogs_OversizedStderrLine_DoesNotWedge(t *testing.T) {
 		Project: payload.Project,
 	}))
 
-	// The whole Run + Wait cycle must complete within a bounded window. The
-	// pre-fix behaviour would hang stdcopy forever and waitAndCleanup would
-	// only release after the configured ContainerTimeout (1h in testConfig)
+	// The whole Run + Wait cycle must complete within a bounded window.
+	// Otherwise stdcopy would hang forever and waitAndCleanup would only
+	// release after the configured ContainerTimeout (1h in testConfig)
 	// — way past any reasonable test deadline.
 	done := make(chan struct{})
 
@@ -5574,11 +5573,11 @@ func TestStreamLogs_OversizedStderrLine_DoesNotWedge(t *testing.T) {
 	assert.Equal(t, 0, tr.Count(), "tracker entry must be removed after Run completes")
 }
 
-// TestWaitAndCleanupChat_RemovesChatSecrets exercises Fix M3: the
-// AttachChatStdin-failure rollback path used to invoke RemoveChat + Stop +
-// WaitAndCleanupChat without touching DeleteChatCleanup, leaving the
-// chatSecrets entry stranded forever. WaitAndCleanupChat must now drop the
-// entry regardless of who consumed it.
+// TestWaitAndCleanupChat_RemovesChatSecrets verifies that WaitAndCleanupChat
+// drops the chatSecrets entry regardless of who consumed it. The
+// AttachChatStdin-failure rollback path invokes RemoveChat + Stop +
+// WaitAndCleanupChat without touching DeleteChatCleanup, which would strand
+// the chatSecrets entry forever without this drop.
 func TestWaitAndCleanupChat_RemovesChatSecrets(t *testing.T) {
 	t.Parallel()
 
@@ -5619,10 +5618,10 @@ func TestWaitAndCleanupChat_RemovesChatSecrets(t *testing.T) {
 	assert.Equal(t, 0, count, "chatSecrets must be empty after WaitAndCleanupChat completes")
 }
 
-// TestStartContainer_SkipsTokenMintWhenNoSkillsDir exercises Fix M5: when
+// TestStartContainer_SkipsTokenMintWhenNoSkillsDir verifies that when
 // TaskSkillsDir is unset, m.token.GenerateToken must not be called at all
 // during startContainer. A transient GitHub-API failure on a deployment that
-// does not bind-mount a skills clone used to block every card spawn.
+// does not bind-mount a skills clone would otherwise block every card spawn.
 func TestStartContainer_SkipsTokenMintWhenNoSkillsDir(t *testing.T) {
 	t.Parallel()
 

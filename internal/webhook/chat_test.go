@@ -183,7 +183,7 @@ func TestChatStart_Success(t *testing.T) {
 // TestChatStart_TrackerRegisteredBeforeWaitGoroutine verifies that the wait-and-
 // cleanup goroutine is owned by the webhook handler and only spawned AFTER the
 // tracker entry has been registered. If the goroutine fired earlier (inside
-// StartChat, as it used to) a microsecond-scale container exit could call
+// StartChat, before AddChat) a microsecond-scale container exit could call
 // RemoveChat before AddChat, leaving an orphan entry behind.
 func TestChatStart_TrackerRegisteredBeforeWaitGoroutine(t *testing.T) {
 	tr := tracker.New()
@@ -337,7 +337,7 @@ func TestChatStart_RollbackOnTrackerFailure(t *testing.T) {
 	assert.True(t, stopCalled, "Stop must be called to roll back the container on tracker failure")
 }
 
-// TestChatStart_RollbackMetricsIncremented verifies the W7 fix: when the
+// TestChatStart_RollbackMetricsIncremented verifies that when the
 // rollback Stop returns an error after a tracker-reservation failure, the
 // cmr_chat_rollback_failures_total counter ticks so operator dashboards can
 // alarm on orphaned chat containers.
@@ -409,7 +409,7 @@ func TestChatEnd_Success(t *testing.T) {
 	req := signedRequest(t, "/chat/end", ChatEndPayload{SessionID: "sess-end"})
 	h.hmacAuth(h.handleChatEnd)(w, req)
 
-	// 202 (W10): /chat/end accepts the request, closes stdin, and the
+	// 202: /chat/end accepts the request, closes stdin, and the
 	// container exits asynchronously through WaitAndCleanupChat — mirrors
 	// /end-session.
 	assert.Equal(t, http.StatusAccepted, w.Code)
@@ -455,7 +455,7 @@ func TestChatEnd_StopsEvenWhenStdinAlreadyClosed(t *testing.T) {
 	req := signedRequest(t, "/chat/end", ChatEndPayload{SessionID: "sess-no-stdin"})
 	h.hmacAuth(h.handleChatEnd)(w, req)
 
-	// 202 (W10): matches the happy path.
+	// 202: matches the happy path.
 	assert.Equal(t, http.StatusAccepted, w.Code)
 	assert.True(t, stopCalled, "Stop must be called even when stdin was not attached")
 	assert.False(t, tr.HasChat("sess-no-stdin"))
@@ -867,8 +867,8 @@ func TestChatStart_PrimerWriteError_DoesNotFailRequest(t *testing.T) {
 
 // wedgedChatTrackerWrapper blocks WriteStdinChat indefinitely on a chosen
 // session_id until CloseStdinChat is called for that session. Used to
-// simulate a wedged hijacked stdin socket — i.e. the failure mode W1
-// targets: a write whose underlying TCP socket is blocked on kernel-buffer
+// simulate a wedged hijacked stdin socket — i.e. a write whose underlying
+// TCP socket is blocked on kernel-buffer
 // pressure or a slow peer. Once CloseStdinChat fires the blocked Write
 // inside WriteStdinChat returns and the worker goroutine exits.
 type wedgedChatTrackerWrapper struct {
@@ -941,7 +941,7 @@ func (w *wedgedChatTrackerWrapper) CloseStdinChat(sessionID string) error {
 	return err
 }
 
-// TestChatStart_PrimingWriteTimeoutDoesNotStallRequest pins Fix W1: a
+// TestChatStart_PrimingWriteTimeoutDoesNotStallRequest pins the rule that a
 // wedged hijacked stdin socket whose Write blocks indefinitely must NOT
 // freeze the /chat/start HTTP request thread. The handler must bound the
 // wait by chatPrimingWriteTimeout, force-close the chat container's stdin
@@ -981,8 +981,8 @@ func TestChatStart_PrimingWriteTimeoutDoesNotStallRequest(t *testing.T) {
 	})
 	w := httptest.NewRecorder()
 
-	// Bound the whole request by a generous slack budget. If W1's timeout
-	// isn't installed the goroutine blocks forever and this fires.
+	// Bound the whole request by a generous slack budget. If the priming-write
+	// timeout isn't installed the goroutine blocks forever and this fires.
 	done := make(chan struct{})
 
 	start := time.Now()

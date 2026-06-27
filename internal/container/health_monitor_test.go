@@ -194,9 +194,9 @@ func TestMonitorDockerd_ExitsCleanlyOnContextCancel(t *testing.T) {
 // TestMonitorDockerd_PanicInPingDoesNotKillLoop verifies the per-iteration
 // defer recovers a panic inside PingFn (typically a bug in the Docker SDK
 // or a corrupted internal state on a reconnect attempt) so the monitor
-// keeps its ticker cadence and failure counter alive. Pre-fix a single
-// panic unwound the whole goroutine; main.go's outer recover-and-respawn
-// loop caught that but the new failure counter started from zero, masking
+// keeps its ticker cadence and failure counter alive. Without it a single
+// panic unwinds the whole goroutine; main.go's outer recover-and-respawn
+// loop catches that but the fresh failure counter starts from zero, masking
 // crashlooping dockerd behind a fresh counter.
 func TestMonitorDockerd_PanicInPingDoesNotKillLoop(t *testing.T) {
 	withFastTicker(t)
@@ -247,9 +247,9 @@ func TestMonitorDockerd_PanicInPingDoesNotKillLoop(t *testing.T) {
 
 // TestMonitorDockerd_PanicLoopTripsExit verifies that a panic on every
 // iteration is counted as a probe failure and trips the 3-strike
-// exitFn(1) path just like consecutive regular ping errors do. Pre-fix
-// the recover only logged so a panic-loop in the Docker SDK could panic
-// forever without supervisor restart.
+// exitFn(1) path just like consecutive regular ping errors do. A recover
+// that only logged would let a panic-loop in the Docker SDK panic forever
+// without supervisor restart.
 func TestMonitorDockerd_PanicLoopTripsExit(t *testing.T) {
 	withFastTicker(t)
 	captured := withExitStub(t)

@@ -885,9 +885,8 @@ func TestValidate_GitHubAuthMutualExclusivity(t *testing.T) {
 
 func TestValidate_ReplayCacheDefaultsWhenUnset(t *testing.T) {
 	// A Config literal that calls ApplyDefaults before Validate must
-	// receive the documented defaults. Validate no longer injects
-	// defaults on its own (that lived duplicated in Load() and here);
-	// ApplyDefaults is the single source of truth.
+	// receive the documented defaults. Validate does not inject defaults
+	// on its own; ApplyDefaults is the single source of truth.
 	cfg := baseValidConfigNoGitHub(t)
 	cfg.GitHub = GitHubConfig{AuthMode: "pat", PAT: GitHubPATConfig{Token: "ghp_patonly"}}
 
@@ -1264,7 +1263,7 @@ func TestValidate_DevMode_MixedPinning(t *testing.T) {
 
 // TestValidate_AllowedImagesDigestPin ensures every entry in the
 // allowed_images allowlist is digest-pinned, not just base_image. A single
-// tag-only entry must fail validation so H2's "allowlist matches strings
+// tag-only entry must fail validation so the "allowlist matches strings
 // not digests" gap stays closed.
 func TestValidate_AllowedImagesDigestPin(t *testing.T) {
 	validDigest := "contextmatrix/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1337,7 +1336,7 @@ func TestLoad_DevDefaults_ExplicitSkew(t *testing.T) {
 // TestLoad_DevDefaults_ExplicitPullPolicy verifies that an explicitly-set
 // image_pull_policy is NOT overridden in dev mode. Covers both "always" (trivially
 // distinct from the dev default) and "never" (shares a value with the
-// production default and previously regressed — see git history).
+// production default, a regression-prone overlap).
 func TestLoad_DevDefaults_ExplicitPullPolicy(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1746,8 +1745,8 @@ func TestLoad_EnvParseError_Surfaces(t *testing.T) {
 	assert.Contains(t, err.Error(), "CMR_PORT")
 }
 
-// TestLoad_EnvOverrides_ExtraFields covers the new CMR_* overrides added in
-// Fix 3. Each override is exercised through Load() so the env wiring stays
+// TestLoad_EnvOverrides_ExtraFields covers the CMR_* overrides. Each override
+// is exercised through Load() so the env wiring stays
 // in lockstep with the documented YAML fields.
 func TestLoad_EnvOverrides_ExtraFields(t *testing.T) {
 	dir := t.TempDir()
@@ -2313,10 +2312,10 @@ func TestValidate_NumericCeilings_AtCeilingPasses(t *testing.T) {
 }
 
 // TestApplyDefaults_DerivesAPIBaseURLFromHost verifies that the GitHub
-// auth-block "host" field is no longer dead config: when only host is set,
-// the runner derives a sensible api_base_url so the value flows through to
-// the githubauth consumer. Previously operators following README guidance
-// could set github.host and see the runner accept it while it was a no-op.
+// auth-block "host" field is live config: when only host is set, the runner
+// derives a sensible api_base_url so the value flows through to the
+// githubauth consumer. Setting github.host alone is enough; the runner does
+// not silently accept it as a no-op.
 func TestApplyDefaults_DerivesAPIBaseURLFromHost(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -2401,11 +2400,11 @@ func TestValidate_ClaudeOAuthToken_RejectsControlBytes(t *testing.T) {
 }
 
 // TestValidate_ClaudeOAuthToken_AcceptsSpace anchors the alignment with
-// container.IsValidStaticSecretByte. The config-side check used to reject
-// 0x20 (space) while the container-side gate accepted it, producing a
-// boot-time / refresh-time mismatch. Both now accept the full 0x20..0x7E
-// range; this test pins that contract so a future tightening of either
-// side surfaces here.
+// container.IsValidStaticSecretByte. The config-side check and the
+// container-side gate both accept the full 0x20..0x7E range, including 0x20
+// (space); a mismatch there would produce a boot-time / refresh-time
+// failure. This test pins that contract so a tightening of either side
+// surfaces here.
 func TestValidate_ClaudeOAuthToken_AcceptsSpace(t *testing.T) {
 	c := minimalValidConfig(t)
 	c.AnthropicAPIKey = ""

@@ -892,9 +892,9 @@ func (c *Config) Validate() error {
 }
 
 // requireDigestPin rejects image references that are not @sha256:... pinned.
-// A valid digest reference has the form <name>@sha256:<64 hex chars>. This
-// closes REVIEW.md H2 (allowlist matches mutable strings) by forcing every
-// image reference the runner accepts to name an immutable content hash.
+// A valid digest reference has the form <name>@sha256:<64 hex chars>.
+// Forcing every image reference the runner accepts to name an immutable
+// content hash keeps an allowlist from matching a mutable tag.
 func requireDigestPin(field, image string) error {
 	if image == "" {
 		return fmt.Errorf("%s must be @sha256:... pinned (got empty string)", field)

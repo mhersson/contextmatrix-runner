@@ -115,8 +115,8 @@ func TestEntrypoint_MCPMergeGuardsEmptyURL(t *testing.T) {
 	assert.NotContains(t, src, `jq -n --arg url "$CM_MCP_URL"`,
 		"entrypoint.sh must not reference $CM_MCP_URL bare under set -u; use ${CM_MCP_URL:-}")
 
-	// The original (pre-fix) code wrote both the MCP_ENTRY jq merge and
-	// the mv-tmp file outside any conditional. Verify the merge block
+	// The MCP_ENTRY jq merge and the mv-tmp file must live inside the
+	// CM_MCP_URL guard, not outside any conditional. Verify the merge block
 	// lives inside the guard by extracting it.
 	guardBlock := extractIfBlock(t, src, `if [ -n "${CM_MCP_URL:-}" ]; then`)
 	assert.Contains(t, guardBlock, "MCP_ENTRY=$(jq -n",
@@ -127,8 +127,8 @@ func TestEntrypoint_MCPMergeGuardsEmptyURL(t *testing.T) {
 
 // TestEntrypoint_MCPMergeEmptyURLDoesNotCrashSetU executes the relevant
 // MCP-merge snippet from entrypoint.sh under `set -euo pipefail` with
-// CM_MCP_URL unset. Pre-fix this would exit with "CM_MCP_URL: unbound
-// variable". Post-fix the guard must skip the merge cleanly.
+// CM_MCP_URL unset. Without the guard this would exit with "CM_MCP_URL:
+// unbound variable"; the guard must skip the merge cleanly.
 //
 // The snippet is the literal `if [ -n "${CM_MCP_URL:-}" ]; then ... fi`
 // block extracted from entrypoint.sh, with the surrounding helpers

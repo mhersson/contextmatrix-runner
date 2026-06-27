@@ -124,9 +124,9 @@ esac
 exit 0
 `
 
-// TestEntrypointBranchValidator verifies the new case-based branch validator
-// rejects injection payloads that the old grep-based one would let through.
-// Feeding a literal newline to the subshell via CM_BASE_BRANCH covers C6.
+// TestEntrypointBranchValidator verifies the case-based branch validator
+// rejects injection payloads that a naive grep-based check would let through.
+// Feeding a literal newline to the subshell via CM_BASE_BRANCH exercises this.
 func TestEntrypointBranchValidator(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -176,7 +176,7 @@ func TestEntrypointBranchValidatorInSource(t *testing.T) {
 	assert.Contains(t, src, `-* | *[!A-Za-z0-9._/-]*`,
 		"entrypoint.sh must validate CM_BASE_BRANCH with a whole-string case pattern")
 
-	// The old grep-based validator must be gone.
+	// A grep-based branch validator must not be present.
 	assert.NotContains(t, src, `grep -qE '^-|[[:space:]]'`,
 		"entrypoint.sh must not use the legacy grep-based branch validator")
 }
@@ -212,7 +212,7 @@ func TestEntrypointUsesDynamicGitHost(t *testing.T) {
 	assert.NotContains(t, src, "machine github.com",
 		"entrypoint.sh must not hardcode 'machine github.com'; it should use $GIT_HOST")
 
-	// Must NOT use the legacy sed-based host extraction (sed is line-oriented,
+	// Must NOT use sed-based host extraction (sed is line-oriented,
 	// so a newline in CM_REPO_URL could yield a multi-line value; parameter
 	// expansion + case allowlist is required).
 	assert.NotContains(t, src, "sed -n 's#^https://",
@@ -345,7 +345,7 @@ func TestEntrypointGitCredentialHelperResourcesSecrets(t *testing.T) {
 
 // TestEntrypointInstallsGhWrapper verifies that the entrypoint installs a
 // wrapper script at $HOME/.local/bin/gh that re-sources /run/cm-secrets/env
-// on every invocation, and that the old static export GH_TOKEN= line is gone.
+// on every invocation, and that no static export GH_TOKEN= line is present.
 func TestEntrypointInstallsGhWrapper(t *testing.T) {
 	path := entrypointPath(t)
 	content, err := os.ReadFile(path)
@@ -357,9 +357,9 @@ func TestEntrypointInstallsGhWrapper(t *testing.T) {
 		`entrypoint.sh must create $HOME/.local/bin`)
 	assert.Contains(t, src, `"$HOME/.local/bin/gh"`,
 		`entrypoint.sh must install a wrapper at $HOME/.local/bin/gh`)
-	// The old block conditionally exported GH_TOKEN at entrypoint time,
-	// pinning the value for the container lifetime. The wrapper approach
-	// replaces it; the bare conditional must be gone.
+	// A bare conditional that exported GH_TOKEN at entrypoint time would pin
+	// the value for the container lifetime; the gh wrapper handles token
+	// sourcing instead, so that conditional must not be present.
 	assert.NotContains(t, src, "if [ -n \"${CM_GIT_TOKEN:-}\" ]; then\n    export GH_TOKEN",
 		`entrypoint.sh must not have the old static "if CM_GIT_TOKEN; then export GH_TOKEN" block`)
 }

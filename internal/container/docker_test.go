@@ -143,7 +143,7 @@ func (m *MockDockerClient) Close() error { return nil }
 // no-op success response. Use this as a baseline and override specific fields
 // when a test wants a particular Docker call to fail or capture state.
 //
-// With the panic-on-unconfigured defaults, silent-success is now explicit:
+// With the panic-on-unconfigured defaults, silent-success is explicit:
 // callers see exactly which methods their code will invoke.
 func successfulMock() *MockDockerClient {
 	return &MockDockerClient{

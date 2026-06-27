@@ -283,7 +283,7 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 
 		switch {
 		case errors.Is(err, tracker.ErrLimitReached):
-			// M13: emit a visible saturation signal so operators notice
+			// Emit a visible saturation signal so operators notice
 			// repeated 429s and can scale concurrency or capacity.
 			if h.logger != nil {
 				h.logger.Warn("trigger rejected: runner saturated",
@@ -297,8 +297,8 @@ func (h *Handler) handleTrigger(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusTooManyRequests, CodeLimitReached, "concurrency limit reached")
 		case errors.Is(err, tracker.ErrAlreadyTracked):
 			// Generic 409 — do NOT reveal whether the collision is the same
-			// card_id or a different one (M21 in REVIEW.md: the old
-			// "task already running: <card_id>" leaked tracker state).
+			// card_id or a different one (a "task already running: <card_id>"
+			// message would leak tracker state).
 			h.logDebug("trigger: card already tracked",
 				"card_id", payload.CardID, "project", payload.Project,
 				"correlation_id", correlationIDFromContext(r.Context()))
@@ -506,7 +506,7 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 		// flushing logs, etc.) it MUST be reshaped to KillWithContext so this
 		// loop does not stall the entire /stop-all response on one entry —
 		// the chat-mode branch above already follows that pattern with a 5s
-		// killCtx. Fix W2 in REVIEW.md.
+		// killCtx.
 		if err := h.manager.Kill(info.Project, info.CardID); err != nil {
 			h.logWarn("stop-all: kill failed",
 				"card_id", info.CardID, "project", info.Project, "error", err.Error(),
@@ -531,10 +531,9 @@ func (h *Handler) handleStopAll(w http.ResponseWriter, r *http.Request) {
 		stopped++
 	}
 
-	// 207 Multi-Status if any per-card kill failed; 200 OK otherwise. M40 in
-	// REVIEW.md flagged that the old handler returned 200 even when every
-	// kill failed — the new shape surfaces the failure in both the status
-	// code and the OK flag so callers can branch on either.
+	// 207 Multi-Status if any per-card kill failed; 200 OK otherwise.
+	// Surfacing the failure in both the status code and the OK flag lets
+	// callers branch on either.
 	status := http.StatusOK
 	ok := true
 
@@ -718,7 +717,7 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 			// TOCTOU: entry was Removed between Has and WriteStdin.
 			writeError(w, http.StatusNotFound, CodeNotFound, MsgNoContainerTracked)
 		case errors.Is(err, tracker.ErrStdinClosed):
-			// M39: session has ended (stdin was attached, then closed by
+			// Session has ended (stdin was attached, then closed by
 			// /end-session, CloseStdin, or Remove). 410 Gone tells the
 			// caller the resource is permanently unavailable — no point
 			// retrying.
@@ -826,17 +825,17 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	// infinite promote loop. Fail closed: refuse to write stdin unless CM
 	// confirms autonomous=true.
 	//
-	// Fix W5 in REVIEW.md: a nil cmClient previously bypassed the entire
+	// Without this check, a nil cmClient bypasses the entire
 	// policy gate, making the safety property a function of production
 	// wiring discipline rather than a hard invariant. We can't make
 	// cmClient required at construction time without rewriting ~80
 	// test-side NewHandler call sites, so we fail-closed here instead:
 	// production wiring in cmd/contextmatrix-runner/main.go always supplies
 	// a real client; this branch fires only in tests that deliberately
-	// exercise it (and in any future regression where cmClient is left
+	// exercise it (and in any regression where cmClient is left
 	// unwired).
 	//
-	// Fix W3 in REVIEW.md: this is a runner-side misconfiguration, not an
+	// This is a runner-side misconfiguration, not an
 	// unreachable upstream — surface it as 500/CodeInternal rather than
 	// 502/CodeUpstreamFailure so operator dashboards don't blame CM for a
 	// problem on our side.
@@ -907,8 +906,7 @@ func (h *Handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	// UI never sees a phantom "promoted to autonomous mode" line for a
 	// promotion that actually failed (e.g. non-interactive container,
 	// stdin closed). Mirrors the pattern used by handleEndSession, which
-	// only publishes its "session ended" entry on success. Fix W4 in
-	// REVIEW.md.
+	// only publishes its "session ended" entry on success.
 	if h.broadcaster != nil {
 		h.broadcaster.Publish(logbroadcast.LogEntry{
 			Timestamp: time.Now(),
@@ -978,7 +976,7 @@ func (h *Handler) handleEndSession(w http.ResponseWriter, r *http.Request) {
 			// been closed (a previous /end-session, or the cleanup path).
 			// 410 Gone tells the caller the resource is permanently
 			// unavailable — no point retrying. Mirrors /message's
-			// ErrStdinClosed mapping. Fix W5 in REVIEW.md.
+			// ErrStdinClosed mapping.
 			writeError(w, http.StatusGone, CodeStdinClosed, "session ended")
 		case errors.Is(err, tracker.ErrNoStdinAttached):
 			writeError(w, http.StatusConflict, CodeConflict, MsgNotInteractive)
@@ -1031,10 +1029,9 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Defence-in-depth: every other handler that touches the broadcaster
-	// nil-guards it; SSE was previously alone in trusting the field to be
-	// wired. A test fixture that constructs a Handler literal without a
-	// broadcaster (or any future regression) would panic here. Fix W4 in
-	// REVIEW.md.
+	// nil-guards it, and so does SSE. Without this guard a test fixture that
+	// constructs a Handler literal without a broadcaster (or any regression
+	// that leaves it unwired) would panic here.
 	if h.broadcaster == nil {
 		writeError(w, http.StatusInternalServerError, CodeInternal, "log broadcaster not configured")
 
@@ -1157,7 +1154,7 @@ func (h *Handler) AdminAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // hmacAuth is middleware that verifies HMAC signatures on incoming requests.
 //
-// M8 in REVIEW.md: every authentication failure returns a single fixed 401
+// Every authentication failure returns a single fixed 401
 // body with {code: "unauthorized", message: "unauthorized"}. The specific
 // reason (missing header, bad signature, expired timestamp, unreadable body)
 // is logged server-side at Debug level but never echoed to the client, so a
@@ -1178,7 +1175,6 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		// Content-Length still fall through to the LimitReader below; that
 		// path remains a 401, since we cannot distinguish "too large" from
 		// "signature mismatch" without reading the bytes.
-		// Fix W1 / W10 in REVIEW.md.
 		if r.ContentLength > maxRequestBodyBytes {
 			h.logDebug("hmac auth: content-length exceeds cap",
 				"remote_addr", r.RemoteAddr,
@@ -1226,12 +1222,10 @@ func (h *Handler) hmacAuth(next http.HandlerFunc) http.HandlerFunc {
 		// config.WebhookReplaySkewSeconds. Operators that want a strict
 		// clock-skew bound must set webhook_replay_skew_seconds to a
 		// small positive integer (e.g. 30). Config.Validate() rejects
-		// negative values and caps the max at one week but currently
-		// treats 0 as "unset". Tightening the config validator to
-		// reject an explicit 0 is tracked as a follow-up in the config
-		// package; this branch is the runtime safety net so the
-		// behaviour is at least consistent regardless of how skew got
-		// to 0. Fix W11 in REVIEW.md.
+		// negative values and caps the max at one week but treats 0 as
+		// "unset" rather than rejecting an explicit 0. This branch is the
+		// runtime safety net so the behaviour is consistent regardless of
+		// how skew got to 0.
 		skew := h.webhookReplaySkew
 		if skew == 0 {
 			skew = protocol.DefaultMaxClockSkew
@@ -1315,7 +1309,7 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 
 // writeValidationError maps a *ValidationError to a 400 ErrorResponse. The
 // response message is "invalid <field>" — the field name only, never the
-// user-supplied value (M4 in REVIEW.md: the value may itself be injection-
+// user-supplied value (the value may itself be injection-
 // crafted text and should not be echoed). If err is not a *ValidationError
 // it is treated as an opaque 400.
 func writeValidationError(w http.ResponseWriter, err error) {

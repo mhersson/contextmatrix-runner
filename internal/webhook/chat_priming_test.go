@@ -46,8 +46,8 @@ func TestBuildChatRehydrationPriming_ContainsContract(t *testing.T) {
 
 // TestBuildChatRehydrationPriming_NoPanicOnEdgeSessionIDs verifies that the
 // function does not panic on edge-case session IDs (empty, very long, etc.).
-// This ensures safe string formatting even if session ID validation is relaxed
-// in the future.
+// This ensures safe string formatting independent of how strict session ID
+// validation is upstream.
 func TestBuildChatRehydrationPriming_NoPanicOnEdgeSessionIDs(t *testing.T) {
 	t.Parallel()
 

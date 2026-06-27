@@ -55,9 +55,9 @@ func MonitorDockerd(ctx context.Context, docker DockerClient, logger *slog.Logge
 // states the docker SDK's internal reconnect logic does not handle.
 //
 // A panic inside pingOnce (typically a bug in the Docker SDK or a corrupted
-// internal state on a third-party reconnect attempt) used to unwind the
-// whole goroutine; main.go's outer recover-and-respawn loop catches that
-// but a short window of monitoring is lost. The per-iteration recover
+// internal state on a third-party reconnect attempt) would otherwise unwind
+// the whole goroutine; main.go's outer recover-and-respawn loop would catch
+// that but lose a short window of monitoring. The per-iteration recover
 // here keeps the same goroutine alive so the failure counter and ticker
 // cadence are preserved across pathological probes. mx may be nil for
 // callers that have no Prometheus registry wired (tests).
@@ -79,9 +79,9 @@ func MonitorDockerdWithMetrics(ctx context.Context, docker DockerClient, logger 
 	//     invoked; the caller returns immediately too.
 	//
 	// A recovered panic is treated as a probe failure (failures++) and may
-	// trip the 3-strike exitFn(1) path. Pre-fix the recover only logged
-	// and incremented PanicRecoveredTotal, so a panic-loop in the Docker
-	// SDK could panic on every tick forever without supervisor restart.
+	// trip the 3-strike exitFn(1) path. A recover that only logged and
+	// incremented PanicRecoveredTotal would let a panic-loop in the Docker
+	// SDK panic on every tick forever without supervisor restart.
 	runOneIteration := func() (exit bool, exitForce bool) {
 		defer func() {
 			if r := recover(); r != nil {

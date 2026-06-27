@@ -2,14 +2,8 @@
 
 > [!WARNING]
 >
-> This project is under heavy development. Breaking changes should be expected
-> at the current stage.
->
-> **Breaking change (current):** `admin_port` now defaults to `0` (disabled).
-> Previously the admin endpoint (Prometheus `/metrics` + `/ready`) started
-> automatically on port `9091`. If you rely on Prometheus scraping, add
-> `admin_port: 9091` to `config.yaml` (or set `CMR_ADMIN_PORT=9091`) to restore
-> the old behaviour after upgrading.
+> This project is under heavy development. Expect breaking changes at this
+> stage.
 
 A self-hosted runner that receives webhooks from
 [ContextMatrix](https://github.com/mhersson/contextmatrix) and spawns disposable
@@ -389,11 +383,8 @@ The runner operates in one of two modes, set via `deployment_profile` in
 
 | Profile      | Behaviour                                                                                                                     |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| `production` | All validators enforced at full strength. No change from pre-feature behaviour.                                               |
+| `production` | All validators enforced at full strength.                                                                                     |
 | `dev`        | Five validators relaxed for local single-box setups. Every relaxation logs a startup or per-request line — nothing is silent. |
-
-`deployment_profile: production` (or unset) is byte-identical to the pre-feature
-behaviour.
 
 ### Dev-mode relaxations
 
@@ -413,8 +404,7 @@ behaviour.
    default above.
 
 4. **Configurable HMAC skew** — the skew from `webhook_replay_skew_seconds` is
-   now threaded into HMAC verification (previously hardcoded to 5 min), so the
-   wider dev-mode window actually takes effect.
+   threaded into HMAC verification, so the wider dev-mode window takes effect.
 
 5. **Chat resume files staged in tmp** — when staging a chat session's
    rehydration files, the runner first tries `secrets_dir` (default
@@ -593,8 +583,9 @@ HMAC is computed over `method + "\n" + uri + "\n" + timestamp + "." + body`,
 where `uri` is the request-target form (path plus `?rawquery` when present).
 Method and URI are bound into the signature so a valid signature for one
 endpoint cannot be replayed against another, and same-second GETs to the same
-path with different query strings produce distinct signatures. Max 5-minute
-clock skew (configurable in dev profile via `webhook_replay_skew_seconds`).
+path with different query strings produce distinct signatures. The maximum
+clock skew is `webhook_replay_skew_seconds` (default 330 s; 86400 s in the dev
+profile).
 
 Status callback values: `running` (container started), `failed` (error or
 non-zero exit), `completed` (clean exit).
@@ -759,12 +750,12 @@ Every container is launched with the following restrictions:
 ### Files in workspace owned by wrong user after container exits
 
 The worker container runs as UID 1000. If the host user running the runner has a
-different UID, files created inside bind-mounted volumes will be owned by UID
-1000 on the host. This only matters for bind mounts — the default disposable
+different UID, files created inside bind-mounted volumes are owned by UID 1000
+on the host. This only matters for bind mounts — the default disposable
 container filesystem is discarded on exit.
 
 ### Orphan containers after runner crash
 
 The runner automatically cleans up orphan containers on startup (identified by
-the `contextmatrix.runner=true` label). ContextMatrix will detect the heartbeat
-timeout (default 30 minutes) and mark the card as stalled.
+the `contextmatrix.runner=true` label). ContextMatrix detects the heartbeat
+timeout (default 30 minutes) and marks the card as stalled.

@@ -21,7 +21,7 @@ import (
 // initReadBufSize is the initial capacity for the bufio.Reader that consumes
 // Claude Code's stream-json output. bufio.Reader has no hard line-length cap
 // (unlike bufio.Scanner's MaxScanTokenSize), so a single long thinking block
-// from Opus on a complex task no longer terminates the parser with
+// from Opus on a complex task does not terminate the parser with
 // bufio.ErrTooLong. The reader grows as needed; this constant only sets the
 // starting allocation so the common short-line case isn't oversized.
 const initReadBufSize = 64 * 1024 // 64 KiB

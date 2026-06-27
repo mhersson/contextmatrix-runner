@@ -153,10 +153,10 @@ func TestReplayCache_Run_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// TestReplayCache_DefaultSweepInterval pins Fix W11: a short TTL must
+// TestReplayCache_DefaultSweepInterval pins the rule that a short TTL must
 // produce a proportionally fast sweep tick. min(ttl/2, 60s) means a 10s
-// TTL sweeps every 5s, not every 60s — without the fix, expired entries
-// would linger up to 2×ttl rather than 1.5×ttl in the worst case.
+// TTL sweeps every 5s, not every 60s — without a proportional tick, expired
+// entries would linger up to 2×ttl rather than 1.5×ttl in the worst case.
 func TestReplayCache_DefaultSweepInterval(t *testing.T) {
 	cases := []struct {
 		ttl  time.Duration

@@ -53,8 +53,8 @@ var ErrAlreadyTracked = errors.New("container already tracked")
 //   - Readers (WriteStdin, CloseStdin, MarkStdinClosed, and the chat
 //     variants) capture info.stdin into a local while holding tracker.mu
 //     (RLock), THEN release tracker.mu BEFORE touching stdin.mu. This
-//     synchronises the field access (silencing the race detector — see
-//     Fix W8 in REVIEW.md) without holding tracker.mu across the
+//     synchronises the field access (silencing the race detector)
+//     without holding tracker.mu across the
 //     potentially-blocking Write/Close on a hijacked TCP socket.
 //   - Once info.stdin is allocated it is never reset to nil for that
 //     entry's lifetime; only the writer field (info.stdin.stdin) is
@@ -236,10 +236,10 @@ func (t *Tracker) Cancel(project, cardID string) bool {
 //     attached stdin.
 //   - Late-arrival path (entry already Removed): tracker.mu is released
 //     BEFORE we touch w/onClose, then closeWriterAsync runs the close +
-//     onClose dispatch on a goroutine under stdinCloseTimeout. This is the
-//     H20 + late-arrival watchdog fix: a wedged hijacked TCP socket whose
-//     Close() blocks on kernel-buffer pressure or a slow peer must not be
-//     able to freeze tracker.mu for the rest of the runner.
+//     onClose dispatch on a goroutine under stdinCloseTimeout. This keeps a
+//     wedged hijacked TCP socket whose Close() blocks on kernel-buffer
+//     pressure or a slow peer from freezing tracker.mu for the rest of the
+//     runner.
 func (t *Tracker) SetStdin(project, cardID string, w io.WriteCloser, onClose func()) {
 	k := key(project, cardID)
 
@@ -283,10 +283,9 @@ func (t *Tracker) SetStdin(project, cardID string, w io.WriteCloser, onClose fun
 // Lock discipline: both the map lookup and the snapshot of info.stdin
 // happen under tracker.mu (RLock). The lock is released BEFORE acquiring
 // stdin.mu so a slow writer's Close on stdin.mu cannot block readers on
-// tracker.mu. This is the W8 fix — the older code read info.stdin
-// without synchronisation, which the race detector flagged on
-// concurrent SetStdin + WriteStdin even though the access pattern is
-// logically safe (a missed write returns the benign
+// tracker.mu. Reading info.stdin without synchronisation would draw a
+// race-detector flag on concurrent SetStdin + WriteStdin even though the
+// access pattern is logically safe (a missed write returns the benign
 // ErrNoStdinAttached). Capturing under RLock makes the read happens-
 // before the write in SetStdin and silences the detector without
 // changing the lock ordering.
@@ -404,7 +403,7 @@ func (t *Tracker) MarkStdinClosedChat(sessionID string) error {
 // Idempotent: a second successful call returns ErrStdinClosed (not
 // ErrNoStdinAttached) so handlers can map a retried /end-session to 410
 // Gone instead of 409 Conflict (which would falsely imply the container
-// was never interactive). Fix W5 in REVIEW.md.
+// was never interactive).
 func (t *Tracker) CloseStdin(project, cardID string) error {
 	t.mu.RLock()
 
@@ -430,7 +429,7 @@ func (t *Tracker) CloseStdin(project, cardID string) error {
 		// stdin pointer exists (SetStdin was called at some point) but
 		// the writer has been nil'd by a prior close. Surface this as
 		// ErrStdinClosed so an idempotent /end-session retry maps to
-		// 410 Gone rather than 409 Conflict. Fix W5 in REVIEW.md.
+		// 410 Gone rather than 409 Conflict.
 		return fmt.Errorf("stdin closed for %s/%s: %w", project, cardID, ErrStdinClosed)
 	}
 
@@ -455,7 +454,7 @@ func (t *Tracker) CloseStdin(project, cardID string) error {
 // Uses time.NewTimer + explicit Stop instead of time.After so the timer is
 // released as soon as the close completes; otherwise the runtime keeps the
 // underlying Timer pinned until the deadline elapses, matching the
-// callback package's retry-loop discipline. Fix W12 in REVIEW.md.
+// callback package's retry-loop discipline.
 func closeStdinAsync(info *ContainerInfo, label string) {
 	done := make(chan struct{})
 
@@ -497,7 +496,7 @@ func closeStdinAsync(info *ContainerInfo, label string) {
 // label is used only in the warning log. Either w or onClose may be nil.
 //
 // Uses time.NewTimer + explicit Stop instead of time.After for parity with
-// closeStdinAsync (see Fix W12 in REVIEW.md).
+// closeStdinAsync.
 func closeWriterAsync(w io.Closer, onClose func(), label string) {
 	if w == nil && onClose == nil {
 		return
@@ -642,7 +641,7 @@ func (t *Tracker) RemoveChat(sessionID string) {
 //
 // Lock discipline mirrors WriteStdin: info.stdin is captured under
 // tracker.mu (RLock) so the read is correctly synchronised against
-// SetStdinChat's write to that field. Fix W8 in REVIEW.md.
+// SetStdinChat's write to that field.
 func (t *Tracker) WriteStdinChat(sessionID string, b []byte) error {
 	t.mu.RLock()
 
@@ -680,7 +679,7 @@ func (t *Tracker) WriteStdinChat(sessionID string, b []byte) error {
 // ErrNoStdinAttached if SetStdinChat was never called, and ErrStdinClosed
 // if SetStdinChat WAS called but the writer has since been closed (a prior
 // CloseStdinChat, or RemoveChat's stdin cleanup). Idempotent — a second
-// successful call returns ErrStdinClosed. Fix W5 in REVIEW.md.
+// successful call returns ErrStdinClosed.
 func (t *Tracker) CloseStdinChat(sessionID string) error {
 	t.mu.RLock()
 

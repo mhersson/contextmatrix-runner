@@ -187,8 +187,8 @@ func TestMaintenanceLoop_NonPositiveIntervalBlocksUntilCancel(t *testing.T) {
 
 // TestMaintenanceLoop_DisabledDoesNotProduceRepeatedWarnings verifies the
 // disabled path emits exactly one WARN (not one per respawn-backoff tick).
-// Without C2 the outer respawn loop in main() would log "maintenance loop
-// disabled" every ~5 s for the process lifetime.
+// Without this guard the outer respawn loop in main() would log "maintenance
+// loop disabled" every ~5 s for the process lifetime.
 func TestMaintenanceLoop_DisabledDoesNotProduceRepeatedWarnings(t *testing.T) {
 	target := &stubMaintenanceTarget{}
 	health := &stubMaintenanceHealth{}

@@ -143,7 +143,7 @@ func TestValidateRepoURL(t *testing.T) {
 		// git SCP-style path (no URL scheme — passes url.Parse but scheme is empty)
 		{"scp-style git URL", "git@github.com:org/repo.git", true},
 
-		// userinfo rejections (Fix W2): a CM-supplied URL must not embed
+		// userinfo rejections: a CM-supplied URL must not embed
 		// credentials, otherwise an attacker-controlled CM could leak tokens
 		// into the worker's git config.
 		{"https with userinfo", "https://user@github.com/org/repo.git", true},
@@ -571,8 +571,8 @@ func TestValidatePayload_ByValue(t *testing.T) {
 	require.NoError(t, ValidatePayload(ChatEndPayload{SessionID: "sess-1"}))
 }
 
-// TestValidatePayload_UnknownTypeRejected verifies the W8 fix: unknown
-// payload types now fail loudly with a clear error rather than silently
+// TestValidatePayload_UnknownTypeRejected verifies that unknown
+// payload types fail loudly with a clear error rather than silently
 // returning nil. A handler that registers a new struct without wiring its
 // dispatch branch in ValidatePayload must surface the mistake immediately
 // rather than bypassing the validation gate.
@@ -706,7 +706,7 @@ func TestValidateTaskSkills_ReturnsValidationError(t *testing.T) {
 	assert.Equal(t, "task_skills", ve.Field)
 }
 
-// TestValidateTaskSkills_LengthCap verifies the W10 fix: an attacker
+// TestValidateTaskSkills_LengthCap verifies that an attacker
 // shipping a million skill entries that all individually pass the charset
 // check is rejected by the slice-length cap.
 func TestValidateTaskSkills_LengthCap(t *testing.T) {
@@ -734,7 +734,7 @@ func TestValidateTaskSkills_LengthCap(t *testing.T) {
 	assert.Contains(t, ve.Reason, "too many entries")
 }
 
-// TestValidatePayload_TriggerModel verifies the W1 fix: TriggerPayload.Model
+// TestValidatePayload_TriggerModel verifies that TriggerPayload.Model
 // must be validated against chatModelPattern when non-empty, and pass through
 // when empty.
 func TestValidatePayload_TriggerModel(t *testing.T) {
@@ -770,7 +770,7 @@ func TestValidatePayload_TriggerModel(t *testing.T) {
 	}
 }
 
-// TestValidateMCPAPIKey verifies the W6 fix: the MCP API key (which is
+// TestValidateMCPAPIKey verifies that the MCP API key (which is
 // forwarded into the worker env unchanged) must be validated for length,
 // UTF-8, and control bytes when non-empty.
 func TestValidateMCPAPIKey(t *testing.T) {
@@ -806,8 +806,8 @@ func TestValidateMCPAPIKey(t *testing.T) {
 	}
 }
 
-// TestValidatePayload_TriggerMCPAPIKey verifies the W6 fix at the dispatch
-// level: an invalid MCPAPIKey on /trigger surfaces as field="mcp_api_key".
+// TestValidatePayload_TriggerMCPAPIKey verifies at the dispatch level that
+// an invalid MCPAPIKey on /trigger surfaces as field="mcp_api_key".
 func TestValidatePayload_TriggerMCPAPIKey(t *testing.T) {
 	p := &TriggerPayload{
 		CardID:    "C-1",
@@ -824,8 +824,8 @@ func TestValidatePayload_TriggerMCPAPIKey(t *testing.T) {
 	assert.Equal(t, "mcp_api_key", ve.Field)
 }
 
-// TestValidatePayload_ChatStartMCPAPIKey verifies the W6 fix at the chat
-// dispatch level.
+// TestValidatePayload_ChatStartMCPAPIKey verifies MCP API key validation at
+// the chat dispatch level.
 func TestValidatePayload_ChatStartMCPAPIKey(t *testing.T) {
 	p := &ChatStartPayload{
 		SessionID: "sess-1",
@@ -840,8 +840,8 @@ func TestValidatePayload_ChatStartMCPAPIKey(t *testing.T) {
 	assert.Equal(t, "mcp_api_key", ve.Field)
 }
 
-// TestValidatePayload_ChatStartPrimer_NUL verifies the W9 fix on Primer:
-// a NUL byte in the orientation text is rejected.
+// TestValidatePayload_ChatStartPrimer_NUL verifies that a NUL byte in the
+// Primer orientation text is rejected.
 func TestValidatePayload_ChatStartPrimer_NUL(t *testing.T) {
 	err := ValidatePayload(&ChatStartPayload{
 		SessionID: "sess-1",
@@ -856,8 +856,8 @@ func TestValidatePayload_ChatStartPrimer_NUL(t *testing.T) {
 	assert.Contains(t, ve.Reason, "NUL")
 }
 
-// TestValidatePayload_ChatStartResumeContent_NUL verifies the W9 fix on
-// resume turn content.
+// TestValidatePayload_ChatStartResumeContent_NUL verifies NUL-byte rejection
+// on resume turn content.
 func TestValidatePayload_ChatStartResumeContent_NUL(t *testing.T) {
 	err := ValidatePayload(&ChatStartPayload{
 		SessionID: "sess-1",

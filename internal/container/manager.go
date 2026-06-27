@@ -91,8 +91,8 @@ const (
 	// dockerCleanupTimeout bounds the detached contexts used for
 	// best-effort Docker cleanup (Stop / Remove / Kill) that must run
 	// even when the parent ctx has already been cancelled. A hung
-	// dockerd used to stall shutdown forever; now every such call has
-	// a hard cap.
+	// dockerd would otherwise stall shutdown forever; this cap bounds
+	// every such call.
 	dockerCleanupTimeout = 5 * time.Second
 
 	// runningStatusCallbackTimeout bounds the detached context used by
@@ -112,9 +112,9 @@ const (
 )
 
 // primingWriteTimeout bounds the priming WriteStdin call made right after
-// ContainerAttach. A wedged hijacked socket used to hang the Run goroutine
-// indefinitely; now the goroutine gives up after this deadline and continues
-// into waitAndCleanup so normal cancellation paths work.
+// ContainerAttach. A wedged hijacked socket would otherwise hang the Run
+// goroutine indefinitely; with this deadline the goroutine gives up and
+// continues into waitAndCleanup so normal cancellation paths work.
 //
 // Declared as a package var (not a const) so tests can shrink it to keep
 // synthetic-wedge cases fast.
@@ -122,9 +122,10 @@ var primingWriteTimeout = 5 * time.Second
 
 // logDrainTimeout bounds the <-logDone wait on the cancel, timeout, and
 // error branches of waitAndCleanup. A hung log-streaming goroutine (wedged
-// docker daemon, stuck hijacked socket, or stdcopy/scanner stall) used to
-// stall those branches indefinitely, preventing the cleanup defers from
-// running and leaking the container until container_timeout (2h default).
+// docker daemon, stuck hijacked socket, or stdcopy/scanner stall) would
+// otherwise stall those branches indefinitely, preventing the cleanup
+// defers from running and leaking the container until container_timeout
+// (2h default).
 // Declared as a package var so tests can shrink it without waiting 5s of
 // wall time per synthetic-wedge scenario.
 var logDrainTimeout = 5 * time.Second
@@ -221,8 +222,8 @@ func pullSkillsEnv(ctx context.Context, dir, token string) []string {
 const imagePruneMaxAge = "24h"
 
 // dnsLookupTimeout bounds buildExtraHosts' resolver call. An attacker who
-// points the card's MCP URL at a slow-responding authoritative server used
-// to be able to stall the spawn path indefinitely (H24); the deadline caps
+// points the card's MCP URL at a slow-responding authoritative server could
+// otherwise stall the spawn path indefinitely; the deadline caps
 // exposure at 2s and then falls back to running the container without the
 // ExtraHosts entry. The container can still reach the MCP server via the
 // normal host-gateway route if DNS inside the container itself works.
@@ -524,7 +525,7 @@ func (m *Manager) Run(ctx context.Context, payload RunConfig) {
 					[]any{"card_id", payload.CardID, "project", payload.Project},
 					nil)
 
-				// H22: close the partial-failure window. If startContainer had
+				// Close the partial-failure window. If startContainer had
 				// already returned a container ID and then something downstream
 				// panicked before waitAndCleanup installed its defers, the
 				// Docker container would leak because tracker.Remove alone only
@@ -860,7 +861,7 @@ func (m *Manager) startContainer(ctx context.Context, payload RunConfig) (string
 			// Wrap the priming WriteStdin with a deadline. The
 			// hijacked net.Conn can wedge on kernel buffer pressure,
 			// a slow container, or a misbehaving proxy, and a
-			// synchronous write used to block the Run goroutine
+			// synchronous write would otherwise block the Run goroutine
 			// forever. We can't reach through
 			// tracker.WriteStdin to set a net.Conn write deadline (the
 			// writer is behind an io.WriteCloser interface and mocks
@@ -1154,7 +1155,7 @@ func (m *Manager) waitAndCleanup(ctx context.Context, containerID string, payloa
 	// execution order. We want the tracker entry to disappear first so
 	// `/message`, `/promote`, and `/end-session` requests that race with
 	// cleanup return 404 (no container tracked) rather than 500 (stdin
-	// write against a dead container). H21.
+	// write against a dead container).
 	//
 	// Actual execution order:
 	//   1. tracker.Remove  — unpublish the entry (also closes stdin).
@@ -1384,8 +1385,8 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 		// The three child goroutines spawned below can each take a panic
 		// from third-party input — stdcopy on a malformed docker multiplex
 		// frame, bufio.Scanner on bogus UTF-8, the logparser on a bad
-		// stream-json line. A panic in any of them used to unwind the
-		// whole runner process; the recover() wrappers below
+		// stream-json line. A panic in any of them would otherwise unwind
+		// the whole runner process; the recover() wrappers below
 		// isolate each goroutine so one bad container can't crash
 		// everything else. The outer goroutine runs logparser
 		// synchronously, so it shares the outer's recovery — we recover()
@@ -1478,7 +1479,7 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 				}
 			}()
 
-			// bufio.Reader avoids the old bufio.Scanner 1 MiB cap;
+			// bufio.Reader avoids bufio.Scanner's 1 MiB cap;
 			// logparser.ReadBoundedLine adds a soft per-line cap so a
 			// runaway stderr stream can't pin the runner heap. Read
 			// from the progressReader wrapper so the idle watchdog
@@ -2787,7 +2788,7 @@ func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 		// StreamChatLogs ever consumed them. The /chat/start rollback path
 		// that calls AttachChatStdin and fails routes through
 		// RemoveChat + Stop + WaitAndCleanupChat without touching
-		// DeleteChatCleanup, which used to leak the entry forever. Idempotent
+		// DeleteChatCleanup, which would otherwise leak the entry forever. Idempotent
 		// on a key that was already consumed by StreamChatLogs.
 		m.chatSecretsMu.Lock()
 		delete(m.chatSecrets, containerID)
@@ -2943,7 +2944,7 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 				}
 			}()
 
-			// bufio.Reader avoids the old bufio.Scanner 1 MiB cap;
+			// bufio.Reader avoids bufio.Scanner's 1 MiB cap;
 			// logparser.ReadBoundedLine adds a soft per-line cap so a
 			// runaway stderr stream can't pin the runner heap.
 			br := bufio.NewReaderSize(stderrPr, 64*1024)
@@ -3161,7 +3162,7 @@ func (m *Manager) taskSkillsMount(ctx context.Context, gitToken string) (mount.M
 //
 // PidsLimit is copied to a local before taking its address so concurrent
 // spawns each get an independent pointer. Sharing &m.cfg.ContainerPidsLimit
-// across containers used to expose a field-address: any code path that
+// across containers would expose a field-address bug: any code path that
 // mutated m.cfg.ContainerPidsLimit would retroactively change the limit
 // observed by every running container's HostConfig snapshot, and the
 // Docker SDK can keep a reference to that pointer for the lifetime of the

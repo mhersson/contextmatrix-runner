@@ -133,9 +133,9 @@ func TestMessageDedupCache_Run_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// TestMessageDedupCache_DefaultSweepInterval pins Fix W11 for the dedup
-// cache: a short TTL must produce a fast sweep tick (min(ttl/2, 60s))
-// rather than always defaulting to 60s.
+// TestMessageDedupCache_DefaultSweepInterval pins the dedup cache rule that
+// a short TTL must produce a fast sweep tick (min(ttl/2, 60s)) rather than
+// always defaulting to 60s.
 func TestMessageDedupCache_DefaultSweepInterval(t *testing.T) {
 	cases := []struct {
 		ttl  time.Duration

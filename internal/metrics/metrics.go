@@ -36,10 +36,10 @@ const (
 	GoroutineRunningStatusCallback = "running_status_callback"
 	GoroutineSkillEngagedCallback  = "skill_engaged_callback"
 	GoroutinePrimingWrite          = "priming_write"
-	// GoroutineWaitAndCleanupChat buckets the wg-tracked goroutine spawned
-	// by Manager.WaitAndCleanupChat. A panic there used to crash the runner
-	// because the function was the only manager background goroutine without
-	// the shared handlePanic defer.
+	// GoroutineWaitAndCleanupChat buckets panics from the wg-tracked
+	// goroutine spawned by Manager.WaitAndCleanupChat. A panic there would
+	// crash the runner without the shared handlePanic defer this goroutine
+	// carries.
 	GoroutineWaitAndCleanupChat = "wait_and_cleanup_chat"
 	// GoroutineIdleWatchdog buckets panics from Manager.runIdleWatchdog
 	// (per-container idle-output watchdog).
@@ -50,9 +50,9 @@ const (
 	// of an existing series.
 	GoroutineDockerdMonitor = "dockerd_monitor"
 	// GoroutineTokenRefresher buckets panics recovered by the deferred
-	// recover in tokenRefresher.Run. Pre-fix the recovered panic was logged
-	// but never counted, so a wedged GitHub-token mint path could panic on
-	// every iteration without showing up in cmr_panic_recovered_total.
+	// recover in tokenRefresher.Run. Without this bucket the recovered panic
+	// is logged but never counted, so a wedged GitHub-token mint path could
+	// panic on every iteration without showing up in cmr_panic_recovered_total.
 	GoroutineTokenRefresher = "token_refresher"
 )
 
@@ -141,7 +141,7 @@ type Metrics struct {
 	// follow-up container Stop returned an error after a tracker reservation
 	// or stdin-attach failure. Operator alarm: a non-zero value means we have
 	// orphaned chat containers leaking until the 2h sweep. Label-free so
-	// cardinality stays O(1). Fix W7 in REVIEW.md.
+	// cardinality stays O(1).
 	ChatRollbackFailuresTotal prometheus.Counter
 }
 

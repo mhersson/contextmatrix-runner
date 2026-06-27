@@ -233,9 +233,9 @@ func (p *panickingTokenGen) GenerateToken(_ context.Context) (string, time.Time,
 
 // TestTokenRefresherRunRecoversPanicIncrementsMetric verifies that a panic
 // raised inside the mint loop is recovered by the deferred recover and
-// bumps PanicRecoveredTotal{goroutine=token_refresher}. Pre-fix the panic
-// was only logged so an attacker (or a buggy upstream) could panic-loop
-// the refresher silently.
+// bumps PanicRecoveredTotal{goroutine=token_refresher}. If the panic were
+// only logged, an attacker (or a buggy upstream) could panic-loop the
+// refresher silently.
 func TestTokenRefresherRunRecoversPanicIncrementsMetric(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, sharedSecretsSubdir), 0o700))
