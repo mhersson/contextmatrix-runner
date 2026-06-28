@@ -51,7 +51,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE_NAME="contextmatrix-runner"
 SERVICE_FILE="${HOME}/.config/systemd/user/${SERVICE_NAME}.service"
 BINARY="${SCRIPT_DIR}/contextmatrix-runner"
-CONFIG="${SCRIPT_DIR}/config.yaml"
+# Config path honors XDG_CONFIG_HOME (default ~/.config). Passed explicitly
+# via --config below so systemd and redeploy.sh agree on one file.
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/contextmatrix-runner/config.yaml"
 
 usage() {
     cat <<EOF

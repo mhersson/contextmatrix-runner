@@ -4,14 +4,19 @@
 # bumblebee-style single-host deployment. Run from the runner repo root.
 #
 # Overridable env vars:
-#   CMR_CONFIG       path to config.yaml (default ~/.config/contextmatrix-runner/config.yaml)
-#   CMR_WORKER_IMAGE image ref used for `docker inspect` (default contextmatrix/worker:latest)
-#   CMR_SERVICE      systemd user unit name (default contextmatrix-runner)
+#   RUNNER_CONFIG       path to config.yaml
+#                       (default ${XDG_CONFIG_HOME:-~/.config}/contextmatrix-runner/config.yaml)
+#   RUNNER_WORKER_IMAGE image ref used for `docker inspect` (default contextmatrix/worker:latest)
+#   RUNNER_SERVICE      systemd user unit name (default contextmatrix-runner)
 set -euo pipefail
 
-CONFIG="${CMR_CONFIG:-$HOME/.config/contextmatrix-runner/config.yaml}"
-WORKER_IMAGE="${CMR_WORKER_IMAGE:-contextmatrix/worker:latest}"
-SERVICE="${CMR_SERVICE:-contextmatrix-runner}"
+CONFIG="${RUNNER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/contextmatrix-runner/config.yaml}"
+WORKER_IMAGE="${RUNNER_WORKER_IMAGE:-contextmatrix/worker:latest}"
+SERVICE="${RUNNER_SERVICE:-contextmatrix-runner}"
+
+# Repo portion of the image ref (strip the trailing :tag) — used to match
+# the RepoDigest emitted by `docker image inspect`.
+WORKER_REPO="${WORKER_IMAGE%:*}"
 
 [ -f "$CONFIG" ] || {
   echo "ERROR: $CONFIG not found" >&2
@@ -19,6 +24,11 @@ SERVICE="${CMR_SERVICE:-contextmatrix-runner}"
 }
 [ -w "$CONFIG" ] || {
   echo "ERROR: $CONFIG not writable" >&2
+  exit 1
+}
+grep -q '^base_image:' "$CONFIG" || {
+  echo "ERROR: no active 'base_image:' line in $CONFIG to pin" >&2
+  echo "       add 'base_image: ${WORKER_IMAGE}' (any value) before the first redeploy" >&2
   exit 1
 }
 command -v docker >/dev/null || {
@@ -39,18 +49,20 @@ make docker-worker
 echo "==> capturing RepoDigest for ${WORKER_IMAGE}"
 digest=$(docker image inspect "$WORKER_IMAGE" \
   --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-  | grep '^contextmatrix/worker@sha256:' | head -n 1)
+  | grep "^${WORKER_REPO}@sha256:" | head -n 1)
 if [ -z "$digest" ]; then
-  echo "ERROR: no contextmatrix/worker@sha256 RepoDigest on ${WORKER_IMAGE}" >&2
+  echo "ERROR: no ${WORKER_REPO}@sha256 RepoDigest on ${WORKER_IMAGE}" >&2
   echo "       rebuild produced an image without a digest — push to a registry or retag" >&2
   exit 1
 fi
 echo "    ${digest}"
 
 echo "==> pinning base_image in ${CONFIG}"
-# Match base_image:" ... " regardless of previous digest content. Uses | as the
-# sed delimiter so the / in the image path does not need escaping.
-sed -i -E "s|^(base_image:[[:space:]]*\")[^\"]*(\")|\\1${digest}\\2|" "$CONFIG"
+# Replace the whole base_image value line. Uses | as the sed delimiter so
+# the / in the image path does not need escaping. Whole-line replace works
+# for both quoted and unquoted styles and only matches the active line
+# (a '#'-commented line does not start with base_image:).
+sed -i -E "s|^(base_image:[[:space:]]*).*|\\1${digest}|" "$CONFIG"
 grep -E '^base_image:' "$CONFIG"
 
 echo "==> systemctl --user restart ${SERVICE}"

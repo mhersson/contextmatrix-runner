@@ -82,10 +82,18 @@ is required — it uses `systemctl --user`.
 ```
 
 `install` writes the unit file to
-`~/.config/systemd/user/contextmatrix-runner.service`. It sets `ExecStart` and
-`WorkingDirectory` to the directory containing `svc.sh`, so the script resolves
-paths correctly regardless of where it is invoked from. The config file defaults
-to `config.yaml` in the same directory.
+`~/.config/systemd/user/contextmatrix-runner.service`. `WorkingDirectory` is set
+to the directory containing `svc.sh`, and `ExecStart` passes `--config` pointing
+at `${XDG_CONFIG_HOME:-~/.config}/contextmatrix-runner/config.yaml` — the same
+file `redeploy.sh` pins the worker digest into, so the service and the redeploy
+flow always agree on one config.
+
+`redeploy.sh` automates an in-place update: it rebuilds the binary and worker
+image, pins the new image digest into that config, and restarts the service.
+
+> **Upgrading from an older install** where `config.yaml` lived next to the
+> binary: move it to `~/.config/contextmatrix-runner/config.yaml` (creating the
+> directory if needed) and re-run `./svc.sh install`.
 
 The unit file is configured for graceful shutdown on stop: `KillMode=mixed` and
 `TimeoutStopSec=60` give running containers time to complete before being
