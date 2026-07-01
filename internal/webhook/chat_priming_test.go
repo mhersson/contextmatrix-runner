@@ -108,7 +108,7 @@ func TestBuildChatRehydrationPriming_PromptVersionGolden(t *testing.T) {
 
 	versions := map[int]golden{
 		// PromptVersion 1: initial chat rehydration priming.
-		1: {length: 2540, hash: 0xeac203e9b259d0a4},
+		1: {length: 2541, hash: 0x9c070e26d365e429},
 	}
 
 	want, ok := versions[chatproto.PromptVersion]

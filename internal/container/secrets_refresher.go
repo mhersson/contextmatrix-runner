@@ -44,11 +44,10 @@ var errStaticCMGitTokenForbidden = errors.New("static env must not contain CM_GI
 // a literal newline from terminating the export line and turning the
 // trailing bytes into a separate shell statement.
 //
-// TODO(config): mirror this charset check inside config.Config.Validate()
-// for ClaudeOAuthToken and AnthropicAPIKey so a misconfigured operator
-// gets a boot-time error instead of a silent refresh failure at the
-// first token rotation. Owned by the config-package work stream so the
-// runtime check here is the safety net, not the primary defence.
+// This charset check is also mirrored in config.Config.Validate() via
+// validatePrintableASCIISecret for ClaudeOAuthToken and AnthropicAPIKey,
+// giving misconfigured operators a boot-time error. This runtime check
+// here is defence-in-depth during token refresh.
 var errInvalidStaticSecretChars = errors.New("static secret value contains invalid characters")
 
 // IsValidStaticSecretByte reports whether b is acceptable inside the
