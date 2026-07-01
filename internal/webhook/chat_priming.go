@@ -23,7 +23,7 @@ CRITICAL CONTEXT: this is a brand-new container. Everything the prior agent
 created on disk (cloned repos, scratch files, branch checkouts) is GONE —
 the workspace at /home/user/workspace is empty unless this entrypoint cloned
 something automatically. Do NOT assume any prior workspace state persists.
-Always verify disk state with %scommand before deciding whether to act.
+Always verify disk state with a command before deciding whether to act.
 
 Before greeting the user, do these things in order:
 
@@ -60,5 +60,5 @@ Before greeting the user, do these things in order:
    the tool.
 
 If the resume file is missing or unreadable, say so and start fresh
-(no tool call required in that case).`, sessionID, "`", "`ls -la ", "`", sessionID)
+(no tool call required in that case).`, sessionID, "`ls -la ", "`", sessionID)
 }
