@@ -414,11 +414,12 @@ func (r *tokenRefresher) Run(ctx context.Context) {
 // consecutive clamps; backoff starts once it exceeds
 // clampBackoffStreakThreshold.
 //
-//	streak=4  → 2s
-//	streak=5  → 4s
-//	streak=6  → 8s
-//	streak=7  → 16s
-//	streak>=8 → 30s (capped)
+//	streak=4  → 1s
+//	streak=5  → 2s
+//	streak=6  → 4s
+//	streak=7  → 8s
+//	streak=8  → 16s
+//	streak>=9 → 30s (capped)
 func clampBackoffDuration(streak int) time.Duration {
 	excess := streak - clampBackoffStreakThreshold
 	if excess < 1 {

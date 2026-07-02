@@ -84,7 +84,7 @@ func (h *Handler) handleChatStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	gitToken := h.manager.BuildChatAuthEnv(r.Context())
+	gitToken := h.manager.MintChatGitToken(r.Context())
 
 	var resume *container.ChatResume
 

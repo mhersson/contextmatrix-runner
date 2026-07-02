@@ -227,6 +227,19 @@ idle_output_timeout: "30m"
 # zero).
 idle_watchdog_interval: "30s"
 
+# Generous backstop on chat-container lifetime. Go duration format. Zero
+# (the default) disables it — chat sessions are long-lived by design (a
+# human may sit idle for hours) and normally reaped only by /chat/end,
+# /stop-all, shutdown, or ContextMatrix's own /containers age-cap sweep.
+# This is NOT a normal-path cap and NOT an idle-output watchdog (it would
+# kill legitimately-idle human sessions); it only fires when a chat
+# container never exits at all — a wedged claude process or a hung dockerd
+# wait — which would otherwise leak a goroutine and a max_concurrent chat
+# slot forever. If set, pick a value generous enough to outlast any real
+# session (e.g. "24h"). Negative values are rejected.
+# Env: CMR_CHAT_CONTAINER_TIMEOUT.
+chat_container_timeout: "0"
+
 # Deployment-wide map of env vars injected into every spawned worker
 # container. Use sparingly — most operators want this empty. Intended
 # for non-sensitive worker tunables, e.g. application-level feature

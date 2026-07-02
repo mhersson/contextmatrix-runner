@@ -549,7 +549,7 @@ type shutdownDeps struct {
 func shutdown(d shutdownDeps) {
 	// Step 1: flip drain flag.
 	if d.health != nil {
-		d.health.Draining.Store(true)
+		d.health.StartDraining()
 		d.logger.Info("draining: /readyz will return 503")
 	}
 

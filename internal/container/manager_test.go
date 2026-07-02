@@ -1693,8 +1693,29 @@ func TestSanitizeContainerName(t *testing.T) {
 		{"with spaces", "B-002", "cmr-with-spaces-b-002"},
 	}
 	for _, tt := range tests {
-		assert.Equal(t, tt.expected, sanitizeContainerName(tt.project, tt.cardID))
+		got := sanitizeContainerName(tt.project, tt.cardID)
+		assert.True(t, strings.HasPrefix(got, tt.expected+"-"),
+			"expected %q to have prefix %q", got, tt.expected+"-")
 	}
+}
+
+func TestSanitizeContainerName_NoCollision(t *testing.T) {
+	// Distinct (project, cardID) pairs that collapse to the same lossy base.
+	assert.NotEqual(t,
+		sanitizeContainerName("a-b", "c"),
+		sanitizeContainerName("a", "b-c"),
+		"ambiguous '-' boundary must not collide")
+
+	// Case-fold axis.
+	assert.NotEqual(t,
+		sanitizeContainerName("Foo", "x"),
+		sanitizeContainerName("foo", "x"),
+		"case-folded projects must not collide")
+
+	// Same inputs remain deterministic and Docker-name-legal.
+	got := sanitizeContainerName("my-project", "PROJ-042")
+	assert.Equal(t, got, sanitizeContainerName("my-project", "PROJ-042"))
+	assert.True(t, strings.HasPrefix(got, "cmr-my-project-proj-042-"))
 }
 
 // TestWaitAndCleanup_ParentContextCanceled verifies that when the parent ctx
@@ -2223,6 +2244,126 @@ drainLoop:
 	assert.True(t, sawFailed, "reportFailure must fire even when errCh wins the select race")
 	assert.True(t, sawKilled, "race outcome must be classified as killed_by_operator, not timeout")
 	assert.False(t, sawTimeout, "parent-ctx-cancel race must NOT be classified as a timeout")
+}
+
+// TestWaitAndCleanup_IdleKill_ClassifiesAsIdleTimeout verifies that a cancel
+// driven through tracker.CancelWithReason(..., killReasonIdle) — exactly what
+// runIdleWatchdog does — is classified by handleCanceled as an idle output
+// timeout, not an operator kill: the CM callback message and the
+// cmr_container_duration_seconds histogram bucket must both reflect
+// OutcomeIdleTimeout rather than OutcomeKilled.
+func TestWaitAndCleanup_IdleKill_ClassifiesAsIdleTimeout(t *testing.T) {
+	type statusReport struct{ status, message string }
+
+	reported := make(chan statusReport, 4)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+			Message      string `json:"message"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reported <- statusReport{req.RunnerStatus, req.Message}:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	mock.ContainerWaitFn = func(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		errCh := make(chan error, 1)
+
+		go func() {
+			<-ctx.Done()
+
+			errCh <- ctx.Err()
+		}()
+
+		return make(chan container.WaitResponse), errCh
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+
+	cfg := testConfig(t)
+	cfg.ContainerTimeout = "1h"
+	cfg.ParseContainerTimeout()
+	cfg.IdleOutputTimeout = 50 * time.Millisecond
+
+	mx := metrics.New()
+	mgr := NewManager(mock, tr, cb, testTokenProvider(t), nil, cfg, testLogger()).WithMetrics(mx)
+
+	payload := testPayload()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID: payload.CardID, Project: payload.Project, Cancel: cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+	require.Eventually(t, func() bool {
+		snap, ok := tr.Snapshot(payload.Project, payload.CardID)
+
+		return ok && snap.ContainerID != ""
+	}, 5*time.Second, 10*time.Millisecond, "tracker must have container ID before idle kill")
+
+	// Exactly what runIdleWatchdog does: tag the entry then cancel the run.
+	require.True(t, tr.CancelWithReason(payload.Project, payload.CardID, killReasonIdle))
+	mgr.Wait()
+
+	var sawFailed, sawIdle, sawOperator bool
+
+drain:
+	for {
+		select {
+		case s := <-reported:
+			sawFailed = sawFailed || s.status == "failed"
+			sawIdle = sawIdle || strings.Contains(s.message, "idle output timeout")
+			sawOperator = sawOperator || strings.Contains(s.message, "killed by operator")
+		default:
+			break drain
+		}
+	}
+
+	assert.True(t, sawFailed, "idle kill still reports failed to CM")
+	assert.True(t, sawIdle, "idle kill must be reported as an idle output timeout")
+	assert.False(t, sawOperator, "idle kill must NOT be misattributed as killed by operator")
+	assert.Equal(t, uint64(1), containerDurationCount(t, mx, metrics.OutcomeIdleTimeout))
+	assert.Equal(t, uint64(0), containerDurationCount(t, mx, metrics.OutcomeKilled))
+}
+
+// containerDurationCount reads the cmr_container_duration_seconds histogram
+// sample count for one outcome label. Mirrors panicCounterValue.
+func containerDurationCount(t *testing.T, mx *metrics.Metrics, outcome string) uint64 {
+	t.Helper()
+
+	families, err := mx.Registry.Gather()
+	require.NoError(t, err)
+
+	for _, fam := range families {
+		if fam.GetName() != "cmr_container_duration_seconds" {
+			continue
+		}
+
+		for _, series := range fam.Metric {
+			for _, lp := range series.Label {
+				if lp.GetName() == "outcome" && lp.GetValue() == outcome {
+					return series.GetHistogram().GetSampleCount()
+				}
+			}
+		}
+	}
+
+	return 0
 }
 
 // TestKillContainer_Success directly drives the killContainer helper and
@@ -5084,12 +5225,12 @@ func TestKillChat_NoStdinAttached(t *testing.T) {
 	assert.True(t, stopped.Load(), "ContainerStop must be called even when stdin is not attached")
 }
 
-// TestBuildChatAuthEnv_ReturnsGitToken verifies that BuildChatAuthEnv returns
+// TestMintChatGitToken_ReturnsGitToken verifies that MintChatGitToken returns
 // a non-empty token when a token provider is wired AND a skills dir is
 // configured. Claude auth (OAuth token, API key) is owned by the tokenRefresher
 // and reaches the worker via the shared secrets dir — this function must not
 // return those credentials.
-func TestBuildChatAuthEnv_ReturnsGitToken(t *testing.T) {
+func TestMintChatGitToken_ReturnsGitToken(t *testing.T) {
 	t.Parallel()
 
 	tp := testPATProvider(t)
@@ -5102,15 +5243,15 @@ func TestBuildChatAuthEnv_ReturnsGitToken(t *testing.T) {
 	}
 
 	mgr := NewManager(nil, tracker.New(), nil, tp, nil, cfg, testLogger())
-	tok := mgr.BuildChatAuthEnv(context.Background())
+	tok := mgr.MintChatGitToken(context.Background())
 
-	require.NotEmpty(t, tok, "BuildChatAuthEnv must return a non-empty token when a provider is wired")
+	require.NotEmpty(t, tok, "MintChatGitToken must return a non-empty token when a provider is wired")
 }
 
-// TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir keeps chat-mode symmetric with
+// TestMintChatGitToken_SkipsMintWhenNoSkillsDir keeps chat-mode symmetric with
 // the card-mode startContainer mint guard: without TaskSkillsDir the token has
 // no consumer, so /chat/start must pay zero GitHub API round-trips.
-func TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir(t *testing.T) {
+func TestMintChatGitToken_SkipsMintWhenNoSkillsDir(t *testing.T) {
 	t.Parallel()
 
 	calls := 0
@@ -5134,10 +5275,10 @@ func TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir(t *testing.T) {
 	}
 
 	mgr := NewManager(nil, tracker.New(), nil, tp, nil, cfg, testLogger())
-	tok := mgr.BuildChatAuthEnv(context.Background())
+	tok := mgr.MintChatGitToken(context.Background())
 
-	require.Empty(t, tok, "BuildChatAuthEnv must return empty when TaskSkillsDir is unset")
-	require.Equal(t, 0, calls, "BuildChatAuthEnv must not call GenerateToken when TaskSkillsDir is unset")
+	require.Empty(t, tok, "MintChatGitToken must return empty when TaskSkillsDir is unset")
+	require.Equal(t, 0, calls, "MintChatGitToken must not call GenerateToken when TaskSkillsDir is unset")
 }
 
 // TestManager_StartChat_ResumeMountReadOnly verifies that StartChat binds
@@ -5616,6 +5757,47 @@ func TestWaitAndCleanupChat_RemovesChatSecrets(t *testing.T) {
 	assert.False(t, leaked,
 		"chatSecrets entry for %s must be deleted by WaitAndCleanupChat to plug AttachChatStdin-failure leak", containerID)
 	assert.Equal(t, 0, count, "chatSecrets must be empty after WaitAndCleanupChat completes")
+}
+
+// TestWaitAndCleanupChat_LifetimeBackstop verifies that when
+// ChatContainerTimeout is set, a chat container whose ContainerWait never
+// resolves on its own (a wedged claude process or a hung dockerd wait) is
+// force-stopped once the backstop deadline fires, and the tracker slot is
+// freed. Without this, a wedged chat process leaks a goroutine and a
+// maxConcurrent chat slot indefinitely, since chat has no other lifetime cap.
+func TestWaitAndCleanupChat_LifetimeBackstop(t *testing.T) {
+	var stopCalled atomic.Bool
+
+	mock := successfulMock()
+	mock.ContainerWaitFn = func(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		errCh := make(chan error, 1)
+
+		go func() {
+			<-ctx.Done() // never exits on its own; only the backstop deadline
+			errCh <- ctx.Err()
+		}()
+
+		return make(chan container.WaitResponse), errCh
+	}
+	mock.ContainerStopFn = func(_ context.Context, _ string, _ container.StopOptions) error {
+		stopCalled.Store(true)
+
+		return nil
+	}
+
+	cfg := testConfig(t)
+	cfg.ChatContainerTimeout = 50 * time.Millisecond
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, cfg, testLogger())
+
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{SessionID: "S-1", ContainerID: "chat-ctr"}))
+
+	mgr.WaitAndCleanupChat("S-1", "chat-ctr", "proj")
+	mgr.Wait()
+
+	assert.True(t, stopCalled.Load(), "a wedged chat container must be force-stopped once the backstop fires")
+	assert.False(t, tr.HasChat("S-1"), "tracker slot must be freed after the backstop cleanup")
 }
 
 // TestStartContainer_SkipsTokenMintWhenNoSkillsDir verifies that when

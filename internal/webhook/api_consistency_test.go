@@ -640,7 +640,7 @@ func (n *noopRunner) Stop(_ context.Context, _ string) error { return nil }
 
 func (n *noopRunner) WorkerImage() string { return "" }
 
-func (n *noopRunner) BuildChatAuthEnv(_ context.Context) string { return "" }
+func (n *noopRunner) MintChatGitToken(_ context.Context) string { return "" }
 
 func (n *noopRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 

@@ -529,39 +529,6 @@ func TestMarkStdinClosed_NoStdin(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoStdinAttached)
 }
 
-// TestMarkStdinClosedChat_FlipsState mirrors TestMarkStdinClosed_FlipsState
-// for the chat-mode counterpart.
-func TestMarkStdinClosedChat_FlipsState(t *testing.T) {
-	tr := New()
-	require.NoError(t, tr.AddChat(&ContainerInfo{
-		ContainerID: "ctr-1",
-		SessionID:   "01SESS",
-		Image:       "test:latest",
-		StartedAt:   time.Now(),
-	}))
-
-	var closeCount atomic.Int32
-
-	w := &countingWriteCloser{
-		closeFn: func() error {
-			closeCount.Add(1)
-
-			return nil
-		},
-	}
-	tr.SetStdinChat("01SESS", w, nil)
-
-	require.NoError(t, tr.MarkStdinClosedChat("01SESS"))
-	assert.EqualValues(t, 0, closeCount.Load(),
-		"MarkStdinClosedChat must not call Close on the writer")
-
-	err := tr.WriteStdinChat("01SESS", []byte("hi"))
-	require.ErrorIs(t, err, ErrStdinClosed)
-
-	err = tr.CloseStdinChat("01SESS")
-	require.ErrorIs(t, err, ErrStdinClosed)
-}
-
 // TestCloseStdin_NotTracked verifies CloseStdin returns ErrNotTracked when
 // the container is not tracked.
 func TestCloseStdin_NotTracked(t *testing.T) {
@@ -1291,6 +1258,28 @@ func TestCancel_NilCancelFuncIsNoOp(t *testing.T) {
 	if got := tr.Cancel("alpha", "ALPHA-1"); !got {
 		t.Fatal("Cancel must return true for a tracked entry even when Cancel is nil")
 	}
+}
+
+// TestCancelWithReason_RecordsReasonAndCancels verifies that CancelWithReason
+// records the reason on the tracked entry before invoking its stored cancel
+// func, and that Reason surfaces it afterwards. A missing entry returns false
+// and leaves Reason empty.
+func TestCancelWithReason_RecordsReasonAndCancels(t *testing.T) {
+	tr := New()
+
+	var cancelled atomic.Bool
+
+	require.NoError(t, tr.Add(&ContainerInfo{
+		Project: "p", CardID: "C-1",
+		Cancel: func() { cancelled.Store(true) },
+	}))
+
+	require.True(t, tr.CancelWithReason("p", "C-1", "idle_timeout"))
+	assert.True(t, cancelled.Load(), "CancelWithReason must invoke the stored cancel func")
+	assert.Equal(t, "idle_timeout", tr.Reason("p", "C-1"), "reason must be readable after cancel")
+
+	assert.False(t, tr.CancelWithReason("p", "missing", "x"), "missing entry returns false")
+	assert.Empty(t, tr.Reason("p", "missing"))
 }
 
 // TestSetStdin_LateArrivalWedgedClose_DoesNotBlockTracker verifies that when

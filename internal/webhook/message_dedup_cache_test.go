@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMessageDedupCache_PutThenGet(t *testing.T) {
@@ -70,6 +71,25 @@ func TestMessageDedupCache_ExpiredAfterTTL(t *testing.T) {
 
 	_, ok = c.Get("proj", "card-1", "msg-1")
 	assert.False(t, ok, "miss after TTL expiry")
+}
+
+func TestMessageDedupCache_SweepReclaimsAfterHit(t *testing.T) {
+	clock := &mockClock{now: time.Unix(1_700_000_000, 0)}
+	c := NewMessageDedupCache(100*time.Second, 100, WithMessageDedupNow(clock.Now))
+
+	c.Put("p", "c", "old", CachedAck{Status: 202, Body: []byte("a")}) // stored t0
+	clock.advance(50 * time.Second)
+	c.Put("p", "c", "new", CachedAck{Status: 202, Body: []byte("b")}) // stored t0+50
+
+	// Read hit on the OLD entry — must not reorder it past the newer one in a
+	// way that defeats the sweep's oldest-first early-return.
+	_, ok := c.Get("p", "c", "old")
+	require.True(t, ok)
+
+	clock.advance(70 * time.Second) // now t0+120: old (age 120) expired, new (age 70) live
+	c.sweep()
+
+	assert.Equal(t, 1, c.Len(), "expired 'old' entry must be swept even after a read hit")
 }
 
 func TestMessageDedupCache_CapacityEviction(t *testing.T) {

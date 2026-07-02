@@ -82,7 +82,7 @@ func (f *chatFakeRunner) KillChat(_ context.Context, _ string) error { return ni
 
 func (f *chatFakeRunner) WorkerImage() string { return f.workerImage }
 
-func (f *chatFakeRunner) BuildChatAuthEnv(_ context.Context) string { return "" }
+func (f *chatFakeRunner) MintChatGitToken(_ context.Context) string { return "" }
 
 func (f *chatFakeRunner) AttachChatStdin(ctx context.Context, sessionID, containerID string) error {
 	if f.attachChatStdinFn != nil {

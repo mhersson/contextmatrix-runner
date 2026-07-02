@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -110,6 +111,11 @@ const (
 	// case before workers visibly slow down.
 	taskSkillsPullTimeout = 60 * time.Second
 )
+
+// killReasonIdle marks a termination initiated by runIdleWatchdog rather than
+// an operator /kill. Recorded on the tracker via CancelWithReason and read
+// back in handleCanceled so the outcome is idle_timeout, not killed.
+const killReasonIdle = metrics.OutcomeIdleTimeout
 
 // primingWriteTimeout bounds the priming WriteStdin call made right after
 // ContainerAttach. A wedged hijacked socket would otherwise hang the Run
@@ -317,7 +323,7 @@ func (m *Manager) WithMetrics(mx *metrics.Metrics) *Manager {
 //
 // token (githubauth.TokenGenerator) is expected to be non-nil for any
 // deployment that actually spawns containers — every spawn-path branch
-// (card mode startContainer, chat mode StartChat / BuildChatAuthEnv, and the
+// (card mode startContainer, chat mode StartChat / MintChatGitToken, and the
 // background tokenRefresher) calls GenerateToken conditionally. Production
 // wiring in cmd/contextmatrix-runner/main.go always passes a real provider.
 //
@@ -325,7 +331,7 @@ func (m *Manager) WithMetrics(mx *metrics.Metrics) *Manager {
 // non-spawn methods (Kill, CleanupOrphans, ListManaged, PruneImages, etc.)
 // can construct a Manager without spinning up a fake GitHub token server.
 // The four spawn-path call sites (startContainer, buildSecretDelivery,
-// StartTokenRefresher, BuildChatAuthEnv) each guard with a nil-check or a
+// StartTokenRefresher, MintChatGitToken) each guard with a nil-check or a
 // TaskSkillsDir-guard that skips the mint when the token has no consumer.
 //
 // cb and broadcaster may also be nil; the manager guards those at every call site.
@@ -1282,12 +1288,25 @@ func (m *Manager) handleWaitError(ctx context.Context, containerID string, paylo
 	return metrics.OutcomeFailure
 }
 
-// handleCanceled is the cleanup path for OutcomeKilled. Reached both via the
-// ctx.Done() select branch AND via the errCh branch when the parent ctx is
-// already canceled (Docker SDK's ContainerWait writes a context-canceled
-// error into errCh and Go's select picks pseudo-randomly between them).
+// handleCanceled is the cleanup path for a cancelled run context: an
+// operator /kill, shutdown, or an idle-watchdog kill (see killReasonIdle).
+// Reached both via the ctx.Done() select branch AND via the errCh branch
+// when the parent ctx is already canceled (Docker SDK's ContainerWait writes
+// a context-canceled error into errCh and Go's select picks pseudo-randomly
+// between them).
 func (m *Manager) handleCanceled(ctx context.Context, containerID string, payload RunConfig, logDone <-chan struct{}, log *slog.Logger) string {
-	log.Info("container canceled")
+	// An idle-watchdog kill records killReasonIdle on the tracker entry before
+	// cancelling; operator /kill and shutdown leave it empty. Read before the
+	// deferred tracker.Remove (which runs after this returns).
+	msg := "killed by operator"
+	outcome := metrics.OutcomeKilled
+
+	if m.tracker.Reason(payload.Project, payload.CardID) == killReasonIdle {
+		msg = fmt.Sprintf("idle output timeout after %s", m.cfg.IdleOutputTimeout)
+		outcome = metrics.OutcomeIdleTimeout
+	}
+
+	log.Info("container canceled", "outcome", outcome)
 
 	killCtx, killCancel := withDockerCleanupTimeout(ctx)
 	m.killContainer(killCtx, containerID, log)
@@ -1302,10 +1321,10 @@ func (m *Manager) handleCanceled(ctx context.Context, containerID string, payloa
 	// callback into a no-op and CM would see the card stuck in
 	// `running` forever.
 	cbCtx, cbCancel := withCleanupTimeout(ctx)
-	m.reportFailure(cbCtx, payload, "killed by operator")
+	m.reportFailure(cbCtx, payload, msg)
 	cbCancel()
 
-	return metrics.OutcomeKilled
+	return outcome
 }
 
 // drainLogs blocks until logDone fires or logDrainTimeout elapses, whichever
@@ -1479,68 +1498,9 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 				}
 			}()
 
-			// bufio.Reader avoids bufio.Scanner's 1 MiB cap;
-			// logparser.ReadBoundedLine adds a soft per-line cap so a
-			// runaway stderr stream can't pin the runner heap. Read
-			// from the progressReader wrapper so the idle watchdog
-			// gets fed on raw byte arrival.
-			br := bufio.NewReaderSize(stderrFeed, 64*1024)
-
-			var readErr error
-
-			for {
-				var (
-					raw       []byte
-					truncated bool
-				)
-
-				raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
-				if len(raw) > 0 || truncated {
-					line := strings.TrimRight(string(raw), "\r\n")
-					if truncated {
-						line += " [...truncated; line exceeded 16 MiB cap]"
-					}
-					// Redact before slog too: a rogue child process echoing the
-					// container env through /proc can easily end up on stderr.
-					redacted := redactor.Redact(line)
-					log.Warn("container stderr", "line", redacted)
-
-					// Record the observation so the idle watchdog sees forward
-					// progress. Stderr noise counts: a container spewing stack
-					// traces is not "idle".
-					nowT := time.Now()
-					lastOutputAt.Store(&nowT)
-
-					if m.broadcaster != nil {
-						m.broadcaster.Publish(logbroadcast.LogEntry{
-							Timestamp: nowT,
-							CardID:    payload.CardID,
-							Project:   payload.Project,
-							Type:      "stderr",
-							Content:   redacted,
-						})
-					}
-				}
-
-				if readErr != nil {
-					break
-				}
-			}
-
-			// On non-EOF read failure (e.g. an underlying I/O error) the
-			// writer side of stderrPr could still block on its next Write
-			// if anything is buffered. Drain to discard so stdcopy makes
-			// forward progress; the defer above also closes stderrPr so any
-			// already-blocked Write returns io.ErrClosedPipe.
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
-				log.Warn("container stderr reader aborted; draining pipe to unblock writer",
-					"container_id", truncateID(containerID),
-					"card_id", payload.CardID,
-					"project", payload.Project,
-					"error", readErr)
-
-				_, _ = io.Copy(io.Discard, stderrPr)
-			}
+			m.scanRedactedStderr(stderrFeed, stderrPr, redactor, log,
+				logbroadcast.LogEntry{CardID: payload.CardID, Project: payload.Project},
+				func(t time.Time) { lastOutputAt.Store(&t) })
 		}()
 
 		// emit is invoked by the logparser for every published assistant
@@ -1596,6 +1556,59 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 	}()
 
 	return done
+}
+
+// scanRedactedStderr consumes the demuxed stderr pipe line by line, redacts
+// each line, logs it, invokes onLine (card mode advances the idle watchdog;
+// chat mode passes nil), and republishes it as a "stderr" LogEntry stamped
+// from label. src is the read source (a *progressReader in card mode so the
+// watchdog sees raw byte arrival; the raw pipe in chat mode); drain is the
+// pipe drained on a non-EOF abort so a blocked stdcopy Write is released.
+func (m *Manager) scanRedactedStderr(src io.Reader, drain *io.PipeReader, redactor *logparser.Redactor, log *slog.Logger, label logbroadcast.LogEntry, onLine func(time.Time)) {
+	br := bufio.NewReaderSize(src, 64*1024)
+
+	var readErr error
+
+	for {
+		var (
+			raw       []byte
+			truncated bool
+		)
+
+		raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
+		if len(raw) > 0 || truncated {
+			line := strings.TrimRight(string(raw), "\r\n")
+			if truncated {
+				line += " [...truncated; line exceeded 16 MiB cap]"
+			}
+
+			redacted := redactor.Redact(line)
+			log.Warn("container stderr", "line", redacted)
+
+			nowT := time.Now()
+			if onLine != nil {
+				onLine(nowT)
+			}
+
+			if m.broadcaster != nil {
+				e := label
+				e.Timestamp = nowT
+				e.Type = "stderr"
+				e.Content = redacted
+				m.broadcaster.Publish(e)
+			}
+		}
+
+		if readErr != nil {
+			break
+		}
+	}
+
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		log.Warn("container stderr reader aborted; draining pipe to unblock writer", "error", readErr)
+
+		_, _ = io.Copy(io.Discard, drain)
+	}
 }
 
 // runIdleWatchdog polls lastOutputAt and kills the container when no output
@@ -1674,14 +1687,14 @@ func (m *Manager) runIdleWatchdog(
 
 			m.emitSystem(payload, reason)
 
-			// Prefer Kill (which cancels the run's ctx so waitAndCleanup
-			// takes the normal cancel path and reports failure to CM).
+			// Tag the tracker entry with killReasonIdle before cancelling
+			// (rather than plain Kill) so waitAndCleanup's handleCanceled can
+			// classify this as an idle timeout instead of an operator kill.
 			// Fall back to a direct stop if the tracker entry has already
 			// been removed (race with exit).
-			if err := m.Kill(payload.Project, payload.CardID); err != nil {
-				log.Warn("idle watchdog Kill failed; attempting direct stop",
+			if !m.tracker.CancelWithReason(payload.Project, payload.CardID, killReasonIdle) {
+				log.Warn("idle watchdog kill: no tracker entry; attempting direct stop",
 					"container_id", truncateID(containerID),
-					"error", err,
 				)
 
 				stopCtx, cancel := withDockerCleanupTimeout(ctx)
@@ -2361,8 +2374,16 @@ func normalizeRepoURL(rawURL string) string {
 func sanitizeContainerName(project, cardID string) string {
 	name := fmt.Sprintf("cmr-%s-%s", project, cardID)
 	name = strings.ToLower(name)
+	name = containerNameRe.ReplaceAllString(name, "-")
 
-	return containerNameRe.ReplaceAllString(name, "-")
+	// The sanitized name is lossy: project and cardID both admit '-', '.',
+	// '_' and are case-folded above, so distinct (project, cardID) pairs can
+	// collapse to the same name and collide on the Docker container name
+	// (second ContainerCreate -> 409). Disambiguate with a short hash of the
+	// NUL-joined pair — NUL cannot appear in either field (validateIdent).
+	sum := sha256.Sum256([]byte(project + "\x00" + cardID))
+
+	return name + "-" + hex.EncodeToString(sum[:4])
 }
 
 func truncateID(id string) string {
@@ -2729,10 +2750,17 @@ func (m *Manager) DeleteChatCleanup(containerID string) {
 // or `docker kill` from outside the runner. Without it those paths would
 // leak the tracker entry until the runner restarts.
 //
-// Uses context.Background() so the wait survives the request ctx that
-// kicked off /chat/start. The associated log-stream goroutine (from
-// StreamChatLogs) exits on its own when ContainerLogs EOFs on container
-// removal, so no explicit cancel is required here.
+// Uses context.Background() (optionally wrapped in a WithTimeout derived
+// from m.cfg.ChatContainerTimeout) so the wait survives the request ctx
+// that kicked off /chat/start. ChatContainerTimeout is an opt-in, generous
+// lifetime backstop (default 0 = disabled): when set, a chat container
+// that never exits — a wedged claude process or a hung dockerd wait, with
+// /chat/end never arriving — is force-stopped once the deadline fires
+// instead of leaking the goroutine and its tracker slot forever. It is not
+// an idle-output watchdog and will not kill a legitimately-idle human
+// session. The associated log-stream goroutine (from StreamChatLogs) exits
+// on its own when ContainerLogs EOFs on container removal, so no explicit
+// cancel is required here.
 //
 // The webhook handler owns the lifecycle: StartChat returns the container
 // ID after stashing the delivery handles in m.chatCleanup, and the handler
@@ -2761,14 +2789,31 @@ func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 
 		ctx := context.Background()
 
-		waitCh, errCh := m.docker.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+		waitCtx := ctx
+		if to := m.cfg.ChatContainerTimeout; to > 0 {
+			var cancel context.CancelFunc
+
+			waitCtx, cancel = context.WithTimeout(ctx, to)
+			defer cancel()
+		}
+
+		waitCh, errCh := m.docker.ContainerWait(waitCtx, containerID, container.WaitConditionNotRunning)
 
 		select {
 		case result := <-waitCh:
 			log.Info("chat container: exited",
 				"exit_code", result.StatusCode)
 		case err := <-errCh:
-			log.Warn("chat container: wait error", "error", err)
+			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				log.Warn("chat container exceeded max lifetime backstop; force-stopping",
+					"timeout", m.cfg.ChatContainerTimeout)
+
+				stopCtx, stopCancel := withDockerCleanupTimeout(ctx)
+				m.killContainer(stopCtx, containerID, log)
+				stopCancel()
+			} else {
+				log.Warn("chat container: wait error", "error", err)
+			}
 		}
 
 		m.tracker.RemoveChat(sessionID)
@@ -2866,9 +2911,10 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 		// The three child goroutines spawned below can each take a panic
 		// from third-party input — stdcopy on a malformed docker multiplex
 		// frame, bufio.Scanner on bogus UTF-8, the logparser on a bad
-		// stream-json line. Mirror the card-mode streamLogs structure
-		// (lines ~1141-1349) so a panic in any of them is recovered with
-		// metric + slog + system LogEntry, and so Wait() drains all three.
+		// stream-json line. Mirror the card-mode streamLogs structure (see
+		// streamLogs at manager.go:1358) so a panic in any of them is
+		// recovered with metric + slog + system LogEntry, and so Wait()
+		// drains all three.
 		defer func() {
 			if r := recover(); r != nil {
 				m.handlePanic(r, metrics.GoroutineLogparser, "chat streamLogs child panicked",
@@ -2944,58 +2990,8 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 				}
 			}()
 
-			// bufio.Reader avoids bufio.Scanner's 1 MiB cap;
-			// logparser.ReadBoundedLine adds a soft per-line cap so a
-			// runaway stderr stream can't pin the runner heap.
-			br := bufio.NewReaderSize(stderrPr, 64*1024)
-
-			var readErr error
-
-			for {
-				var (
-					raw       []byte
-					truncated bool
-				)
-
-				raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
-				if len(raw) > 0 || truncated {
-					line := strings.TrimRight(string(raw), "\r\n")
-					if truncated {
-						line += " [...truncated; line exceeded 16 MiB cap]"
-					}
-					// Redact before slog too: a rogue child process echoing the
-					// container env through /proc can easily end up on stderr.
-					redacted := redactor.Redact(line)
-					log.Warn("chat container stderr", "line", redacted)
-
-					if m.broadcaster != nil {
-						m.broadcaster.Publish(logbroadcast.LogEntry{
-							Timestamp: time.Now(),
-							SessionID: sessionID,
-							Project:   project,
-							Type:      "stderr",
-							Content:   redacted,
-						})
-					}
-				}
-
-				if readErr != nil {
-					break
-				}
-			}
-
-			// On non-EOF read failure drain to discard so stdcopy makes
-			// forward progress; the defer above also closes stderrPr so an
-			// already-blocked Write returns io.ErrClosedPipe.
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
-				log.Warn("chat container stderr reader aborted; draining pipe to unblock writer",
-					"container_id", containerID,
-					"session_id", sessionID,
-					"project", project,
-					"error", readErr)
-
-				_, _ = io.Copy(io.Discard, stderrPr)
-			}
+			m.scanRedactedStderr(stderrPr, stderrPr, redactor, log,
+				logbroadcast.LogEntry{SessionID: sessionID, Project: project}, nil)
 		}()
 
 		emit := func(e logbroadcast.LogEntry) {
@@ -3182,7 +3178,7 @@ func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mo
 	}
 }
 
-// BuildChatAuthEnv mints a GitHub installation token for the runner's own
+// MintChatGitToken mints a GitHub installation token for the runner's own
 // taskSkillsMount git pull. Claude auth and CM_GIT_TOKEN for the container
 // are owned by the tokenRefresher and reach the worker via the shared secrets
 // dir — this token must not be forwarded to the container.
@@ -3192,7 +3188,7 @@ func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mo
 // Card-mode startContainer skips the mint in the same case; this guard keeps
 // the two modes symmetric so a deployment without a skills dir pays zero
 // GitHub API calls on /chat/start.
-func (m *Manager) BuildChatAuthEnv(ctx context.Context) string {
+func (m *Manager) MintChatGitToken(ctx context.Context) string {
 	if m.cfg.TaskSkillsDir == "" {
 		return ""
 	}
@@ -3204,7 +3200,7 @@ func (m *Manager) BuildChatAuthEnv(ctx context.Context) string {
 	tok, _, err := m.token.GenerateToken(ctx)
 	if err != nil {
 		if m.logger != nil {
-			m.logger.Warn("BuildChatAuthEnv: github token generation failed", "error", err)
+			m.logger.Warn("MintChatGitToken: github token generation failed", "error", err)
 		}
 
 		return ""

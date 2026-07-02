@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestReplayCache_FirstSeenFalseSecondTrue(t *testing.T) {
@@ -103,6 +104,24 @@ func TestReplayCache_ConcurrentSafe(t *testing.T) {
 	wg.Wait()
 
 	assert.Equal(t, int64(0), dupes.Load(), "worker-unique signatures must never collide on first call")
+}
+
+func TestReplayCache_SweepReclaimsAfterHit(t *testing.T) {
+	clock := &mockClock{now: time.Unix(1_700_000_000, 0)}
+	c := NewReplayCache(100*time.Second, 100, WithReplayCacheNow(clock.Now))
+
+	assert.False(t, c.Seen("sig-old"), "first sighting of sig-old") // seen t0
+	clock.advance(50 * time.Second)
+	assert.False(t, c.Seen("sig-new"), "first sighting of sig-new") // seen t0+50
+
+	// Replay hit on the OLD signature — must not reorder it past the newer
+	// one in a way that defeats the sweep's oldest-first early-return.
+	require.True(t, c.Seen("sig-old"), "replay hit on sig-old")
+
+	clock.advance(70 * time.Second) // now t0+120: sig-old (age 120) expired, sig-new (age 70) live
+	c.sweep()
+
+	assert.Equal(t, 1, c.Len(), "expired 'sig-old' entry must be swept even after a replay hit")
 }
 
 func TestReplayCache_CapacityEviction(t *testing.T) {

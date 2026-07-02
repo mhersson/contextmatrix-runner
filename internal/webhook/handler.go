@@ -59,23 +59,19 @@ type ContainerRunner interface {
 	KillChat(ctx context.Context, sessionID string) error
 	Stop(ctx context.Context, containerID string) error
 	WorkerImage() string
-	BuildChatAuthEnv(ctx context.Context) string
+	MintChatGitToken(ctx context.Context) string
 }
 
 // TrackerService is the interface to the task/chat tracker used by the webhook handler.
 // Using an interface enables handler tests to inject wrappers without needing
 // to modify the real tracker implementation.
 type TrackerService interface {
-	Add(info *tracker.ContainerInfo) error
 	AddIfUnderLimit(info *tracker.ContainerInfo, limit int) error
-	AddChat(info *tracker.ContainerInfo) error
 	AddChatIfUnderLimit(info *tracker.ContainerInfo, limit int) error
 	Has(project, cardID string) bool
 	HasChat(sessionID string) bool
 	Count() int
-	Remove(project, cardID string)
 	RemoveChat(sessionID string)
-	Snapshot(project, cardID string) (tracker.ContainerSnapshot, bool)
 	SnapshotChat(sessionID string) (tracker.ContainerSnapshot, bool)
 	AllSnapshots() []tracker.ContainerSnapshot
 	ListSnapshotsByProject(project string) []tracker.ContainerSnapshot
@@ -83,8 +79,6 @@ type TrackerService interface {
 	WriteStdinChat(sessionID string, b []byte) error
 	CloseStdin(project, cardID string) error
 	CloseStdinChat(sessionID string) error
-	SetStdin(project, cardID string, w io.WriteCloser, onClose func())
-	SetStdinChat(sessionID string, w io.WriteCloser, onClose func())
 }
 
 // Handler processes incoming webhooks from ContextMatrix.
@@ -1093,8 +1087,21 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	var drain <-chan struct{}
+	if h.health != nil {
+		drain = h.health.DrainSignal()
+	}
+
 	for {
 		select {
+		case <-drain:
+			if h.logger != nil {
+				h.logger.Info("SSE log client disconnected: draining",
+					"project_filter", project, "session_id_filter", sessionID)
+			}
+
+			return
+
 		case <-r.Context().Done():
 			if h.logger != nil {
 				h.logger.Info("SSE log client disconnected",
