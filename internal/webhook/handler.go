@@ -66,16 +66,12 @@ type ContainerRunner interface {
 // Using an interface enables handler tests to inject wrappers without needing
 // to modify the real tracker implementation.
 type TrackerService interface {
-	Add(info *tracker.ContainerInfo) error
 	AddIfUnderLimit(info *tracker.ContainerInfo, limit int) error
-	AddChat(info *tracker.ContainerInfo) error
 	AddChatIfUnderLimit(info *tracker.ContainerInfo, limit int) error
 	Has(project, cardID string) bool
 	HasChat(sessionID string) bool
 	Count() int
-	Remove(project, cardID string)
 	RemoveChat(sessionID string)
-	Snapshot(project, cardID string) (tracker.ContainerSnapshot, bool)
 	SnapshotChat(sessionID string) (tracker.ContainerSnapshot, bool)
 	AllSnapshots() []tracker.ContainerSnapshot
 	ListSnapshotsByProject(project string) []tracker.ContainerSnapshot
@@ -83,8 +79,6 @@ type TrackerService interface {
 	WriteStdinChat(sessionID string, b []byte) error
 	CloseStdin(project, cardID string) error
 	CloseStdinChat(sessionID string) error
-	SetStdin(project, cardID string, w io.WriteCloser, onClose func())
-	SetStdinChat(sessionID string, w io.WriteCloser, onClose func())
 }
 
 // Handler processes incoming webhooks from ContextMatrix.
