@@ -159,9 +159,10 @@ func (c *MessageDedupCache) getByKey(key string) (CachedAck, bool) {
 		return CachedAck{}, false
 	}
 
-	// Mark as recently used — moving to the back keeps LRU eviction
-	// order consistent with access.
-	c.entries.MoveToBack(el)
+	// No MoveToBack on a read hit: entries carry a pinned `stored` timestamp
+	// and expire at stored+ttl regardless of access, so the list stays
+	// ordered oldest-first (front) — the invariant sweep's early-return
+	// relies on.
 
 	// Return a defensive copy so callers can't mutate the stored bytes.
 	bodyCopy := make([]byte, len(entry.ack.Body))

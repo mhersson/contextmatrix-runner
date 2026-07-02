@@ -119,11 +119,10 @@ func (r *ReplayCache) Seen(sig string) bool {
 			// timestamp so the entry ages out predictably at ttl.
 			// Refreshing seen on hit would let an attacker (or a buggy
 			// client) pin a hot signature in the cache indefinitely,
-			// defeating the TTL bound. MoveToBack is still fine here — it
-			// only affects LRU eviction order, not the seen-timestamp the
-			// sweep / expiry compares against.
-			r.entries.MoveToBack(el)
-
+			// defeating the TTL bound. Do NOT MoveToBack on a hit either:
+			// it would push an old-seen entry behind newer ones and defeat
+			// sweep's oldest-first early-return, leaking the entry until
+			// capacity eviction.
 			return true
 		}
 		// Expired: drop it and treat as fresh.
