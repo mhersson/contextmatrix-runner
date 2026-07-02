@@ -672,7 +672,7 @@ func (r *strictRunner) Stop(_ context.Context, _ string) error {
 
 func (r *strictRunner) WorkerImage() string { return "" }
 
-func (r *strictRunner) BuildChatAuthEnv(_ context.Context) string { return "" }
+func (r *strictRunner) MintChatGitToken(_ context.Context) string { return "" }
 
 func (r *strictRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 

@@ -323,7 +323,7 @@ func (m *Manager) WithMetrics(mx *metrics.Metrics) *Manager {
 //
 // token (githubauth.TokenGenerator) is expected to be non-nil for any
 // deployment that actually spawns containers — every spawn-path branch
-// (card mode startContainer, chat mode StartChat / BuildChatAuthEnv, and the
+// (card mode startContainer, chat mode StartChat / MintChatGitToken, and the
 // background tokenRefresher) calls GenerateToken conditionally. Production
 // wiring in cmd/contextmatrix-runner/main.go always passes a real provider.
 //
@@ -331,7 +331,7 @@ func (m *Manager) WithMetrics(mx *metrics.Metrics) *Manager {
 // non-spawn methods (Kill, CleanupOrphans, ListManaged, PruneImages, etc.)
 // can construct a Manager without spinning up a fake GitHub token server.
 // The four spawn-path call sites (startContainer, buildSecretDelivery,
-// StartTokenRefresher, BuildChatAuthEnv) each guard with a nil-check or a
+// StartTokenRefresher, MintChatGitToken) each guard with a nil-check or a
 // TaskSkillsDir-guard that skips the mint when the token has no consumer.
 //
 // cb and broadcaster may also be nil; the manager guards those at every call site.
@@ -3178,7 +3178,7 @@ func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mo
 	}
 }
 
-// BuildChatAuthEnv mints a GitHub installation token for the runner's own
+// MintChatGitToken mints a GitHub installation token for the runner's own
 // taskSkillsMount git pull. Claude auth and CM_GIT_TOKEN for the container
 // are owned by the tokenRefresher and reach the worker via the shared secrets
 // dir — this token must not be forwarded to the container.
@@ -3188,7 +3188,7 @@ func (m *Manager) baseHostConfig(ctx context.Context, mcpURL string, mounts []mo
 // Card-mode startContainer skips the mint in the same case; this guard keeps
 // the two modes symmetric so a deployment without a skills dir pays zero
 // GitHub API calls on /chat/start.
-func (m *Manager) BuildChatAuthEnv(ctx context.Context) string {
+func (m *Manager) MintChatGitToken(ctx context.Context) string {
 	if m.cfg.TaskSkillsDir == "" {
 		return ""
 	}
@@ -3200,7 +3200,7 @@ func (m *Manager) BuildChatAuthEnv(ctx context.Context) string {
 	tok, _, err := m.token.GenerateToken(ctx)
 	if err != nil {
 		if m.logger != nil {
-			m.logger.Warn("BuildChatAuthEnv: github token generation failed", "error", err)
+			m.logger.Warn("MintChatGitToken: github token generation failed", "error", err)
 		}
 
 		return ""

@@ -459,7 +459,7 @@ func (f *reconcileFakeRunner) Stop(_ context.Context, _ string) error { return n
 
 func (f *reconcileFakeRunner) WorkerImage() string { return "" }
 
-func (f *reconcileFakeRunner) BuildChatAuthEnv(_ context.Context) string { return "" }
+func (f *reconcileFakeRunner) MintChatGitToken(_ context.Context) string { return "" }
 
 func (f *reconcileFakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 
@@ -678,7 +678,7 @@ func (f *fakeRunner) Stop(_ context.Context, _ string) error { return nil }
 
 func (f *fakeRunner) WorkerImage() string { return "" }
 
-func (f *fakeRunner) BuildChatAuthEnv(_ context.Context) string { return "" }
+func (f *fakeRunner) MintChatGitToken(_ context.Context) string { return "" }
 
 func (f *fakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 
@@ -2122,7 +2122,7 @@ func (s *stopAllFakeRunner) Stop(_ context.Context, _ string) error { return nil
 
 func (s *stopAllFakeRunner) WorkerImage() string { return "" }
 
-func (s *stopAllFakeRunner) BuildChatAuthEnv(_ context.Context) string { return "" }
+func (s *stopAllFakeRunner) MintChatGitToken(_ context.Context) string { return "" }
 
 func (s *stopAllFakeRunner) AttachChatStdin(_ context.Context, _, _ string) error { return nil }
 

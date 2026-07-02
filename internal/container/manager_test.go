@@ -5225,12 +5225,12 @@ func TestKillChat_NoStdinAttached(t *testing.T) {
 	assert.True(t, stopped.Load(), "ContainerStop must be called even when stdin is not attached")
 }
 
-// TestBuildChatAuthEnv_ReturnsGitToken verifies that BuildChatAuthEnv returns
+// TestMintChatGitToken_ReturnsGitToken verifies that MintChatGitToken returns
 // a non-empty token when a token provider is wired AND a skills dir is
 // configured. Claude auth (OAuth token, API key) is owned by the tokenRefresher
 // and reaches the worker via the shared secrets dir — this function must not
 // return those credentials.
-func TestBuildChatAuthEnv_ReturnsGitToken(t *testing.T) {
+func TestMintChatGitToken_ReturnsGitToken(t *testing.T) {
 	t.Parallel()
 
 	tp := testPATProvider(t)
@@ -5243,15 +5243,15 @@ func TestBuildChatAuthEnv_ReturnsGitToken(t *testing.T) {
 	}
 
 	mgr := NewManager(nil, tracker.New(), nil, tp, nil, cfg, testLogger())
-	tok := mgr.BuildChatAuthEnv(context.Background())
+	tok := mgr.MintChatGitToken(context.Background())
 
-	require.NotEmpty(t, tok, "BuildChatAuthEnv must return a non-empty token when a provider is wired")
+	require.NotEmpty(t, tok, "MintChatGitToken must return a non-empty token when a provider is wired")
 }
 
-// TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir keeps chat-mode symmetric with
+// TestMintChatGitToken_SkipsMintWhenNoSkillsDir keeps chat-mode symmetric with
 // the card-mode startContainer mint guard: without TaskSkillsDir the token has
 // no consumer, so /chat/start must pay zero GitHub API round-trips.
-func TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir(t *testing.T) {
+func TestMintChatGitToken_SkipsMintWhenNoSkillsDir(t *testing.T) {
 	t.Parallel()
 
 	calls := 0
@@ -5275,10 +5275,10 @@ func TestBuildChatAuthEnv_SkipsMintWhenNoSkillsDir(t *testing.T) {
 	}
 
 	mgr := NewManager(nil, tracker.New(), nil, tp, nil, cfg, testLogger())
-	tok := mgr.BuildChatAuthEnv(context.Background())
+	tok := mgr.MintChatGitToken(context.Background())
 
-	require.Empty(t, tok, "BuildChatAuthEnv must return empty when TaskSkillsDir is unset")
-	require.Equal(t, 0, calls, "BuildChatAuthEnv must not call GenerateToken when TaskSkillsDir is unset")
+	require.Empty(t, tok, "MintChatGitToken must return empty when TaskSkillsDir is unset")
+	require.Equal(t, 0, calls, "MintChatGitToken must not call GenerateToken when TaskSkillsDir is unset")
 }
 
 // TestManager_StartChat_ResumeMountReadOnly verifies that StartChat binds

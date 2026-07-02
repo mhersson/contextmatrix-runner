@@ -59,7 +59,7 @@ type ContainerRunner interface {
 	KillChat(ctx context.Context, sessionID string) error
 	Stop(ctx context.Context, containerID string) error
 	WorkerImage() string
-	BuildChatAuthEnv(ctx context.Context) string
+	MintChatGitToken(ctx context.Context) string
 }
 
 // TrackerService is the interface to the task/chat tracker used by the webhook handler.
