@@ -1693,8 +1693,29 @@ func TestSanitizeContainerName(t *testing.T) {
 		{"with spaces", "B-002", "cmr-with-spaces-b-002"},
 	}
 	for _, tt := range tests {
-		assert.Equal(t, tt.expected, sanitizeContainerName(tt.project, tt.cardID))
+		got := sanitizeContainerName(tt.project, tt.cardID)
+		assert.True(t, strings.HasPrefix(got, tt.expected+"-"),
+			"expected %q to have prefix %q", got, tt.expected+"-")
 	}
+}
+
+func TestSanitizeContainerName_NoCollision(t *testing.T) {
+	// Distinct (project, cardID) pairs that collapse to the same lossy base.
+	assert.NotEqual(t,
+		sanitizeContainerName("a-b", "c"),
+		sanitizeContainerName("a", "b-c"),
+		"ambiguous '-' boundary must not collide")
+
+	// Case-fold axis.
+	assert.NotEqual(t,
+		sanitizeContainerName("Foo", "x"),
+		sanitizeContainerName("foo", "x"),
+		"case-folded projects must not collide")
+
+	// Same inputs remain deterministic and Docker-name-legal.
+	got := sanitizeContainerName("my-project", "PROJ-042")
+	assert.Equal(t, got, sanitizeContainerName("my-project", "PROJ-042"))
+	assert.True(t, strings.HasPrefix(got, "cmr-my-project-proj-042-"))
 }
 
 // TestWaitAndCleanup_ParentContextCanceled verifies that when the parent ctx

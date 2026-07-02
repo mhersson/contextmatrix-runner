@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -2379,8 +2380,16 @@ func normalizeRepoURL(rawURL string) string {
 func sanitizeContainerName(project, cardID string) string {
 	name := fmt.Sprintf("cmr-%s-%s", project, cardID)
 	name = strings.ToLower(name)
+	name = containerNameRe.ReplaceAllString(name, "-")
 
-	return containerNameRe.ReplaceAllString(name, "-")
+	// The sanitized name is lossy: project and cardID both admit '-', '.',
+	// '_' and are case-folded above, so distinct (project, cardID) pairs can
+	// collapse to the same name and collide on the Docker container name
+	// (second ContainerCreate -> 409). Disambiguate with a short hash of the
+	// NUL-joined pair — NUL cannot appear in either field (validateIdent).
+	sum := sha256.Sum256([]byte(project + "\x00" + cardID))
+
+	return name + "-" + hex.EncodeToString(sum[:4])
 }
 
 func truncateID(id string) string {
