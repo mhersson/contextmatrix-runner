@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"net/http"
+	"sync"
 	"sync/atomic"
 )
 
@@ -17,15 +18,35 @@ import (
 //
 // Both flags are atomic.Bool so readers (the /readyz handler) do not need
 // to coordinate with writers (preflight retry loop, shutdown hook).
+//
+// drained is a close-once signal companion to Draining: long-lived handlers
+// (SSE /logs) that block in a select cannot poll an atomic.Bool, so they
+// select on this channel instead to return promptly when shutdown begins.
 type HealthState struct {
 	PreflightPassed atomic.Bool
 	Draining        atomic.Bool
+
+	drainOnce sync.Once
+	drained   chan struct{}
 }
 
 // NewHealthState returns a HealthState with both flags set to false.
 func NewHealthState() *HealthState {
-	return &HealthState{}
+	return &HealthState{drained: make(chan struct{})}
 }
+
+// StartDraining flips Draining and closes the drain signal so long-lived SSE
+// handlers can return promptly. Idempotent; the shutdown sequence calls it in
+// place of a bare Draining.Store(true).
+func (h *HealthState) StartDraining() {
+	h.drainOnce.Do(func() {
+		h.Draining.Store(true)
+		close(h.drained)
+	})
+}
+
+// DrainSignal returns a channel closed when graceful shutdown begins.
+func (h *HealthState) DrainSignal() <-chan struct{} { return h.drained }
 
 // readyResponse matches the /readyz body shape:
 //

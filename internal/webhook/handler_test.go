@@ -947,6 +947,49 @@ func TestHandleLogs_ClientDisconnect(t *testing.T) {
 	}, 2*time.Second, 50*time.Millisecond, "subscriber should be removed after client disconnect")
 }
 
+func TestHandleLogs_ReturnsOnDrain(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+	health := NewHealthState()
+	health.PreflightPassed.Store(true)
+	h := NewHandler(nil, tracker.New(), b, nil, testAPIKey, 3, testMCPURL, nil, 0, health)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /logs", h.hmacAuth(h.handleLogs))
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := protocol.SignPayloadWithTimestamp(testAPIKey, http.MethodGet, "/logs", []byte{}, ts)
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/logs", nil)
+	require.NoError(t, err)
+	req.Header.Set(protocol.SignatureHeader, "sha256="+sig)
+	req.Header.Set(protocol.TimestampHeader, ts)
+
+	resp, err := (&http.Client{}).Do(req)
+	require.NoError(t, err)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if scanner.Text() == ": connected" {
+			break
+		}
+	}
+
+	require.Equal(t, 1, b.SubscriberCount())
+
+	// Begin draining — the SSE handler must return promptly (not after the
+	// server's WriteTimeout) so srv.Shutdown can complete.
+	health.StartDraining()
+
+	require.Eventually(t, func() bool {
+		return b.SubscriberCount() == 0
+	}, 2*time.Second, 20*time.Millisecond, "handleLogs must return once draining begins")
+}
+
 // --- /message handler tests ---
 
 // fakeWriteCloser is a simple io.WriteCloser that records all written bytes.

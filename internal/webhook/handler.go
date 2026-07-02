@@ -1093,8 +1093,21 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	var drain <-chan struct{}
+	if h.health != nil {
+		drain = h.health.DrainSignal()
+	}
+
 	for {
 		select {
+		case <-drain:
+			if h.logger != nil {
+				h.logger.Info("SSE log client disconnected: draining",
+					"project_filter", project, "session_id_filter", sessionID)
+			}
+
+			return
+
 		case <-r.Context().Done():
 			if h.logger != nil {
 				h.logger.Info("SSE log client disconnected",
