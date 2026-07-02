@@ -129,6 +129,13 @@ type Config struct {
 	// preserves zero).
 	IdleWatchdogInterval time.Duration `yaml:"idle_watchdog_interval"`
 
+	// ChatContainerTimeout is a generous backstop on chat-container lifetime.
+	// Zero (default) disables it, relying on CM's /containers age-cap. When
+	// set it bounds WaitAndCleanupChat's wait so a wedged chat container
+	// cannot leak a concurrency slot forever. Negative values are rejected
+	// by Validate. Env: CMR_CHAT_CONTAINER_TIMEOUT.
+	ChatContainerTimeout time.Duration `yaml:"chat_container_timeout"`
+
 	// WorkerExtraEnv is a deployment-wide map of additional env vars
 	// injected into every spawned worker container. Use sparingly:
 	// production deployments shouldn't need these (the entrypoint sets
@@ -773,6 +780,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("idle_watchdog_interval must not exceed %s (got %s)", maxIdleWatchdogInterval, c.IdleWatchdogInterval)
 	}
 
+	if c.ChatContainerTimeout < 0 {
+		return fmt.Errorf("chat_container_timeout must not be negative (got %s)", c.ChatContainerTimeout)
+	}
+
 	// Worker extra env: validate key shape and reject collisions with
 	// secrets-file vars. These restrictions exist so a misconfigured
 	// extra-env map can't accidentally shadow the secret-injection path
@@ -1099,6 +1110,9 @@ func applyEnvOverrides(cfg *Config) error {
 	parseDuration("CMR_IDLE_OUTPUT_TIMEOUT", &cfg.IdleOutputTimeout)
 	parseDuration("CMR_IDLE_WATCHDOG_INTERVAL", &cfg.IdleWatchdogInterval)
 	parseDuration("CMR_MAINTENANCE_INTERVAL", &cfg.MaintenanceInterval)
+
+	// Chat-container lifetime backstop (opt-in; zero disables).
+	parseDuration("CMR_CHAT_CONTAINER_TIMEOUT", &cfg.ChatContainerTimeout)
 
 	// Bool tunables.
 	parseBool("CMR_USE_HMAC_FOR_VERIFY_AUTONOMOUS", &cfg.UseHMACForVerifyAutonomous)

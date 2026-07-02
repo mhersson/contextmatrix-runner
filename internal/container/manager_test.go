@@ -5738,6 +5738,47 @@ func TestWaitAndCleanupChat_RemovesChatSecrets(t *testing.T) {
 	assert.Equal(t, 0, count, "chatSecrets must be empty after WaitAndCleanupChat completes")
 }
 
+// TestWaitAndCleanupChat_LifetimeBackstop verifies that when
+// ChatContainerTimeout is set, a chat container whose ContainerWait never
+// resolves on its own (a wedged claude process or a hung dockerd wait) is
+// force-stopped once the backstop deadline fires, and the tracker slot is
+// freed. Without this, a wedged chat process leaks a goroutine and a
+// maxConcurrent chat slot indefinitely, since chat has no other lifetime cap.
+func TestWaitAndCleanupChat_LifetimeBackstop(t *testing.T) {
+	var stopCalled atomic.Bool
+
+	mock := successfulMock()
+	mock.ContainerWaitFn = func(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		errCh := make(chan error, 1)
+
+		go func() {
+			<-ctx.Done() // never exits on its own; only the backstop deadline
+			errCh <- ctx.Err()
+		}()
+
+		return make(chan container.WaitResponse), errCh
+	}
+	mock.ContainerStopFn = func(_ context.Context, _ string, _ container.StopOptions) error {
+		stopCalled.Store(true)
+
+		return nil
+	}
+
+	cfg := testConfig(t)
+	cfg.ChatContainerTimeout = 50 * time.Millisecond
+
+	tr := tracker.New()
+	mgr := NewManager(mock, tr, nil, testPATProvider(t), nil, cfg, testLogger())
+
+	require.NoError(t, tr.AddChat(&tracker.ContainerInfo{SessionID: "S-1", ContainerID: "chat-ctr"}))
+
+	mgr.WaitAndCleanupChat("S-1", "chat-ctr", "proj")
+	mgr.Wait()
+
+	assert.True(t, stopCalled.Load(), "a wedged chat container must be force-stopped once the backstop fires")
+	assert.False(t, tr.HasChat("S-1"), "tracker slot must be freed after the backstop cleanup")
+}
+
 // TestStartContainer_SkipsTokenMintWhenNoSkillsDir verifies that when
 // TaskSkillsDir is unset, m.token.GenerateToken must not be called at all
 // during startContainer. A transient GitHub-API failure on a deployment that

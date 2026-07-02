@@ -2747,10 +2747,17 @@ func (m *Manager) DeleteChatCleanup(containerID string) {
 // or `docker kill` from outside the runner. Without it those paths would
 // leak the tracker entry until the runner restarts.
 //
-// Uses context.Background() so the wait survives the request ctx that
-// kicked off /chat/start. The associated log-stream goroutine (from
-// StreamChatLogs) exits on its own when ContainerLogs EOFs on container
-// removal, so no explicit cancel is required here.
+// Uses context.Background() (optionally wrapped in a WithTimeout derived
+// from m.cfg.ChatContainerTimeout) so the wait survives the request ctx
+// that kicked off /chat/start. ChatContainerTimeout is an opt-in, generous
+// lifetime backstop (default 0 = disabled): when set, a chat container
+// that never exits — a wedged claude process or a hung dockerd wait, with
+// /chat/end never arriving — is force-stopped once the deadline fires
+// instead of leaking the goroutine and its tracker slot forever. It is not
+// an idle-output watchdog and will not kill a legitimately-idle human
+// session. The associated log-stream goroutine (from StreamChatLogs) exits
+// on its own when ContainerLogs EOFs on container removal, so no explicit
+// cancel is required here.
 //
 // The webhook handler owns the lifecycle: StartChat returns the container
 // ID after stashing the delivery handles in m.chatCleanup, and the handler
@@ -2779,14 +2786,31 @@ func (m *Manager) WaitAndCleanupChat(sessionID, containerID, project string) {
 
 		ctx := context.Background()
 
-		waitCh, errCh := m.docker.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+		waitCtx := ctx
+		if to := m.cfg.ChatContainerTimeout; to > 0 {
+			var cancel context.CancelFunc
+
+			waitCtx, cancel = context.WithTimeout(ctx, to)
+			defer cancel()
+		}
+
+		waitCh, errCh := m.docker.ContainerWait(waitCtx, containerID, container.WaitConditionNotRunning)
 
 		select {
 		case result := <-waitCh:
 			log.Info("chat container: exited",
 				"exit_code", result.StatusCode)
 		case err := <-errCh:
-			log.Warn("chat container: wait error", "error", err)
+			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				log.Warn("chat container exceeded max lifetime backstop; force-stopping",
+					"timeout", m.cfg.ChatContainerTimeout)
+
+				stopCtx, stopCancel := withDockerCleanupTimeout(ctx)
+				m.killContainer(stopCtx, containerID, log)
+				stopCancel()
+			} else {
+				log.Warn("chat container: wait error", "error", err)
+			}
 		}
 
 		m.tracker.RemoveChat(sessionID)
