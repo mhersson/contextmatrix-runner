@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -123,78 +124,23 @@ func (c *Client) ReportStatus(ctx context.Context, cardID, project, status, mess
 		return fmt.Errorf("marshal callback: %w", err)
 	}
 
-	var lastErr error
-
 	statusURI, err := callbackStatusURI(c.contextMatrixURL)
 	if err != nil {
 		return err
 	}
 
-	for attempt := range maxRetries {
-		// Each retry uses a fresh ts (and therefore a fresh HMAC
-		// signature), so the receiver's replay cache — which keys on the
-		// (method, uri, timestamp, signature) tuple — will treat each
-		// attempt as a distinct request and will not self-409 the retry.
-		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusURI, body, ts)
+	return c.retryWithBackoff(ctx, "", endpointLabel(status), []any{"card_id", cardID},
+		func(ctx context.Context) error {
+			// Each retry uses a fresh ts (and therefore a fresh HMAC
+			// signature), so the receiver's replay cache — which keys on the
+			// (method, uri, timestamp, signature) tuple — will treat each
+			// attempt as a distinct request and will not self-409 the retry.
+			ts := strconv.FormatInt(time.Now().Unix(), 10)
+			signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, statusURI, body, ts)
 
-		lastErr = c.doRequest(ctx, body, signature, ts)
-		if lastErr == nil {
-			return nil
-		}
-
-		if isClientError(lastErr) {
-			return lastErr
-		}
-
-		// Log the short, body-free error at Warn level (safe for shared log
-		// aggregators) and the full upstream body at Debug level for operators
-		// who opt into verbose logging.
-		c.logger.Warn("callback failed, retrying",
-			"attempt", attempt+1,
-			"card_id", cardID,
-			"error", lastErr.Error(),
-		)
-
-		if ce, ok := errors.AsType[*Error](lastErr); ok {
-			c.logger.Debug("callback failed, upstream body",
-				"attempt", attempt+1,
-				"card_id", cardID,
-				"detail", ce.DetailForLog(),
-			)
-		}
-
-		if c.metrics != nil {
-			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointLabel(status)).Inc()
-		}
-
-		// Skip the backoff on the final attempt — the loop is about to exit
-		// regardless of how long we wait. Without this, a maxRetries=3 run
-		// burns ~4s on a stopped timer before returning the failure.
-		if attempt == maxRetries-1 {
-			break
-		}
-
-		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does not
-		// leak the timer (time.After drops its reference only when it
-		// fires). backoff is per-attempt, so declaring the timer inside
-		// the loop body is correct — each attempt gets a fresh timer.
-		// Under Go 1.23+ the runtime GC's a stopped timer even if its
-		// channel was not drained after Stop returns false, so no manual
-		// drain is needed.
-		backoff := time.Duration(1<<uint(attempt)) * time.Second
-		timer := time.NewTimer(backoff)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-
-	return fmt.Errorf("callback failed after %d attempts: %w", maxRetries, lastErr)
+			return c.doRequest(ctx, body, signature, ts)
+		},
+	)
 }
 
 // ReportSkillEngaged sends a skill-engagement notification to ContextMatrix.
@@ -215,92 +161,17 @@ func (c *Client) ReportSkillEngaged(ctx context.Context, cardID, project, skillN
 		return err
 	}
 
-	var lastErr error
+	return c.retryWithBackoff(ctx, "skill-engaged", endpointSkillEngaged, []any{"card_id", cardID},
+		func(ctx context.Context) error {
+			// Each retry uses a fresh ts (and a fresh HMAC signature), so the
+			// receiver's replay cache treats each attempt as a distinct
+			// request and does not self-409 the retry.
+			ts := strconv.FormatInt(time.Now().Unix(), 10)
+			signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillURI, body, ts)
 
-	for attempt := range maxRetries {
-		// Each retry uses a fresh ts (and a fresh HMAC signature), so the
-		// receiver's replay cache treats each attempt as a distinct
-		// request and does not self-409 the retry.
-		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		signature := protocol.SignPayloadWithTimestamp(c.apiKey, http.MethodPost, skillURI, body, ts)
-
-		reqURL := c.contextMatrixURL + "/api/runner/skill-engaged"
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
-		if err != nil {
-			return fmt.Errorf("create skill-engaged request: %w", err)
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(protocol.SignatureHeader, "sha256="+signature)
-		req.Header.Set(protocol.TimestampHeader, ts)
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("send skill-engaged request: %w", err)
-		} else {
-			func() {
-				defer func() { _ = resp.Body.Close() }()
-
-				respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-				if readErr != nil {
-					lastErr = fmt.Errorf("read skill-engaged response: %w", readErr)
-
-					return
-				}
-
-				if resp.StatusCode >= 400 {
-					lastErr = newError(reqURL, resp.StatusCode, respBody)
-				} else {
-					lastErr = nil
-				}
-			}()
-		}
-
-		if lastErr == nil {
-			return nil
-		}
-
-		if isClientError(lastErr) {
-			return lastErr
-		}
-
-		c.logger.Warn("skill-engaged callback failed, retrying",
-			"attempt", attempt+1,
-			"card_id", cardID,
-			"error", lastErr.Error(),
-		)
-
-		if c.metrics != nil {
-			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointSkillEngaged).Inc()
-		}
-
-		// Skip the backoff on the final attempt — the loop is about to exit
-		// regardless of how long we wait. Without this, a maxRetries=3 run
-		// burns ~4s on a stopped timer before returning the failure.
-		if attempt == maxRetries-1 {
-			break
-		}
-
-		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does
-		// not leak the timer. backoff is per-attempt, so declaring the
-		// timer inside the loop body is correct — each attempt gets a
-		// fresh timer. Under Go 1.23+ the runtime GC's a stopped timer
-		// even if its channel was not drained after Stop returns false,
-		// so no manual drain is needed.
-		backoff := time.Duration(1<<uint(attempt)) * time.Second
-		timer := time.NewTimer(backoff)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-
-	return fmt.Errorf("skill-engaged callback failed after %d attempts: %w", maxRetries, lastErr)
+			return c.doSkillEngaged(ctx, body, signature, ts)
+		},
+	)
 }
 
 // Ping checks that ContextMatrix is reachable at the configured URL via a
@@ -368,8 +239,8 @@ type cardResponse struct {
 // like "my project" or "CARD/42" produce a well-formed URL in either mode.
 //
 // Transient errors (5xx, connection reset, etc.) are retried up to
-// maxRetries times with exponential backoff, mirroring ReportStatus /
-// ReportSkillEngaged. A 4xx response is non-retryable
+// maxRetries times with exponential backoff via the shared
+// retryWithBackoff core. A 4xx response is non-retryable
 // (isClientError short-circuits) and returns immediately. Without the
 // retry, a single transient error fails closed as a 502 to CM even when
 // a retry would have succeeded.
@@ -380,64 +251,82 @@ func (c *Client) VerifyAutonomous(ctx context.Context, project, cardID string) (
 		url.PathEscape(cardID),
 	)
 
+	var autonomous bool
+
+	err := c.retryWithBackoff(ctx, "verify-autonomous", endpointVerifyAutonomous, []any{"project", project, "card_id", cardID},
+		func(ctx context.Context) error {
+			a, err := c.doVerifyAutonomous(ctx, reqURL)
+			if err != nil {
+				return err
+			}
+
+			autonomous = a
+
+			return nil
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+
+	return autonomous, nil
+}
+
+// retryWithBackoff is the shared retry/backoff/ctx-cancel core for every
+// runner->CM callback (ReportStatus, ReportSkillEngaged, VerifyAutonomous).
+// name drives the log line prefix and final-error text via label — an
+// empty name (ReportStatus) collapses to "callback" rather than " callback".
+// metricLabel drives the cmr_callback_retries_total series, so each caller
+// keeps its own label (ReportStatus additionally varies its label per
+// runner_status via endpointLabel). logFields are appended to both the Warn
+// retry line and the Debug upstream-body line so callers can attach their
+// own identifying fields (card_id, project, ...) without retryWithBackoff
+// needing to know their names. attempt performs exactly one request; on a
+// non-nil, non-client error it is retried up to maxRetries times with
+// exponential backoff (1<<i seconds), short-circuiting immediately on
+// isClientError or ctx cancellation.
+func (c *Client) retryWithBackoff(ctx context.Context, name, metricLabel string, logFields []any, attempt func(context.Context) error) error {
+	label := strings.TrimSpace(name + " callback")
+
 	var lastErr error
 
-	for attempt := range maxRetries {
-		autonomous, err := c.doVerifyAutonomous(ctx, reqURL)
-		if err == nil {
-			return autonomous, nil
+	for i := range maxRetries {
+		lastErr = attempt(ctx)
+		if lastErr == nil {
+			return nil
 		}
 
-		lastErr = err
-
-		if isClientError(err) {
-			return false, err
+		if isClientError(lastErr) {
+			return lastErr
 		}
 
-		c.logger.Warn("verify-autonomous callback failed, retrying",
-			"attempt", attempt+1,
-			"project", project,
-			"card_id", cardID,
-			"error", err.Error(),
-		)
+		c.logger.Warn(label+" failed, retrying", append(append([]any{"attempt", i + 1}, logFields...), "error", lastErr.Error())...)
 
-		if ce, ok := errors.AsType[*Error](err); ok {
-			c.logger.Debug("verify-autonomous callback failed, upstream body",
-				"attempt", attempt+1,
-				"project", project,
-				"card_id", cardID,
-				"detail", ce.DetailForLog(),
-			)
+		if ce, ok := errors.AsType[*Error](lastErr); ok {
+			c.logger.Debug(label+" failed, upstream body", append(append([]any{"attempt", i + 1}, logFields...), "detail", ce.DetailForLog())...)
 		}
 
 		if c.metrics != nil {
-			c.metrics.CallbackRetriesTotal.WithLabelValues(endpointVerifyAutonomous).Inc()
+			c.metrics.CallbackRetriesTotal.WithLabelValues(metricLabel).Inc()
 		}
 
-		// Skip the backoff on the final attempt — the loop is about to exit
-		// regardless of how long we wait. Mirrors the same skip in the
-		// POST callbacks.
-		if attempt == maxRetries-1 {
+		if i == maxRetries-1 {
 			break
 		}
 
-		// Explicit Timer + Stop on ctx-cancel so ctx cancellation does
-		// not leak the timer. backoff is per-attempt; under Go 1.23+ the
-		// runtime GC's a stopped timer even if its channel was not drained
-		// after Stop returns false, so no manual drain is needed.
-		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		backoff := time.Duration(1<<uint(i)) * time.Second
 		timer := time.NewTimer(backoff)
 
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 
-			return false, ctx.Err()
+			return ctx.Err()
 		case <-timer.C:
 		}
 	}
 
-	return false, fmt.Errorf("verify-autonomous callback failed after %d attempts: %w", maxRetries, lastErr)
+	return fmt.Errorf("%s failed after %d attempts: %w", label, maxRetries, lastErr)
 }
 
 // doVerifyAutonomous performs a single VerifyAutonomous HTTP request and
@@ -533,6 +422,40 @@ func (c *Client) doRequest(ctx context.Context, body []byte, signature, ts strin
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return newError(reqURL, resp.StatusCode, respBody)
+	}
+
+	return nil
+}
+
+// doSkillEngaged performs a single ReportSkillEngaged HTTP request. Mirrors
+// doRequest so ReportSkillEngaged no longer inlines its request build inside
+// the retry loop.
+func (c *Client) doSkillEngaged(ctx context.Context, body []byte, signature, ts string) error {
+	reqURL := c.contextMatrixURL + "/api/runner/skill-engaged"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create skill-engaged request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(protocol.SignatureHeader, "sha256="+signature)
+	req.Header.Set(protocol.TimestampHeader, ts)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send skill-engaged request: %w", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read skill-engaged response: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
