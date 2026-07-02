@@ -1293,6 +1293,28 @@ func TestCancel_NilCancelFuncIsNoOp(t *testing.T) {
 	}
 }
 
+// TestCancelWithReason_RecordsReasonAndCancels verifies that CancelWithReason
+// records the reason on the tracked entry before invoking its stored cancel
+// func, and that Reason surfaces it afterwards. A missing entry returns false
+// and leaves Reason empty.
+func TestCancelWithReason_RecordsReasonAndCancels(t *testing.T) {
+	tr := New()
+
+	var cancelled atomic.Bool
+
+	require.NoError(t, tr.Add(&ContainerInfo{
+		Project: "p", CardID: "C-1",
+		Cancel: func() { cancelled.Store(true) },
+	}))
+
+	require.True(t, tr.CancelWithReason("p", "C-1", "idle_timeout"))
+	assert.True(t, cancelled.Load(), "CancelWithReason must invoke the stored cancel func")
+	assert.Equal(t, "idle_timeout", tr.Reason("p", "C-1"), "reason must be readable after cancel")
+
+	assert.False(t, tr.CancelWithReason("p", "missing", "x"), "missing entry returns false")
+	assert.Empty(t, tr.Reason("p", "missing"))
+}
+
 // TestSetStdin_LateArrivalWedgedClose_DoesNotBlockTracker verifies that when
 // SetStdin arrives AFTER Remove (the entry is gone), the late-arrival branch
 // does not close the writer SYNCHRONOUSLY under tracker.mu (write). Closing

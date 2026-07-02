@@ -2225,6 +2225,126 @@ drainLoop:
 	assert.False(t, sawTimeout, "parent-ctx-cancel race must NOT be classified as a timeout")
 }
 
+// TestWaitAndCleanup_IdleKill_ClassifiesAsIdleTimeout verifies that a cancel
+// driven through tracker.CancelWithReason(..., killReasonIdle) — exactly what
+// runIdleWatchdog does — is classified by handleCanceled as an idle output
+// timeout, not an operator kill: the CM callback message and the
+// cmr_container_duration_seconds histogram bucket must both reflect
+// OutcomeIdleTimeout rather than OutcomeKilled.
+func TestWaitAndCleanup_IdleKill_ClassifiesAsIdleTimeout(t *testing.T) {
+	type statusReport struct{ status, message string }
+
+	reported := make(chan statusReport, 4)
+
+	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var req struct {
+			RunnerStatus string `json:"runner_status"`
+			Message      string `json:"message"`
+		}
+
+		_ = json.Unmarshal(body, &req)
+		select {
+		case reported <- statusReport{req.RunnerStatus, req.Message}:
+		default:
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer cbSrv.Close()
+
+	mock := successfulMock()
+	mock.ContainerWaitFn = func(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+		errCh := make(chan error, 1)
+
+		go func() {
+			<-ctx.Done()
+
+			errCh <- ctx.Err()
+		}()
+
+		return make(chan container.WaitResponse), errCh
+	}
+
+	tr := tracker.New()
+	cb := callback.NewClient(cbSrv.URL, "test-secret-key-that-is-long-enough", testLogger())
+
+	cfg := testConfig(t)
+	cfg.ContainerTimeout = "1h"
+	cfg.ParseContainerTimeout()
+	cfg.IdleOutputTimeout = 50 * time.Millisecond
+
+	mx := metrics.New()
+	mgr := NewManager(mock, tr, cb, testTokenProvider(t), nil, cfg, testLogger()).WithMetrics(mx)
+
+	payload := testPayload()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, tr.Add(&tracker.ContainerInfo{
+		CardID: payload.CardID, Project: payload.Project, Cancel: cancel,
+	}))
+
+	mgr.Run(ctx, payload)
+	require.Eventually(t, func() bool {
+		snap, ok := tr.Snapshot(payload.Project, payload.CardID)
+
+		return ok && snap.ContainerID != ""
+	}, 5*time.Second, 10*time.Millisecond, "tracker must have container ID before idle kill")
+
+	// Exactly what runIdleWatchdog does: tag the entry then cancel the run.
+	require.True(t, tr.CancelWithReason(payload.Project, payload.CardID, killReasonIdle))
+	mgr.Wait()
+
+	var sawFailed, sawIdle, sawOperator bool
+
+drain:
+	for {
+		select {
+		case s := <-reported:
+			sawFailed = sawFailed || s.status == "failed"
+			sawIdle = sawIdle || strings.Contains(s.message, "idle output timeout")
+			sawOperator = sawOperator || strings.Contains(s.message, "killed by operator")
+		default:
+			break drain
+		}
+	}
+
+	assert.True(t, sawFailed, "idle kill still reports failed to CM")
+	assert.True(t, sawIdle, "idle kill must be reported as an idle output timeout")
+	assert.False(t, sawOperator, "idle kill must NOT be misattributed as killed by operator")
+	assert.Equal(t, uint64(1), containerDurationCount(t, mx, metrics.OutcomeIdleTimeout))
+	assert.Equal(t, uint64(0), containerDurationCount(t, mx, metrics.OutcomeKilled))
+}
+
+// containerDurationCount reads the cmr_container_duration_seconds histogram
+// sample count for one outcome label. Mirrors panicCounterValue.
+func containerDurationCount(t *testing.T, mx *metrics.Metrics, outcome string) uint64 {
+	t.Helper()
+
+	families, err := mx.Registry.Gather()
+	require.NoError(t, err)
+
+	for _, fam := range families {
+		if fam.GetName() != "cmr_container_duration_seconds" {
+			continue
+		}
+
+		for _, series := range fam.Metric {
+			for _, lp := range series.Label {
+				if lp.GetName() == "outcome" && lp.GetValue() == outcome {
+					return series.GetHistogram().GetSampleCount()
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
 // TestKillContainer_Success directly drives the killContainer helper and
 // verifies ContainerStop is called with the provided ID and grace period.
 func TestKillContainer_Success(t *testing.T) {

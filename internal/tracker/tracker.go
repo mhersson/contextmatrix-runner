@@ -89,6 +89,11 @@ type ContainerInfo struct {
 	StartedAt   time.Time
 	Cancel      context.CancelFunc
 
+	// reason is set by CancelWithReason to record WHY the run was cancelled
+	// (e.g. an idle-output-watchdog kill). Read by the manager's cleanup path
+	// to classify the container outcome. Mutated only under tracker.mu.
+	reason string
+
 	// stdin is a shared pointer so the live writer is always reachable from
 	// the tracker entry. Access is mediated by WriteStdin/CloseStdin/SetStdin
 	// on the Tracker; callers must never touch it directly.
@@ -222,6 +227,47 @@ func (t *Tracker) Cancel(project, cardID string) bool {
 	}
 
 	return true
+}
+
+// CancelWithReason records reason on the tracked entry, then invokes its
+// stored context.CancelFunc, so the cleanup path can classify an
+// idle-watchdog kill distinctly from an operator /kill. Returns false if no
+// container is tracked. Lock discipline mirrors Cancel: reason is written and
+// the cancel func captured under the lock, which is released before the
+// cancel func runs (it may reach back into the tracker).
+func (t *Tracker) CancelWithReason(project, cardID, reason string) bool {
+	t.mu.Lock()
+
+	info, ok := t.containers[key(project, cardID)]
+	if !ok {
+		t.mu.Unlock()
+
+		return false
+	}
+
+	info.reason = reason
+	cancel := info.Cancel
+
+	t.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	return true
+}
+
+// Reason returns the termination reason recorded by CancelWithReason, or ""
+// if none was set or the entry is gone.
+func (t *Tracker) Reason(project, cardID string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if info, ok := t.containers[key(project, cardID)]; ok {
+		return info.reason
+	}
+
+	return ""
 }
 
 // SetStdin attaches a writable stdin handle to a tracked container.

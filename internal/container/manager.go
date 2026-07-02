@@ -111,6 +111,11 @@ const (
 	taskSkillsPullTimeout = 60 * time.Second
 )
 
+// killReasonIdle marks a termination initiated by runIdleWatchdog rather than
+// an operator /kill. Recorded on the tracker via CancelWithReason and read
+// back in handleCanceled so the outcome is idle_timeout, not killed.
+const killReasonIdle = metrics.OutcomeIdleTimeout
+
 // primingWriteTimeout bounds the priming WriteStdin call made right after
 // ContainerAttach. A wedged hijacked socket would otherwise hang the Run
 // goroutine indefinitely; with this deadline the goroutine gives up and
@@ -1282,12 +1287,25 @@ func (m *Manager) handleWaitError(ctx context.Context, containerID string, paylo
 	return metrics.OutcomeFailure
 }
 
-// handleCanceled is the cleanup path for OutcomeKilled. Reached both via the
-// ctx.Done() select branch AND via the errCh branch when the parent ctx is
-// already canceled (Docker SDK's ContainerWait writes a context-canceled
-// error into errCh and Go's select picks pseudo-randomly between them).
+// handleCanceled is the cleanup path for a cancelled run context: an
+// operator /kill, shutdown, or an idle-watchdog kill (see killReasonIdle).
+// Reached both via the ctx.Done() select branch AND via the errCh branch
+// when the parent ctx is already canceled (Docker SDK's ContainerWait writes
+// a context-canceled error into errCh and Go's select picks pseudo-randomly
+// between them).
 func (m *Manager) handleCanceled(ctx context.Context, containerID string, payload RunConfig, logDone <-chan struct{}, log *slog.Logger) string {
-	log.Info("container canceled")
+	// An idle-watchdog kill records killReasonIdle on the tracker entry before
+	// cancelling; operator /kill and shutdown leave it empty. Read before the
+	// deferred tracker.Remove (which runs after this returns).
+	msg := "killed by operator"
+	outcome := metrics.OutcomeKilled
+
+	if m.tracker.Reason(payload.Project, payload.CardID) == killReasonIdle {
+		msg = fmt.Sprintf("idle output timeout after %s", m.cfg.IdleOutputTimeout)
+		outcome = metrics.OutcomeIdleTimeout
+	}
+
+	log.Info("container canceled", "outcome", outcome)
 
 	killCtx, killCancel := withDockerCleanupTimeout(ctx)
 	m.killContainer(killCtx, containerID, log)
@@ -1302,10 +1320,10 @@ func (m *Manager) handleCanceled(ctx context.Context, containerID string, payloa
 	// callback into a no-op and CM would see the card stuck in
 	// `running` forever.
 	cbCtx, cbCancel := withCleanupTimeout(ctx)
-	m.reportFailure(cbCtx, payload, "killed by operator")
+	m.reportFailure(cbCtx, payload, msg)
 	cbCancel()
 
-	return metrics.OutcomeKilled
+	return outcome
 }
 
 // drainLogs blocks until logDone fires or logDrainTimeout elapses, whichever
@@ -1674,14 +1692,14 @@ func (m *Manager) runIdleWatchdog(
 
 			m.emitSystem(payload, reason)
 
-			// Prefer Kill (which cancels the run's ctx so waitAndCleanup
-			// takes the normal cancel path and reports failure to CM).
+			// Tag the tracker entry with killReasonIdle before cancelling
+			// (rather than plain Kill) so waitAndCleanup's handleCanceled can
+			// classify this as an idle timeout instead of an operator kill.
 			// Fall back to a direct stop if the tracker entry has already
 			// been removed (race with exit).
-			if err := m.Kill(payload.Project, payload.CardID); err != nil {
-				log.Warn("idle watchdog Kill failed; attempting direct stop",
+			if !m.tracker.CancelWithReason(payload.Project, payload.CardID, killReasonIdle) {
+				log.Warn("idle watchdog kill: no tracker entry; attempting direct stop",
 					"container_id", truncateID(containerID),
-					"error", err,
 				)
 
 				stopCtx, cancel := withDockerCleanupTimeout(ctx)
