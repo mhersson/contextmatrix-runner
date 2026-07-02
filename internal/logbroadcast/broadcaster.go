@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	protocol "github.com/mhersson/contextmatrix-protocol"
 )
@@ -446,7 +447,14 @@ func (b *Broadcaster) Publish(entry LogEntry) {
 		// guards against a future tweak that shrinks the cap below the
 		// marker length.
 		if head > 0 && head < len(entry.Content) {
-			entry.Content = entry.Content[:head] + truncatedMarker
+			cut := head
+			// Back off to a UTF-8 rune boundary so truncation never splits a
+			// multibyte rune (mirrors logparser's rune-safe truncation).
+			for cut > 0 && !utf8.RuneStart(entry.Content[cut]) {
+				cut--
+			}
+
+			entry.Content = entry.Content[:cut] + truncatedMarker
 		} else {
 			entry.Content = truncatedMarker
 		}

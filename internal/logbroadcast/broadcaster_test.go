@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mhersson/contextmatrix-runner/internal/logbroadcast"
 	"github.com/stretchr/testify/assert"
@@ -654,6 +655,32 @@ func TestPublish_PreservesSmallContent(t *testing.T) {
 		assert.Equal(t, payload, got.Content)
 	case <-time.After(time.Second):
 		t.Fatal("subscriber did not receive the published entry")
+	}
+}
+
+// TestPublish_TruncationPreservesUTF8 verifies that the truncation cut backs
+// off to a UTF-8 rune boundary instead of slicing at a raw byte offset, which
+// can land mid-rune and produce invalid UTF-8.
+func TestPublish_TruncationPreservesUTF8(t *testing.T) {
+	b := logbroadcast.NewBroadcaster(nil, nil)
+
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
+
+	ch, unsub := b.Subscribe("")
+	defer unsub()
+
+	// All 3-byte runes: the fixed ~64 KiB byte-offset cut lands mid-rune, so a
+	// raw byte slice would emit invalid UTF-8.
+	content := strings.Repeat("€", 30000) // 90000 bytes > 64 KiB cap
+
+	b.Publish(logbroadcast.LogEntry{Project: "p", Type: "text", Content: content})
+
+	select {
+	case got := <-ch:
+		require.Less(t, len(got.Content), len(content), "content must be truncated")
+		assert.True(t, utf8.ValidString(got.Content), "truncated content must remain valid UTF-8")
+	case <-time.After(time.Second):
+		t.Fatal("no entry published")
 	}
 }
 
