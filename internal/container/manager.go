@@ -1498,68 +1498,9 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 				}
 			}()
 
-			// bufio.Reader avoids bufio.Scanner's 1 MiB cap;
-			// logparser.ReadBoundedLine adds a soft per-line cap so a
-			// runaway stderr stream can't pin the runner heap. Read
-			// from the progressReader wrapper so the idle watchdog
-			// gets fed on raw byte arrival.
-			br := bufio.NewReaderSize(stderrFeed, 64*1024)
-
-			var readErr error
-
-			for {
-				var (
-					raw       []byte
-					truncated bool
-				)
-
-				raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
-				if len(raw) > 0 || truncated {
-					line := strings.TrimRight(string(raw), "\r\n")
-					if truncated {
-						line += " [...truncated; line exceeded 16 MiB cap]"
-					}
-					// Redact before slog too: a rogue child process echoing the
-					// container env through /proc can easily end up on stderr.
-					redacted := redactor.Redact(line)
-					log.Warn("container stderr", "line", redacted)
-
-					// Record the observation so the idle watchdog sees forward
-					// progress. Stderr noise counts: a container spewing stack
-					// traces is not "idle".
-					nowT := time.Now()
-					lastOutputAt.Store(&nowT)
-
-					if m.broadcaster != nil {
-						m.broadcaster.Publish(logbroadcast.LogEntry{
-							Timestamp: nowT,
-							CardID:    payload.CardID,
-							Project:   payload.Project,
-							Type:      "stderr",
-							Content:   redacted,
-						})
-					}
-				}
-
-				if readErr != nil {
-					break
-				}
-			}
-
-			// On non-EOF read failure (e.g. an underlying I/O error) the
-			// writer side of stderrPr could still block on its next Write
-			// if anything is buffered. Drain to discard so stdcopy makes
-			// forward progress; the defer above also closes stderrPr so any
-			// already-blocked Write returns io.ErrClosedPipe.
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
-				log.Warn("container stderr reader aborted; draining pipe to unblock writer",
-					"container_id", truncateID(containerID),
-					"card_id", payload.CardID,
-					"project", payload.Project,
-					"error", readErr)
-
-				_, _ = io.Copy(io.Discard, stderrPr)
-			}
+			m.scanRedactedStderr(stderrFeed, stderrPr, redactor, log,
+				logbroadcast.LogEntry{CardID: payload.CardID, Project: payload.Project},
+				func(t time.Time) { lastOutputAt.Store(&t) })
 		}()
 
 		// emit is invoked by the logparser for every published assistant
@@ -1615,6 +1556,59 @@ func (m *Manager) streamLogs(ctx context.Context, containerID string, payload Ru
 	}()
 
 	return done
+}
+
+// scanRedactedStderr consumes the demuxed stderr pipe line by line, redacts
+// each line, logs it, invokes onLine (card mode advances the idle watchdog;
+// chat mode passes nil), and republishes it as a "stderr" LogEntry stamped
+// from label. src is the read source (a *progressReader in card mode so the
+// watchdog sees raw byte arrival; the raw pipe in chat mode); drain is the
+// pipe drained on a non-EOF abort so a blocked stdcopy Write is released.
+func (m *Manager) scanRedactedStderr(src io.Reader, drain *io.PipeReader, redactor *logparser.Redactor, log *slog.Logger, label logbroadcast.LogEntry, onLine func(time.Time)) {
+	br := bufio.NewReaderSize(src, 64*1024)
+
+	var readErr error
+
+	for {
+		var (
+			raw       []byte
+			truncated bool
+		)
+
+		raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
+		if len(raw) > 0 || truncated {
+			line := strings.TrimRight(string(raw), "\r\n")
+			if truncated {
+				line += " [...truncated; line exceeded 16 MiB cap]"
+			}
+
+			redacted := redactor.Redact(line)
+			log.Warn("container stderr", "line", redacted)
+
+			nowT := time.Now()
+			if onLine != nil {
+				onLine(nowT)
+			}
+
+			if m.broadcaster != nil {
+				e := label
+				e.Timestamp = nowT
+				e.Type = "stderr"
+				e.Content = redacted
+				m.broadcaster.Publish(e)
+			}
+		}
+
+		if readErr != nil {
+			break
+		}
+	}
+
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		log.Warn("container stderr reader aborted; draining pipe to unblock writer", "error", readErr)
+
+		_, _ = io.Copy(io.Discard, drain)
+	}
 }
 
 // runIdleWatchdog polls lastOutputAt and kills the container when no output
@@ -2917,9 +2911,10 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 		// The three child goroutines spawned below can each take a panic
 		// from third-party input — stdcopy on a malformed docker multiplex
 		// frame, bufio.Scanner on bogus UTF-8, the logparser on a bad
-		// stream-json line. Mirror the card-mode streamLogs structure
-		// (lines ~1141-1349) so a panic in any of them is recovered with
-		// metric + slog + system LogEntry, and so Wait() drains all three.
+		// stream-json line. Mirror the card-mode streamLogs structure (see
+		// streamLogs at manager.go:1358) so a panic in any of them is
+		// recovered with metric + slog + system LogEntry, and so Wait()
+		// drains all three.
 		defer func() {
 			if r := recover(); r != nil {
 				m.handlePanic(r, metrics.GoroutineLogparser, "chat streamLogs child panicked",
@@ -2995,58 +2990,8 @@ func (m *Manager) StreamChatLogs(ctx context.Context, sessionID, containerID, pr
 				}
 			}()
 
-			// bufio.Reader avoids bufio.Scanner's 1 MiB cap;
-			// logparser.ReadBoundedLine adds a soft per-line cap so a
-			// runaway stderr stream can't pin the runner heap.
-			br := bufio.NewReaderSize(stderrPr, 64*1024)
-
-			var readErr error
-
-			for {
-				var (
-					raw       []byte
-					truncated bool
-				)
-
-				raw, truncated, readErr = logparser.ReadBoundedLine(br, logparser.MaxLineBytes)
-				if len(raw) > 0 || truncated {
-					line := strings.TrimRight(string(raw), "\r\n")
-					if truncated {
-						line += " [...truncated; line exceeded 16 MiB cap]"
-					}
-					// Redact before slog too: a rogue child process echoing the
-					// container env through /proc can easily end up on stderr.
-					redacted := redactor.Redact(line)
-					log.Warn("chat container stderr", "line", redacted)
-
-					if m.broadcaster != nil {
-						m.broadcaster.Publish(logbroadcast.LogEntry{
-							Timestamp: time.Now(),
-							SessionID: sessionID,
-							Project:   project,
-							Type:      "stderr",
-							Content:   redacted,
-						})
-					}
-				}
-
-				if readErr != nil {
-					break
-				}
-			}
-
-			// On non-EOF read failure drain to discard so stdcopy makes
-			// forward progress; the defer above also closes stderrPr so an
-			// already-blocked Write returns io.ErrClosedPipe.
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
-				log.Warn("chat container stderr reader aborted; draining pipe to unblock writer",
-					"container_id", containerID,
-					"session_id", sessionID,
-					"project", project,
-					"error", readErr)
-
-				_, _ = io.Copy(io.Discard, stderrPr)
-			}
+			m.scanRedactedStderr(stderrPr, stderrPr, redactor, log,
+				logbroadcast.LogEntry{SessionID: sessionID, Project: project}, nil)
 		}()
 
 		emit := func(e logbroadcast.LogEntry) {
