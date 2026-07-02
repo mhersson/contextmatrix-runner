@@ -407,33 +407,6 @@ func (t *Tracker) MarkStdinClosed(project, cardID string) error {
 	return nil
 }
 
-// MarkStdinClosedChat is the chat-mode counterpart of MarkStdinClosed. See
-// MarkStdinClosed for the use case (priming-write timeout) and semantics.
-func (t *Tracker) MarkStdinClosedChat(sessionID string) error {
-	t.mu.RLock()
-
-	info, ok := t.containers[chatKey(sessionID)]
-	if !ok {
-		t.mu.RUnlock()
-
-		return fmt.Errorf("%s: %w", chatKey(sessionID), ErrNotTracked)
-	}
-
-	stdin := info.stdin
-
-	t.mu.RUnlock()
-
-	if stdin == nil {
-		return fmt.Errorf("no stdin attached for %s: %w", chatKey(sessionID), ErrNoStdinAttached)
-	}
-
-	stdin.mu.Lock()
-	stdin.stdin = nil
-	stdin.mu.Unlock()
-
-	return nil
-}
-
 // CloseStdin closes the attached stdin writer without removing the tracker
 // entry. Used to signal EOF to a containerized claude process so it exits
 // cleanly; the normal waitAndCleanup path will later call Remove.

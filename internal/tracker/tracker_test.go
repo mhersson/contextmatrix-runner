@@ -529,39 +529,6 @@ func TestMarkStdinClosed_NoStdin(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoStdinAttached)
 }
 
-// TestMarkStdinClosedChat_FlipsState mirrors TestMarkStdinClosed_FlipsState
-// for the chat-mode counterpart.
-func TestMarkStdinClosedChat_FlipsState(t *testing.T) {
-	tr := New()
-	require.NoError(t, tr.AddChat(&ContainerInfo{
-		ContainerID: "ctr-1",
-		SessionID:   "01SESS",
-		Image:       "test:latest",
-		StartedAt:   time.Now(),
-	}))
-
-	var closeCount atomic.Int32
-
-	w := &countingWriteCloser{
-		closeFn: func() error {
-			closeCount.Add(1)
-
-			return nil
-		},
-	}
-	tr.SetStdinChat("01SESS", w, nil)
-
-	require.NoError(t, tr.MarkStdinClosedChat("01SESS"))
-	assert.EqualValues(t, 0, closeCount.Load(),
-		"MarkStdinClosedChat must not call Close on the writer")
-
-	err := tr.WriteStdinChat("01SESS", []byte("hi"))
-	require.ErrorIs(t, err, ErrStdinClosed)
-
-	err = tr.CloseStdinChat("01SESS")
-	require.ErrorIs(t, err, ErrStdinClosed)
-}
-
 // TestCloseStdin_NotTracked verifies CloseStdin returns ErrNotTracked when
 // the container is not tracked.
 func TestCloseStdin_NotTracked(t *testing.T) {
