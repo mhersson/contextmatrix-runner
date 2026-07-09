@@ -2,8 +2,13 @@
 
 > [!WARNING]
 >
-> This project is under heavy development. Expect breaking changes at this
-> stage.
+> **This project is deprecated and no longer maintained.** It was frozen when
+> ContextMatrix added multi-user support, which the runner never gained: a
+> ContextMatrix instance running the default `auth.mode: multi` rejects the
+> runner at startup. It runs only in single-user (`auth.mode: none`)
+> ContextMatrix instances and receives no new features. Use the
+> [contextmatrix-agent](https://github.com/mhersson/contextmatrix-agent) task
+> backend instead.
 
 A self-hosted runner that receives webhooks from
 [ContextMatrix](https://github.com/mhersson/contextmatrix) and spawns disposable
