@@ -9,6 +9,12 @@
 > ContextMatrix instances and receives no new features. Use the
 > [contextmatrix-agent](https://github.com/mhersson/contextmatrix-agent) task
 > backend instead.
+>
+> ContextMatrix support for this backend ends at the
+> [`runner-eos`](https://github.com/mhersson/contextmatrix/releases/tag/runner-eos)
+> tag of the contextmatrix repo — the last commit that can drive this runner.
+> Later ContextMatrix releases speak protocol ≥ v0.8.0 and have removed the
+> runner backend entirely.
 
 A self-hosted runner that receives webhooks from
 [ContextMatrix](https://github.com/mhersson/contextmatrix) and spawns disposable
