@@ -6,7 +6,7 @@ require (
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/google/uuid v1.6.0
 	github.com/mhersson/contextmatrix-githubauth v0.1.0
-	github.com/mhersson/contextmatrix-protocol v0.4.0
+	github.com/mhersson/contextmatrix-protocol v0.14.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
