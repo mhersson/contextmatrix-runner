@@ -6,9 +6,7 @@
 # Pushes to main skip checks (already validated on the PR) — branch protection
 # requires the check jobs to pass before merge.
 #
-# GitHub Actions are pinned to exact release tags. Full SHA pinning is a
-# follow-up once Dependabot has produced a first-pass bump PR that captures
-# the current resolved SHAs.
+# GitHub Actions are pinned to exact release tags.
 
 name: ci
 
